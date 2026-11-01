@@ -36,6 +36,10 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(page["avatar_color"], "brown")
         self.assertEqual(gbot_tui.program_key(page["id"]), "gbot-bot-1")
         self.assertEqual(gbot_tui.avatar_color("brown"), "#936439")
+        self.assertEqual(
+            gbot_tui.client_version_from_name("Grok_Bot_0.78.1_abc.AppImage"),
+            "0.78.1",
+        )
 
     def test_gbot_error(self):
         with self.assertRaises(gbot_tui.GbotError):

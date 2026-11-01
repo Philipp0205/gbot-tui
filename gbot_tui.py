@@ -235,12 +235,16 @@ def gbot_failure(stdout, stderr):
 
 
 def gbot(*args, timeout=60):
+    env = os.environ.copy()
+    # gbot 0.12.4 tells Cursor it is Grok Bot 0.20.0, which the server rejects.
+    env.setdefault("SAND_CLIENT_VERSION", sand_client_version())
     try:
         proc = subprocess.run(
             gbot_argv(args),
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired as error:
         raise GbotError("gbot timed out") from error
@@ -353,6 +357,22 @@ def compose_avatar(mask_path, face_path, color):
     out = io.BytesIO()
     painted.save(out, format="PNG")
     return out.getvalue()
+
+
+def client_version_from_name(name):
+    parts = os.path.basename(name).split("_")
+    if len(parts) >= 3 and parts[2][:1].isdigit():
+        return parts[2]
+    return ""
+
+
+def sand_client_version():
+    app = grok_appimage()
+    if app:
+        found = client_version_from_name(os.path.realpath(app))
+        if found:
+            return found
+    return "0.78.1"
 
 
 def grok_appimage():
@@ -987,9 +1007,16 @@ def draw(stdscr, chat):
     stdscr.refresh()
 
 
+def place_cursor(visible):
+    try:
+        curses.curs_set(1 if visible else 0)
+    except curses.error:
+        pass
+
+
 def chat_loop(stdscr, chat):
     apply_theme(stdscr)
-    curses.curs_set(1)
+    place_cursor(True)
     stdscr.keypad(True)
     stdscr.timeout(2000)
     chat.load()
@@ -1038,7 +1065,7 @@ def chat_loop(stdscr, chat):
 
 def pick(stdscr, bots):
     apply_theme(stdscr)
-    curses.curs_set(0)
+    place_cursor(False)
     stdscr.keypad(True)
     selected = 0
     while True:
