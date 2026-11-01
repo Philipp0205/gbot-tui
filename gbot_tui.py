@@ -341,24 +341,21 @@ def herdr_root():
     return os.path.join(os.path.expanduser("~"), ".config", "herdr-app")
 
 
-def compose_avatar(mask_path, face_path, color):
-    """Tint the shape mask and lay the black face on it. Both files come from the Grok Bot app."""
+def compose_avatar(mask_path, _face_path, color):
+    """Tint the solid avatar mask so it stays filled on Herdr's dark tile."""
     from PIL import Image
 
     mask = Image.open(mask_path).convert("RGBA")
-    face = Image.open(face_path).convert("RGBA")
-    face = face.crop((0, 0, min(18, face.width), min(18, face.height)))
-    size = 32
-    resample = getattr(getattr(Image, "Resampling", Image), "BOX")
+    size = 64
+    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
     mask = mask.resize((size, size), resample)
     rgb = tuple(int(color[i : i + 2], 16) for i in (1, 3, 5))
-    painted = Image.new("RGBA", (size, size))
+    painted = Image.new("RGBA", mask.size)
     src = mask.load()
     dst = painted.load()
-    for y in range(size):
-        for x in range(size):
+    for y in range(mask.height):
+        for x in range(mask.width):
             dst[x, y] = (*rgb, src[x, y][3])
-    painted.alpha_composite(face.resize((size, size), resample))
     import io
 
     out = io.BytesIO()
@@ -490,11 +487,16 @@ def install_avatars(bots, root=None, src=None):
             continue
         rel = f"icons/gbot/{key}-{shape}-{color_name}.png"
         dest = os.path.join(root, rel)
-        if not os.path.exists(dest):
-            try:
-                png = compose_avatar(mask, face, avatar_color(color_name))
-            except (OSError, ValueError):
-                continue
+        try:
+            png = compose_avatar(mask, face, avatar_color(color_name))
+        except (OSError, ValueError):
+            continue
+        try:
+            with open(dest, "rb") as handle:
+                current = handle.read()
+        except OSError:
+            current = None
+        if current != png:
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with open(dest, "wb") as handle:
                 handle.write(png)
@@ -836,7 +838,19 @@ def user_bubble():
     return 235 if dark_terminal() else 254
 
 
-def layout(height):
+def composer_text_width(width):
+    # " → " plus the two box edges. The last column stays empty for the cursor.
+    span = max(width - 1, 0)
+    return max(span - 5, 1)
+
+
+def draft_lines(typed, width):
+    if not typed:
+        return []
+    return wrap(typed, composer_text_width(width))
+
+
+def layout(height, text_lines=1):
     if height >= 10:
         header = 2
     elif height >= 5:
@@ -844,7 +858,11 @@ def layout(height):
     else:
         header = 0
     if height >= 7:
-        composer, footer = 3, 1
+        footer = 1
+        text_lines = max(int(text_lines), 1)
+        # Two box rules and one transcript row stay on screen.
+        text_lines = min(text_lines, max(height - header - footer - 3, 1))
+        composer = text_lines + 2
     elif height >= 3:
         composer, footer = 1, 0
     else:
@@ -889,6 +907,8 @@ def composer_lines(width, typed):
         return "┌", "│", "└"
     rule = "─" * (span - 2)
     shown = typed if typed else "Add a follow-up"
+    if typed:
+        shown = draft_lines(typed, width)[0]
     body = f" → {shown}"[: span - 2].ljust(span - 2)
     return "┌" + rule + "┐", "│" + body + "│", "└" + rule + "┘"
 
@@ -900,7 +920,7 @@ def footer_spans(phase, error):
         return [("Pending decision", "yellow")]
     if phase == "working":
         return [("Generating", "bold"), ("  —  pgup scroll", "dim")]
-    return [("enter send · ctrl-c quit · pgup scroll", "dim")]
+    return [("enter send · esc bots · ctrl-c quit · pgup scroll", "dim")]
 
 
 # -1 keeps the terminal background. A filled curses color is the block this CLI does not use.
@@ -962,26 +982,24 @@ def paint_spans(stdscr, y, x, spans):
         col += len(text)
 
 
-def paint_composer(stdscr, y, width, typed):
+def paint_composer(stdscr, y, width, lines, placeholder=False):
     span = max(width - 1, 0)
     if span < 2:
         return
     inner = span - 2
-    put(stdscr, y, 0, "│", ATTR["default"])
-    arrow = " → "
-    put(stdscr, y, 1, arrow[:inner], ATTR["default"] if typed else ATTR["dim"])
-    rest = max(inner - len(arrow), 0)
-    if typed:
-        put(stdscr, y, 1 + min(len(arrow), inner), typed[:rest], ATTR["default"])
-    else:
-        put(stdscr, y, 1 + min(len(arrow), inner), "Add a follow-up"[:rest], ATTR["dim"])
-    put(stdscr, y, span - 1, "│", ATTR["default"])
+    attr = ATTR["dim"] if placeholder else ATTR["default"]
+    for index, line in enumerate(lines):
+        put(stdscr, y + index, 0, "│", ATTR["default"])
+        prefix = " → " if index == 0 else "   "
+        put(stdscr, y + index, 1, (prefix + line)[:inner], attr)
+        put(stdscr, y + index, span - 1, "│", ATTR["default"])
 
 
 def draw(stdscr, chat):
     height, width = stdscr.getmaxyx()
     stdscr.erase()
-    header, body_h, composer_h, footer_h = layout(height)
+    lines = draft_lines(chat.typed, width)
+    header, body_h, composer_h, footer_h = layout(height, len(lines) or 1)
     if header:
         put(stdscr, 0, 1, "│", ATTR["default"])
         put(stdscr, 0, 3, clip(chat.title, max(width - 4, 0)), ATTR["default"])
@@ -1005,9 +1023,12 @@ def draw(stdscr, chat):
     if composer_h >= 3:
         top, _mid, bot = composer_lines(width, chat.typed)
         put(stdscr, composer_at, 0, top, ATTR["default"])
-        paint_composer(stdscr, composer_at + 1, width, chat.typed)
-        put(stdscr, composer_at + 2, 0, bot, ATTR["default"])
-        cursor = (composer_at + 1, min(4 + len(chat.typed), max(width - 3, 0)))
+        visible = composer_h - 2
+        shown = lines[-visible:] if lines else ["Add a follow-up"]
+        paint_composer(stdscr, composer_at + 1, width, shown, placeholder=not lines)
+        put(stdscr, composer_at + composer_h - 1, 0, bot, ATTR["default"])
+        last = "" if not lines else shown[-1]
+        cursor = (composer_at + len(shown), min(4 + len(last), max(width - 3, 0)))
     elif composer_h == 1:
         shown = chat.typed or "Add a follow-up"
         put(
@@ -1036,8 +1057,16 @@ def place_cursor(visible):
         pass
 
 
+def fast_escape():
+    try:
+        curses.set_escdelay(25)
+    except (AttributeError, curses.error):
+        return
+
+
 def chat_loop(stdscr, chat):
     apply_theme(stdscr)
+    fast_escape()
     place_cursor(True)
     stdscr.keypad(True)
     # gbot's network calls used to run here, so typing froze until each one returned.
@@ -1110,6 +1139,8 @@ def chat_loop(stdscr, chat):
                 continue
             if key in ("\x03", "\x04"):
                 return
+            if key in ("\x1b", 27):
+                return "back"
             if key == curses.KEY_PPAGE:
                 chat.follow = False
                 chat.scroll = max(chat.scroll - max(curses.LINES - 4, 1), 0)
@@ -1117,7 +1148,7 @@ def chat_loop(stdscr, chat):
             if key == curses.KEY_NPAGE:
                 chat.scroll += max(curses.LINES - 4, 1)
                 height, width = stdscr.getmaxyx()
-                _header, body_h, _composer, _footer = layout(height)
+                _header, body_h, _composer, _footer = layout(height, len(draft_lines(chat.typed, width)) or 1)
                 rows = visible_rows(chat, width)
                 if chat.scroll >= max(len(rows) - body_h, 0):
                     chat.follow = True
@@ -1143,22 +1174,75 @@ def chat_loop(stdscr, chat):
         jobs.put(None)
 
 
+def fuzzy_score(query, name):
+    """Higher is a tighter match. None means the letters are not there in order."""
+    query = query.casefold()
+    if not query:
+        return 0
+    name = name.casefold()
+    found = name.find(query)
+    if found >= 0:
+        return 1000 - found + (50 if found == 0 else 0)
+    at = 0
+    score = 0
+    run = False
+    for index, char in enumerate(name):
+        if at < len(query) and char == query[at]:
+            score += 3 if index == 0 or not name[index - 1].isalnum() else 1
+            if run:
+                score += 2
+            run = True
+            at += 1
+        else:
+            run = False
+    if at != len(query):
+        return None
+    return score
+
+
+def fuzzy_bots(query, bots):
+    if not query:
+        return list(bots)
+    ranked = []
+    for index, bot in enumerate(bots):
+        scores = [fuzzy_score(query, bot.get("name") or "")]
+        title = bot.get("title") or ""
+        if title:
+            scores.append(fuzzy_score(query, title))
+        best = max((score for score in scores if score is not None), default=None)
+        if best is not None:
+            ranked.append((-best, index, bot))
+    ranked.sort()
+    return [bot for _score, _index, bot in ranked]
+
+
 def pick(stdscr, bots):
     apply_theme(stdscr)
+    fast_escape()
     place_cursor(False)
     stdscr.keypad(True)
     selected = 0
+    query = ""
     while True:
+        shown = fuzzy_bots(query, bots)
+        if not shown:
+            selected = 0
+        elif selected >= len(shown):
+            selected = len(shown) - 1
         height, width = stdscr.getmaxyx()
         stdscr.erase()
         put(stdscr, 0, 1, "│", ATTR["default"])
         put(stdscr, 0, 3, "Grok bots", ATTR["default"])
+        if query:
+            put(stdscr, 1, 3, clip("/" + query, max(width - 4, 0)), ATTR["dim"])
         footer = 1 if height >= 4 else 0
         body_h = max(height - 2 - footer, 0)
         top = 0
         if body_h and selected >= body_h:
             top = selected - body_h + 1
-        for index, bot in enumerate(bots[top : top + body_h]):
+        if not shown and body_h:
+            put(stdscr, 2, 1, clip("  no match", max(width - 2, 0)), ATTR["dim"])
+        for index, bot in enumerate(shown[top : top + body_h]):
             actual = top + index
             title = bot.get("title") or ""
             name = bot["name"] + (f"  {title}" if title else "")
@@ -1167,17 +1251,32 @@ def pick(stdscr, bots):
             else:
                 put(stdscr, 2 + index, 1, clip("  " + name, max(width - 2, 0)), ATTR["dim"])
         if footer:
-            paint_spans(stdscr, height - 1, 1, [("enter open · ctrl-c quit", "dim")])
+            paint_spans(stdscr, height - 1, 1, [("type to search · enter open · ctrl-c quit", "dim")])
         stdscr.refresh()
         key = stdscr.get_wch()
-        if key in ("\x03", "\x04", "q"):
+        if key in ("\x03", "\x04"):
             return None
-        if key in (curses.KEY_UP, "k") and selected > 0:
+        if key in ("\x1b", 27):
+            query = ""
+            selected = 0
+            continue
+        if key == curses.KEY_UP and selected > 0:
             selected -= 1
-        elif key in (curses.KEY_DOWN, "j") and selected < len(bots) - 1:
+            continue
+        if key == curses.KEY_DOWN and selected < len(shown) - 1:
             selected += 1
-        elif key in ("\n", "\r", curses.KEY_ENTER):
-            return bots[selected]["name"]
+            continue
+        if key in ("\n", "\r", curses.KEY_ENTER):
+            if shown:
+                return shown[selected]["name"]
+            continue
+        if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+            query = query[:-1]
+            selected = 0
+            continue
+        if isinstance(key, str) and key.isprintable():
+            query += key
+            selected = 0
 
 
 def open_chat(target):
@@ -1187,7 +1286,7 @@ def open_chat(target):
     chat = Chat(target)
     publish("idle", target, "", chat.resume)
     try:
-        curses.wrapper(lambda stdscr: chat_loop(stdscr, chat))
+        return curses.wrapper(lambda stdscr: chat_loop(stdscr, chat))
     finally:
         emit("clear", chat.title)
         try:
@@ -1232,6 +1331,37 @@ def complete_names():
     return 0 if names else 1
 
 
+def session(target):
+    while True:
+        if not target:
+            try:
+                bots = list(ROSTER.values())
+                if not bots:
+                    bots = list_bots()
+            except GbotError as error:
+                print(error, file=sys.stderr)
+                return 1
+            if not bots:
+                print("No bots.", file=sys.stderr)
+                return 1
+            try:
+                target = curses.wrapper(lambda stdscr: pick(stdscr, bots))
+            except KeyboardInterrupt:
+                return 130
+            if not target:
+                return 0
+        try:
+            back = open_chat(target)
+        except GbotError as error:
+            print(error, file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            return 130
+        if back != "back":
+            return 0
+        target = ""
+
+
 def open_named(query):
     chosen = query
     cached = read_names()
@@ -1244,25 +1374,23 @@ def open_named(query):
                 return 1
             chosen = query
     try:
-        open_chat(chosen)
-        return 0
+        back = open_chat(chosen)
     except GbotError as error:
         if "No bot or group named" not in str(error):
             print(error, file=sys.stderr)
             return 1
+    except KeyboardInterrupt:
+        return 130
+    else:
+        if back != "back":
+            return 0
+        return session("")
     try:
         chosen = match_bot(query, [bot["name"] for bot in list_bots()])
     except GbotError as error:
         print(error, file=sys.stderr)
         return 1
-    try:
-        open_chat(chosen)
-    except GbotError as error:
-        print(error, file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        return 130
-    return 0
+    return session(chosen)
 
 
 def main(argv):
@@ -1279,27 +1407,9 @@ def main(argv):
         return 1
     if not target:
         try:
-            bots = list_bots()
-        except GbotError as error:
-            print(error, file=sys.stderr)
-            return 1
-        if not bots:
-            print("No bots.", file=sys.stderr)
-            return 1
-        try:
-            target = curses.wrapper(lambda stdscr: pick(stdscr, bots))
+            return session("")
         except KeyboardInterrupt:
             return 130
-        if not target:
-            return 0
-        try:
-            open_chat(target)
-        except GbotError as error:
-            print(error, file=sys.stderr)
-            return 1
-        except KeyboardInterrupt:
-            return 130
-        return 0
     try:
         return open_named(target)
     except KeyboardInterrupt:

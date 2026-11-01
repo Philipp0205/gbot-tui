@@ -121,10 +121,16 @@ class AvatarTests(unittest.TestCase):
             root = Path(tmp)
             mask = root / "bot-heart.png"
             face = root / "bot-heart-face.png"
-            Image.new("RGBA", (16, 16), (255, 255, 255, 255)).save(mask)
-            sheet = Image.new("RGBA", (18, 18), (0, 0, 0, 0))
-            sheet.putpixel((8, 8), (0, 0, 0, 255))
+            shape = Image.new("RGBA", (16, 16), (0, 0, 0, 0))
+            shape.putpixel((1, 1), (0, 0, 0, 255))
+            shape.save(mask)
+            sheet = Image.new("RGBA", (36, 18), (0, 0, 0, 0))
+            sheet.putpixel((1, 1), (0, 0, 0, 255))
+            sheet.putpixel((18, 0), (0, 0, 0, 255))
             sheet.save(face)
+            stale = root / "icons" / "gbot" / "gbot-abc-heart-red.png"
+            stale.parent.mkdir(parents=True)
+            Image.new("RGBA", (4, 4), (0, 0, 0, 255)).save(stale)
             made = gbot_tui.install_avatars(
                 [{"id": "abc", "name": "Outfitly", "avatarShape": "heart", "avatarColor": "red"}],
                 root=tmp,
@@ -133,8 +139,12 @@ class AvatarTests(unittest.TestCase):
             self.assertIn("gbot-abc", made)
             self.assertFalse(made["gbot-abc"]["tint"])
             icon = root / made["gbot-abc"]["icon"]
-            pixel = Image.open(icon).getpixel((2, 2))
+            image = Image.open(icon)
+            self.assertEqual(image.size, (64, 64))
+            pixel = image.getpixel((4, 4))
             self.assertEqual(pixel[:3], (255, 38, 60))
+            self.assertGreater(pixel[3], 0)
+            self.assertEqual(image.getpixel((0, 0))[3], 0)
             previous = gbot_tui.APP
             try:
                 gbot_tui.show_avatar(
@@ -176,6 +186,37 @@ class LookTests(unittest.TestCase):
         _top, typed, _bot = gbot_tui.composer_lines(32, "hello")
         self.assertIn("hello", typed)
         self.assertNotIn("Add a follow-up", typed)
+
+    def test_long_draft_wraps_and_the_box_grows(self):
+        text = "abcdefghijklmnopqrstuvwxyz"
+        lines = gbot_tui.draft_lines(text, 20)
+        self.assertGreater(len(lines), 1)
+        self.assertEqual("".join(lines), text)
+        width = gbot_tui.composer_text_width(20)
+        self.assertTrue(all(len(line) <= width for line in lines))
+        _header, short_body, short_box, _footer = gbot_tui.layout(24, 1)
+        _header, long_body, long_box, _footer = gbot_tui.layout(24, 4)
+        self.assertEqual(short_box, 3)
+        self.assertEqual(long_box, 6)
+        self.assertEqual(short_body - long_body, 3)
+
+    def test_fuzzy_search_orders_the_list(self):
+        bots = [
+            {"name": "Nutritionist", "title": ""},
+            {"name": "Night Watch", "title": ""},
+            {"name": "Outfitly", "title": "clothes"},
+        ]
+        self.assertEqual(
+            [bot["name"] for bot in gbot_tui.fuzzy_bots("", bots)],
+            ["Nutritionist", "Night Watch", "Outfitly"],
+        )
+        self.assertEqual(gbot_tui.fuzzy_bots("otf", bots)[0]["name"], "Outfitly")
+        self.assertEqual(
+            [bot["name"] for bot in gbot_tui.fuzzy_bots("n", bots)],
+            ["Nutritionist", "Night Watch"],
+        )
+        self.assertEqual(gbot_tui.fuzzy_bots("clothes", bots)[0]["name"], "Outfitly")
+        self.assertEqual(gbot_tui.fuzzy_bots("zzz", bots), [])
 
     def test_user_text_is_a_bubble_and_the_reply_is_plain(self):
         rows = gbot_tui.transcript_rows(
