@@ -67,9 +67,9 @@ Authorization on those posts is `Bearer <gatewayToken>`. Local sockets in `gbot`
 
 `Chat` holds the target, title, session id, messages, cursor, typed draft, scroll position, and a phase.
 
-The first load replaces the message list. Later polls pass `--after <cursor>` and append only new entries. `gapReset` means the cursor is stale, so the whole thread is replaced.
+The first load replaces the message list and keeps a local line the thread does not have yet. Later polls pass `--after <cursor>` and merge the new entries, replacing a local user row when the text matches. `gapReset` means the cursor is stale, so the whole thread is replaced, and an unacked local line stays at the end.
 
-Sending clears the draft, marks the phase `working`, calls `gbot send`, then polls once so the new user line shows up immediately.
+Sending clears the draft, appends the user's line to the transcript, and marks the phase `working`. One background worker then calls `gbot send`. The curses loop does not wait on it. The next poll replaces that local row when the thread returns the same user text, and keeps the local row when the poll does not have it yet.
 
 `watch_step` moves the phase:
 
@@ -90,7 +90,7 @@ The two-poll window is about four seconds, because the curses loop waits up to 2
 - Page Up / Page Down scroll. Scrolling up turns off follow-tail. Scrolling back to the bottom turns it on
 - Ctrl-C or Ctrl-D exits
 
-The layout is a header (bot name), a transcript, a box composer, and a one-line footer. User lines are padded into a gray bubble (ANSI 235 on a dark terminal, 254 on a light one, from `COLORFGBG`). Other messages are plain wrapped text. The footer says `enter send`, `Generating`, `Pending decision`, or the last `gbot` error.
+The layout follows the desktop chat. The header is the bot's name, a color mark for its avatar, and its label when it has one. Your lines are a gray bubble on the right (ANSI 235 on a dark terminal, 254 on a light one, from `COLORFGBG`). The bot's lines sit on the left, next to that same mark, in its avatar color. A pending approval is a `Needs approval` card. Under that is the box composer and a one-line footer. The footer says `enter send`, `Generating`, `Pending decision`, or the last `gbot` error.
 
 On exit the TUI emits an OSC clear and, inside Herdr, `herdr pane release-agent`.
 
@@ -103,4 +103,4 @@ The chat works without Herdr. When the phase changes, `publish` reports it two w
 
 If this process is the only live terminal in its Herdr tab, the tab is renamed to the bot. The check walks `/proc` for ancestor pids, then asks `hc ls` / `hc get` which terminal owns this process.
 
-Avatars are optional and only for Herdr's program icons. On `bots list`, the TUI mounts the Grok Bot AppImage with `squashfuse`, pulls `bot-*.png` masks and faces out of `app.asar`, and writes `~/.config/herdr-app/icons/gbot/` plus a `programs.json` entry. The face file is a strip of 18px frames whose alpha is the body (eyes are holes, RGB is black). The icon is the resting frame tinted with the bot's color. A png already on disk is replaced when the bytes differ. The OSC `app` field becomes `gbot-<bot id>`, which is the key Herdr matches. A missing AppImage, `squashfuse`, or Pillow is ignored. The chat still runs.
+Avatars are optional and only for Herdr's program icons. On `bots list`, the TUI mounts the Grok Bot AppImage with `squashfuse`, pulls `bot-*.png` masks and faces out of `app.asar`, and writes `~/.config/herdr-app/icons/gbot/` plus `programs.json`. The face file is 29 frames of 18px. Frame 0 is the resting pose. Its RGB is black and is not drawn; the icon uses the bot's color and that frame's alpha, so the body is filled and the eyes stay holes. Herdr's program icon is one static path, so the strip is not animated. A png already on disk is replaced when the bytes differ. The OSC `app` field is `program_key`, at most 32 bytes, which is the key Herdr matches. `programs.json` may also keep the longer `gbot-<id>` key, and both point at that same icon. A missing AppImage, `squashfuse`, or Pillow is ignored. The chat still runs.

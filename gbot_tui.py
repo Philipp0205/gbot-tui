@@ -289,6 +289,18 @@ def program_key(bot_id):
     return ("gbot-" + compact)[:32]
 
 
+def program_ids(bot_id):
+    """The OSC key, then the full gbot-<id> when programs.json already has both."""
+    primary = program_key(bot_id)
+    safe = "".join(ch for ch in str(bot_id) if ch.isalnum() or ch == "-")
+    full = f"gbot-{safe}" if safe else ""
+    keys = []
+    for key in (primary, full):
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
 def list_bots():
     payload = gbot("bots", "list", timeout=30)
     rows = payload if isinstance(payload, list) else []
@@ -301,7 +313,7 @@ def list_bots():
     write_names([bot["name"] for bot in bots])
     try:
         install_avatars(bots)
-    except OSError:
+    except (OSError, ImportError):
         pass
     return bots
 
@@ -341,20 +353,27 @@ def herdr_root():
     return os.path.join(os.path.expanduser("~"), ".config", "herdr-app")
 
 
-def compose_avatar(mask_path, _face_path, color):
-    """Tint the solid avatar mask so it stays filled on Herdr's dark tile."""
+def compose_avatar(_mask_path, face_path, color):
+    """Tint the resting face frame. The strip's black RGB is not drawn.
+
+    Frame 0 of bot-<shape>-face.png is 18×18. Its alpha is the filled body
+    and the eyes are holes. Pasting that black frame onto the mask only
+    leaves a rim on Herdr's dark tile. Herdr's program icon is one still
+    path, so this is the rest pose and not the other 28 frames.
+    """
     from PIL import Image
 
-    mask = Image.open(mask_path).convert("RGBA")
+    face = Image.open(face_path).convert("RGBA")
+    frame = face.crop((0, 0, min(18, face.width), min(18, face.height)))
     size = 64
-    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
-    mask = mask.resize((size, size), resample)
+    resample = getattr(getattr(Image, "Resampling", Image), "NEAREST")
+    frame = frame.resize((size, size), resample)
     rgb = tuple(int(color[i : i + 2], 16) for i in (1, 3, 5))
-    painted = Image.new("RGBA", mask.size)
-    src = mask.load()
+    painted = Image.new("RGBA", frame.size)
+    src = frame.load()
     dst = painted.load()
-    for y in range(mask.height):
-        for x in range(mask.width):
+    for y in range(frame.height):
+        for x in range(frame.width):
             dst[x, y] = (*rgb, src[x, y][3])
     import io
 
@@ -476,7 +495,8 @@ def install_avatars(bots, root=None, src=None):
     made = {}
     changed = False
     for bot in bots:
-        key = program_key(bot.get("id") or "")
+        keys = program_ids(bot.get("id") or "")
+        key = keys[0] if keys else ""
         shape = "".join(ch for ch in str(bot.get("avatarShape") or bot.get("avatar_shape") or "") if ch.isalnum())
         color_name = "".join(ch for ch in str(bot.get("avatarColor") or bot.get("avatar_color") or "") if ch.isalnum())
         if not key or not shape:
@@ -489,7 +509,7 @@ def install_avatars(bots, root=None, src=None):
         dest = os.path.join(root, rel)
         try:
             png = compose_avatar(mask, face, avatar_color(color_name))
-        except (OSError, ValueError):
+        except (OSError, ValueError, ImportError):
             continue
         try:
             with open(dest, "rb") as handle:
@@ -509,9 +529,12 @@ def install_avatars(bots, root=None, src=None):
             "match": [key],
         }
         made[key] = entry
-        if programs.get(key) != entry:
-            programs[key] = entry
-            changed = True
+        for slot in keys:
+            slot_entry = dict(entry, match=[slot])
+            made[slot] = slot_entry
+            if programs.get(slot) != slot_entry:
+                programs[slot] = slot_entry
+                changed = True
     if changed:
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
@@ -752,6 +775,10 @@ class Chat:
         self.typed = ""
         self.error = ""
         self.resume = resume_arg(target)
+        bot = ROSTER.get(target) or {}
+        self.avatar_color = bot.get("avatarColor") or bot.get("avatar_color") or ""
+        self.avatar_shape = bot.get("avatarShape") or bot.get("avatar_shape") or ""
+        self.label = bot.get("title") or ""
 
     def note(self, phase):
         if phase != self.phase:
@@ -764,16 +791,52 @@ class Chat:
             self.resume = resume_arg(page["name"]) or resume_arg(page["id"]) or self.resume
         if page["id"]:
             self.session_id = page["id"]
+        if page.get("avatar_shape"):
+            self.avatar_shape = page["avatar_shape"]
+        if page.get("avatar_color"):
+            self.avatar_color = page["avatar_color"]
         if replace or page["gap_reset"]:
-            self.messages = page["entries"]
+            pending = [entry for entry in self.messages if entry.get("local")]
+            self.messages = list(page["entries"])
+            for entry in pending:
+                if not self._covers(entry):
+                    self.messages.append(entry)
             self.cursor = page["cursor"]
             return []
-        fresh = page["entries"]
-        if fresh:
-            self.messages.extend(fresh)
+        fresh = list(page["entries"])
+        for entry in fresh:
+            self._absorb(entry)
         if page["cursor"]:
             self.cursor = page["cursor"]
         return fresh
+
+    def _covers(self, local):
+        text = entry_text(local).strip()
+        return any(
+            is_user(entry) and not entry.get("local") and entry_text(entry).strip() == text
+            for entry in self.messages
+        )
+
+    def _take_local(self, entry):
+        if not is_user(entry):
+            return False
+        text = entry_text(entry).strip()
+        if not text:
+            return False
+        for index, local in enumerate(self.messages):
+            if local.get("local") and entry_text(local).strip() == text:
+                self.messages[index] = entry
+                return True
+        return False
+
+    def _absorb(self, entry):
+        if self._take_local(entry):
+            return
+        index = next((i for i, local in enumerate(self.messages) if local.get("local")), None)
+        if index is None:
+            self.messages.append(entry)
+        else:
+            self.messages.insert(index, entry)
 
     def ingest(self, page, first=False):
         replace = first or not self.cursor or page["gap_reset"]
@@ -788,7 +851,12 @@ class Chat:
             fresh = self.apply(page, replace=False)
         if first:
             show_avatar(page)
-            phase = "blocked" if pending_approval(self.messages) else "idle"
+            if pending_approval(self.messages):
+                phase = "blocked"
+            elif self.phase == "working":
+                phase = "working"
+            else:
+                phase = "idle"
             self.phase = phase
             publish(phase, self.title, self.session_id, self.resume)
             title = self.title
@@ -820,6 +888,8 @@ class Chat:
         self.error = ""
         self.saw_other = False
         self.quiet = 0
+        self.follow = True
+        self.messages.append({"role": "user", "text": text, "local": True})
         self.note("working")
         return text
 
@@ -834,8 +904,44 @@ def dark_terminal():
 
 
 def user_bubble():
-    # Cursor's fallback user-message colors: ansi 235 on a dark terminal, 254 on a light one.
+    # The desktop app's user bubble: ansi 235 on a dark terminal, 254 on a light one.
     return 235 if dark_terminal() else 254
+
+
+def xterm_color(hex_color):
+    red = int(hex_color[1:3], 16)
+    green = int(hex_color[3:5], 16)
+    blue = int(hex_color[5:7], 16)
+    if max(red, green, blue) - min(red, green, blue) < 12:
+        if red < 8:
+            return 16
+        if red > 248:
+            return 231
+        return 232 + int(round((red - 8) / 247 * 24))
+    return 16 + 36 * int(round(red / 51.0)) + 6 * int(round(green / 51.0)) + int(round(blue / 51.0))
+
+
+AVATAR_ATTR = {}
+
+
+def avatar_attr(name):
+    return AVATAR_ATTR.get((name or "").lower(), ATTR["default"])
+
+
+def bot_text_attr(name):
+    # Desktop 1:1 messages use the bot's color. Black would vanish on a dark terminal.
+    folded = (name or "").lower()
+    if folded == "black" and dark_terminal():
+        return ATTR["default"]
+    if folded not in AVATAR_ATTR:
+        return ATTR["default"]
+    return AVATAR_ATTR[folded]
+
+
+def bubble_column(width, text):
+    """Right edge of a user bubble, inset one column, as in the desktop chat."""
+    shown = " " + text + " "
+    return max(width - len(shown) - 1, 0)
 
 
 def composer_text_width(width):
@@ -881,21 +987,46 @@ def visible_rows(chat, width):
     return chat._rows
 
 
+def card_text(entry):
+    if not isinstance(entry, dict) or entry.get("kind") != "send-message":
+        return ""
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return ""
+    kind = message.get("type")
+    card = message.get("approval") if kind == "auto-review-approval" else None
+    if kind == "local-tool-permission":
+        card = message.get("ask")
+    if isinstance(card, dict) and card.get("status") == "pending":
+        return "Needs approval"
+    return ""
+
+
 def transcript_rows(entries, width):
     rows = []
     user_w = max(width - 8, 1)
-    text_w = max(width - 2, 1)
+    text_w = max(width - 4, 1)
     for entry in entries:
+        card = card_text(entry)
         text = entry_text(entry).strip()
-        if not text:
+        if not text and not card:
             continue
-        user = is_user(entry)
-        wrapped = wrap(text, user_w if user else text_w)
         if rows:
             rows.append(("gap", ""))
-        kind = "user" if user else "text"
-        for line in wrapped:
-            rows.append((kind, line))
+        if text:
+            user = is_user(entry)
+            wrapped = wrap(text, user_w if user else text_w)
+            if user:
+                span = max(len(line) for line in wrapped)
+                for line in wrapped:
+                    rows.append(("user", line.ljust(span)))
+            else:
+                for line in wrapped:
+                    rows.append(("text", line))
+        if card:
+            if text:
+                rows.append(("gap", ""))
+            rows.append(("card", card))
     return rows
 
 
@@ -950,8 +1081,13 @@ def apply_theme(stdscr):
             bubble = user_bubble()
             curses.init_pair(2, -1, bubble)
             ATTR["user"] = curses.color_pair(2)
+            AVATAR_ATTR.clear()
+            for index, (name, hex_color) in enumerate(AVATAR_COLORS.items()):
+                curses.init_pair(10 + index, xterm_color(hex_color), -1)
+                AVATAR_ATTR[name] = curses.color_pair(10 + index)
         else:
             ATTR["user"] = ATTR["bold"]
+            AVATAR_ATTR.clear()
         curses.init_pair(3, curses.COLOR_YELLOW, -1)
         curses.init_pair(4, curses.COLOR_RED, -1)
         ATTR["yellow"] = curses.color_pair(3)
@@ -975,10 +1111,16 @@ def put(stdscr, y, x, text, attr=0):
         pass
 
 
+def span_attr(style):
+    if style in ATTR:
+        return ATTR[style]
+    return avatar_attr(style)
+
+
 def paint_spans(stdscr, y, x, spans):
     col = x
     for text, style in spans:
-        put(stdscr, y, col, text, ATTR.get(style, 0))
+        put(stdscr, y, col, text, span_attr(style))
         col += len(text)
 
 
@@ -1000,24 +1142,33 @@ def draw(stdscr, chat):
     stdscr.erase()
     lines = draft_lines(chat.typed, width)
     header, body_h, composer_h, footer_h = layout(height, len(lines) or 1)
+    color = getattr(chat, "avatar_color", "")
     if header:
-        put(stdscr, 0, 1, "│", ATTR["default"])
-        put(stdscr, 0, 3, clip(chat.title, max(width - 4, 0)), ATTR["default"])
+        put(stdscr, 0, 1, "●", avatar_attr(color))
+        put(stdscr, 0, 3, clip(chat.title, max(width - 4, 0)), ATTR["bold"])
+        label = getattr(chat, "label", "")
+        if header > 1 and label:
+            put(stdscr, 1, 3, clip(label, max(width - 4, 0)), ATTR["dim"])
     rows = visible_rows(chat, width)
     if chat.follow:
         chat.scroll = max(len(rows) - body_h, 0)
     start = min(chat.scroll, max(len(rows) - body_h, 0))
-    bubble_w = max(width - 2, 0)
     for row in range(body_h):
         index = start + row
         if index >= len(rows):
             continue
         kind, text = rows[index]
         y = header + row
+        previous = rows[index - 1][0] if index else ""
         if kind == "user":
-            put(stdscr, y, 1, (" " + text).ljust(bubble_w)[:bubble_w], ATTR["user"])
+            shown = " " + text + " "
+            put(stdscr, y, bubble_column(width, text), shown, ATTR["user"])
         elif kind == "text":
-            put(stdscr, y, 1, text, ATTR["default"])
+            if previous != "text":
+                put(stdscr, y, 1, "●", avatar_attr(color))
+            put(stdscr, y, 3, text, bot_text_attr(color))
+        elif kind == "card":
+            put(stdscr, y, 1, clip(text, max(width - 2, 0)), ATTR["yellow"])
     composer_at = header + body_h
     cursor = None
     if composer_h >= 3:
@@ -1200,6 +1351,20 @@ def fuzzy_score(query, name):
     return score
 
 
+def picker_spans(bot, selected, width):
+    """One sidebar row: selection mark, avatar, name, and label."""
+    title = bot.get("title") or ""
+    name = bot["name"] + (f"  {title}" if title else "")
+    style = "bold" if selected else "dim"
+    lead = "→ " if selected else "  "
+    color = (bot.get("avatarColor") or bot.get("avatar_color") or "").lower()
+    return [
+        (lead, style),
+        ("● ", color or "default"),
+        (clip(name, max(width - 7, 0)), style),
+    ]
+
+
 def fuzzy_bots(query, bots):
     if not query:
         return list(bots)
@@ -1231,8 +1396,7 @@ def pick(stdscr, bots):
             selected = len(shown) - 1
         height, width = stdscr.getmaxyx()
         stdscr.erase()
-        put(stdscr, 0, 1, "│", ATTR["default"])
-        put(stdscr, 0, 3, "Grok bots", ATTR["default"])
+        put(stdscr, 0, 1, "Grok bots", ATTR["bold"])
         if query:
             put(stdscr, 1, 3, clip("/" + query, max(width - 4, 0)), ATTR["dim"])
         footer = 1 if height >= 4 else 0
@@ -1244,12 +1408,7 @@ def pick(stdscr, bots):
             put(stdscr, 2, 1, clip("  no match", max(width - 2, 0)), ATTR["dim"])
         for index, bot in enumerate(shown[top : top + body_h]):
             actual = top + index
-            title = bot.get("title") or ""
-            name = bot["name"] + (f"  {title}" if title else "")
-            if actual == selected:
-                put(stdscr, 2 + index, 1, clip("→ " + name, max(width - 2, 0)), ATTR["bold"])
-            else:
-                put(stdscr, 2 + index, 1, clip("  " + name, max(width - 2, 0)), ATTR["dim"])
+            paint_spans(stdscr, 2 + index, 1, picker_spans(bot, actual == selected, width))
         if footer:
             paint_spans(stdscr, height - 1, 1, [("type to search · enter open · ctrl-c quit", "dim")])
         stdscr.refresh()

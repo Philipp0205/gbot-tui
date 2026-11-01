@@ -121,12 +121,16 @@ class AvatarTests(unittest.TestCase):
             root = Path(tmp)
             mask = root / "bot-heart.png"
             face = root / "bot-heart-face.png"
-            shape = Image.new("RGBA", (16, 16), (0, 0, 0, 0))
-            shape.putpixel((1, 1), (0, 0, 0, 255))
-            shape.save(mask)
+            # The mask is a solid disc. The face is the body: frame 0 is filled,
+            # the corner and the eye are holes, and frame 1 must not be drawn.
+            Image.new("RGBA", (18, 18), (0, 0, 0, 255)).save(mask)
             sheet = Image.new("RGBA", (36, 18), (0, 0, 0, 0))
-            sheet.putpixel((1, 1), (0, 0, 0, 255))
-            sheet.putpixel((18, 0), (0, 0, 0, 255))
+            for y in range(18):
+                for x in range(18):
+                    sheet.putpixel((x, y), (0, 0, 0, 255))
+            sheet.putpixel((0, 0), (0, 0, 0, 0))
+            sheet.putpixel((9, 9), (0, 0, 0, 0))
+            sheet.putpixel((18, 0), (255, 255, 255, 255))
             sheet.save(face)
             stale = root / "icons" / "gbot" / "gbot-abc-heart-red.png"
             stale.parent.mkdir(parents=True)
@@ -141,10 +145,11 @@ class AvatarTests(unittest.TestCase):
             icon = root / made["gbot-abc"]["icon"]
             image = Image.open(icon)
             self.assertEqual(image.size, (64, 64))
-            pixel = image.getpixel((4, 4))
-            self.assertEqual(pixel[:3], (255, 38, 60))
-            self.assertGreater(pixel[3], 0)
+            body = image.getpixel((4, 4))
+            self.assertEqual(body, (255, 38, 60, 255))
             self.assertEqual(image.getpixel((0, 0))[3], 0)
+            self.assertEqual(image.getpixel((32, 32))[3], 0)
+            self.assertTrue(all(pixel[:3] == (255, 38, 60) for pixel in image.get_flattened_data()))
             previous = gbot_tui.APP
             try:
                 gbot_tui.show_avatar(
@@ -159,6 +164,67 @@ class AvatarTests(unittest.TestCase):
                 gbot_tui.APP = previous
             programs = __import__("json").loads((root / "programs.json").read_text())
             self.assertEqual(programs["programs"]["gbot-abc"]["icon"], made["gbot-abc"]["icon"])
+            long_id = "ea566f99-aded-40c2-99fc-60e5477d2a61"
+            long_made = gbot_tui.install_avatars(
+                [{"id": long_id, "name": "Researcher", "avatarShape": "heart", "avatarColor": "red"}],
+                root=tmp,
+                src=tmp,
+            )
+            compact = gbot_tui.program_key(long_id)
+            full = "gbot-" + long_id
+            self.assertLessEqual(len(compact), 32)
+            self.assertGreater(len(full), 32)
+            self.assertEqual(long_made[compact]["icon"], long_made[full]["icon"])
+            self.assertFalse(long_made[compact]["tint"])
+            programs = __import__("json").loads((root / "programs.json").read_text())
+            self.assertEqual(programs["programs"][compact]["icon"], programs["programs"][full]["icon"])
+            self.assertFalse(programs["programs"][compact]["tint"])
+            self.assertEqual(programs["programs"]["gbot-abc"]["icon"], made["gbot-abc"]["icon"])
+            previous = gbot_tui.APP
+            try:
+                gbot_tui.show_avatar(
+                    {
+                        "id": long_id,
+                        "name": "Researcher",
+                        "avatar_shape": "heart",
+                        "avatar_color": "red",
+                    },
+                    root=tmp,
+                    src=tmp,
+                )
+                self.assertEqual(gbot_tui.APP, compact)
+                report = gbot_tui.osc_report("working", "Researcher")
+                self.assertIn(f"app={compact}", report)
+                self.assertLessEqual(len(compact), 32)
+            finally:
+                gbot_tui.APP = previous
+
+    def test_missing_pillow_skips_the_icon(self):
+        import builtins
+
+        real_import = builtins.__import__
+
+        def guarded(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "PIL" or name.startswith("PIL."):
+                raise ImportError("no pillow")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            from PIL import Image
+
+            Image.new("RGBA", (18, 18), (0, 0, 0, 255)).save(root / "bot-heart.png")
+            Image.new("RGBA", (18, 18), (0, 0, 0, 255)).save(root / "bot-heart-face.png")
+            builtins.__import__ = guarded
+            try:
+                made = gbot_tui.install_avatars(
+                    [{"id": "abc", "name": "Outfitly", "avatarShape": "heart", "avatarColor": "red"}],
+                    root=tmp,
+                    src=tmp,
+                )
+            finally:
+                builtins.__import__ = real_import
+            self.assertEqual(made, {})
 
 
 class LookTests(unittest.TestCase):
@@ -217,6 +283,15 @@ class LookTests(unittest.TestCase):
         )
         self.assertEqual(gbot_tui.fuzzy_bots("clothes", bots)[0]["name"], "Outfitly")
         self.assertEqual(gbot_tui.fuzzy_bots("zzz", bots), [])
+        spans = gbot_tui.picker_spans(
+            {"name": "Outfitly", "title": "wardrobe", "avatarColor": "violet"},
+            True,
+            40,
+        )
+        self.assertEqual(spans[0], ("→ ", "bold"))
+        self.assertEqual(spans[1], ("● ", "violet"))
+        self.assertIn("Outfitly", spans[2][0])
+        self.assertIn("wardrobe", spans[2][0])
 
     def test_user_text_is_a_bubble_and_the_reply_is_plain(self):
         rows = gbot_tui.transcript_rows(
@@ -227,12 +302,98 @@ class LookTests(unittest.TestCase):
             40,
         )
         self.assertEqual([kind for kind, _text in rows], ["user", "gap", "text"])
+        self.assertGreater(gbot_tui.bubble_column(40, "hi"), 20)
+
+    def test_pending_card_reads_needs_approval(self):
+        rows = gbot_tui.transcript_rows(
+            [
+                {
+                    "kind": "send-message",
+                    "message": {
+                        "type": "auto-review-approval",
+                        "approval": {"status": "pending"},
+                    },
+                }
+            ],
+            40,
+        )
+        self.assertEqual(rows, [("card", "Needs approval")])
 
     def test_footer_states(self):
         self.assertEqual(gbot_tui.footer_spans("blocked", "")[0], ("Pending decision", "yellow"))
         working = "".join(text for text, _style in gbot_tui.footer_spans("working", ""))
         self.assertIn("Generating", working)
         self.assertEqual(gbot_tui.footer_spans("idle", "no session")[0][1], "red")
+
+
+class SendTests(unittest.TestCase):
+    def test_enter_shows_the_line_and_the_poll_replaces_it(self):
+        chat = gbot_tui.Chat("Researcher")
+        chat.typed = "  hello  "
+        self.assertEqual(chat.arm_send(), "hello")
+        self.assertEqual(chat.phase, "working")
+        self.assertEqual(chat.typed, "")
+        self.assertEqual(gbot_tui.entry_text(chat.messages[-1]), "hello")
+        self.assertTrue(chat.messages[-1].get("local"))
+        page = gbot_tui.parse_thread(
+            {
+                "target": {"id": "a1", "name": "Researcher"},
+                "transcript": {
+                    "entries": [
+                        {"id": "m1", "role": "user", "text": "hello"},
+                        {"id": "m2", "role": "assistant", "text": "yo"},
+                    ]
+                },
+                "cursor": "m2",
+            }
+        )
+        chat.apply(page, replace=False)
+        self.assertEqual([gbot_tui.entry_text(entry) for entry in chat.messages], ["hello", "yo"])
+        self.assertEqual(chat.messages[0]["id"], "m1")
+        self.assertFalse(chat.messages[0].get("local"))
+
+    def test_a_reply_between_two_sends_stays_between_them(self):
+        chat = gbot_tui.Chat("Researcher")
+        chat.messages = [{"role": "assistant", "text": "earlier"}]
+        chat.typed = "one"
+        chat.arm_send()
+        chat.typed = "two"
+        chat.arm_send()
+        page = gbot_tui.parse_thread(
+            {
+                "transcript": {
+                    "entries": [
+                        {"id": "u1", "role": "user", "text": "one"},
+                        {"id": "a1", "role": "assistant", "text": "ack"},
+                        {"id": "u2", "role": "user", "text": "two"},
+                    ]
+                },
+                "cursor": "u2",
+            }
+        )
+        chat.apply(page, replace=False)
+        self.assertEqual(
+            [gbot_tui.entry_text(entry) for entry in chat.messages],
+            ["earlier", "one", "ack", "two"],
+        )
+
+    def test_gap_reset_keeps_an_unacked_local_line(self):
+        chat = gbot_tui.Chat("Researcher")
+        chat.typed = "hello"
+        chat.arm_send()
+        page = gbot_tui.parse_thread(
+            {
+                "transcript": {"entries": [{"id": "old", "role": "assistant", "text": "prior"}]},
+                "cursor": "old",
+                "gapReset": True,
+            }
+        )
+        chat.apply(page, replace=False)
+        self.assertEqual(
+            [gbot_tui.entry_text(entry) for entry in chat.messages],
+            ["prior", "hello"],
+        )
+        self.assertTrue(chat.messages[-1].get("local"))
 
 
 class HerdrTests(unittest.TestCase):
