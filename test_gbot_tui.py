@@ -1,6 +1,8 @@
 import base64
 import os
+import tempfile
 import unittest
+from pathlib import Path
 
 import gbot_tui
 
@@ -24,6 +26,16 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(page["name"], "Researcher")
         self.assertEqual(page["cursor"], "m2")
         self.assertEqual(page["entries"][0]["text"], "done")
+        self.assertEqual(page["avatar_shape"], "")
+
+    def test_thread_keeps_the_avatar(self):
+        page = gbot_tui.parse_thread(
+            {"target": {"id": "bot-1", "name": "Outfitly", "avatarShape": "heart", "avatarColor": "brown"}}
+        )
+        self.assertEqual(page["avatar_shape"], "heart")
+        self.assertEqual(page["avatar_color"], "brown")
+        self.assertEqual(gbot_tui.program_key(page["id"]), "gbot-bot-1")
+        self.assertEqual(gbot_tui.avatar_color("brown"), "#936439")
 
     def test_gbot_error(self):
         with self.assertRaises(gbot_tui.GbotError):
@@ -91,6 +103,44 @@ class NameTests(unittest.TestCase):
         self.assertIn("Night Watch", str(error.exception))
         with self.assertRaises(gbot_tui.GbotError):
             gbot_tui.match_bot("missing", names)
+
+
+class AvatarTests(unittest.TestCase):
+    def test_icon_is_the_colored_shape_with_a_face(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            mask = root / "bot-heart.png"
+            face = root / "bot-heart-face.png"
+            Image.new("RGBA", (16, 16), (255, 255, 255, 255)).save(mask)
+            sheet = Image.new("RGBA", (18, 18), (0, 0, 0, 0))
+            sheet.putpixel((8, 8), (0, 0, 0, 255))
+            sheet.save(face)
+            made = gbot_tui.install_avatars(
+                [{"id": "abc", "name": "Outfitly", "avatarShape": "heart", "avatarColor": "red"}],
+                root=tmp,
+                src=tmp,
+            )
+            self.assertIn("gbot-abc", made)
+            self.assertFalse(made["gbot-abc"]["tint"])
+            icon = root / made["gbot-abc"]["icon"]
+            pixel = Image.open(icon).getpixel((2, 2))
+            self.assertEqual(pixel[:3], (255, 38, 60))
+            previous = gbot_tui.APP
+            try:
+                gbot_tui.show_avatar(
+                    {"id": "abc", "name": "Outfitly", "avatar_shape": "heart", "avatar_color": "red"},
+                    root=tmp,
+                    src=tmp,
+                )
+                self.assertEqual(gbot_tui.APP, "gbot-abc")
+                report = gbot_tui.osc_report("idle", "Outfitly")
+                self.assertIn("app=gbot-abc", report)
+            finally:
+                gbot_tui.APP = previous
+            programs = __import__("json").loads((root / "programs.json").read_text())
+            self.assertEqual(programs["programs"]["gbot-abc"]["icon"], made["gbot-abc"]["icon"])
 
 
 class LookTests(unittest.TestCase):

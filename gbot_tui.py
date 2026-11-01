@@ -138,6 +138,8 @@ def parse_thread(payload):
         "gap_reset": bool(payload.get("gapReset")) if isinstance(payload, dict) else False,
         "name": target.get("name") or "",
         "id": target.get("id") or "",
+        "avatar_shape": target.get("avatarShape") or "",
+        "avatar_color": target.get("avatarColor") or "",
     }
 
 
@@ -249,6 +251,33 @@ def gbot(*args, timeout=60):
     return parse_gbot(proc.stdout)
 
 
+ROSTER = {}
+
+# The Grok Bot app's avatar colors. A shape mask is tinted with one of these.
+AVATAR_COLORS = {
+    "black": "#000000",
+    "brown": "#936439",
+    "red": "#FF263C",
+    "orange": "#FF6700",
+    "yellow": "#FF9800",
+    "green": "#00C972",
+    "cyan": "#00BCA6",
+    "blue": "#1084FE",
+    "violet": "#9159FE",
+    "magenta": "#FF309B",
+    "gray": "#777777",
+}
+
+
+def avatar_color(name):
+    return AVATAR_COLORS.get((name or "").lower(), "#777777")
+
+
+def program_key(bot_id):
+    safe = "".join(ch for ch in str(bot_id) if ch.isalnum() or ch == "-")
+    return f"gbot-{safe}" if safe else ""
+
+
 def list_bots():
     payload = gbot("bots", "list", timeout=30)
     rows = payload if isinstance(payload, list) else []
@@ -256,7 +285,13 @@ def list_bots():
     for row in rows:
         if isinstance(row, dict) and row.get("name") and row.get("kind", "bot") != "group":
             bots.append(row)
+    ROSTER.clear()
+    ROSTER.update({bot["name"]: bot for bot in bots})
     write_names([bot["name"] for bot in bots])
+    try:
+        install_avatars(bots)
+    except OSError:
+        pass
     return bots
 
 
@@ -289,6 +324,180 @@ def write_names(names):
                 handle.write("\n")
     except OSError:
         return
+
+
+def herdr_root():
+    return os.path.join(os.path.expanduser("~"), ".config", "herdr-app")
+
+
+def compose_avatar(mask_path, face_path, color):
+    """Tint the shape mask and lay the black face on it. Both files come from the Grok Bot app."""
+    from PIL import Image
+
+    mask = Image.open(mask_path).convert("RGBA")
+    face = Image.open(face_path).convert("RGBA")
+    face = face.crop((0, 0, min(18, face.width), min(18, face.height)))
+    size = 32
+    resample = getattr(getattr(Image, "Resampling", Image), "BOX")
+    mask = mask.resize((size, size), resample)
+    rgb = tuple(int(color[i : i + 2], 16) for i in (1, 3, 5))
+    painted = Image.new("RGBA", (size, size))
+    src = mask.load()
+    dst = painted.load()
+    for y in range(size):
+        for x in range(size):
+            dst[x, y] = (*rgb, src[x, y][3])
+    painted.alpha_composite(face.resize((size, size), resample))
+    import io
+
+    out = io.BytesIO()
+    painted.save(out, format="PNG")
+    return out.getvalue()
+
+
+def grok_appimage():
+    link = os.path.expanduser("~/.local/share/grok-bot/appimage")
+    if os.path.exists(link):
+        return link
+    folder = os.path.expanduser("~/Applications")
+    if not os.path.isdir(folder):
+        return None
+    names = sorted(name for name in os.listdir(folder) if name.startswith("Grok_Bot_") and name.endswith(".AppImage"))
+    return os.path.join(folder, names[-1]) if names else None
+
+
+def avatar_src():
+    cache = os.path.join(os.path.expanduser("~/.cache/gbot-tui"), "avatar-src")
+    if os.path.exists(os.path.join(cache, "bot-heart.png")):
+        return cache
+    if extract_avatar_sources(cache):
+        return cache
+    return None
+
+
+def extract_avatar_sources(cache):
+    import json as _json
+    import struct
+
+    app = grok_appimage()
+    if not app:
+        return False
+    try:
+        offset = subprocess.check_output([app, "--appimage-offset"], text=True, timeout=10).strip()
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+    mount = os.path.join(cache, "mnt")
+    os.makedirs(mount, exist_ok=True)
+    mounted = subprocess.run(
+        ["squashfuse", "-o", f"offset={offset}", app, mount],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if mounted.returncode != 0:
+        return False
+    try:
+        asar = os.path.join(mount, "resources", "app.asar")
+        data = open(asar, "rb").read()
+        header_size = struct.unpack_from("<I", data, 4)[0]
+        header = _json.loads(data[16 : 16 + header_size].split(b"\0", 1)[0])
+        aligned = (16 + header_size + 3) & ~3
+        os.makedirs(cache, exist_ok=True)
+
+        def walk(node):
+            for name, meta in node.get("files", {}).items():
+                if "files" in meta:
+                    walk(meta)
+                    continue
+                if not (name.startswith("bot-") and name.endswith(".png") and "@2x" not in name):
+                    continue
+                start = aligned + int(meta["offset"]) - 8
+                blob = data[start : start + meta["size"]]
+                if blob.startswith(b"\x89PNG"):
+                    with open(os.path.join(cache, name), "wb") as handle:
+                        handle.write(blob)
+
+        walk(header)
+    except (OSError, ValueError, KeyError):
+        return False
+    finally:
+        for unmount in (["fusermount3", "-u", mount], ["fusermount", "-u", mount]):
+            done = subprocess.run(unmount, capture_output=True, text=True)
+            if done.returncode == 0:
+                break
+    return os.path.exists(os.path.join(cache, "bot-heart.png"))
+
+
+def install_avatars(bots, root=None, src=None):
+    """Write one Herdr program icon per bot. Herdr matches it from the 7501 app name."""
+    root = root or herdr_root()
+    src = src or avatar_src()
+    if not src:
+        return {}
+    path = os.path.join(root, "programs.json")
+    try:
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as handle:
+                table = json.loads(handle.read())
+        else:
+            table = {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(table, dict):
+        return {}
+    programs = table.get("programs")
+    if not isinstance(programs, dict):
+        programs = {}
+        table["programs"] = programs
+    made = {}
+    changed = False
+    for bot in bots:
+        key = program_key(bot.get("id") or "")
+        shape = "".join(ch for ch in str(bot.get("avatarShape") or bot.get("avatar_shape") or "") if ch.isalnum())
+        color_name = "".join(ch for ch in str(bot.get("avatarColor") or bot.get("avatar_color") or "") if ch.isalnum())
+        if not key or not shape:
+            continue
+        mask = os.path.join(src, f"bot-{shape}.png")
+        face = os.path.join(src, f"bot-{shape}-face.png")
+        if not (os.path.exists(mask) and os.path.exists(face)):
+            continue
+        rel = f"icons/gbot/{key}-{shape}-{color_name}.png"
+        dest = os.path.join(root, rel)
+        if not os.path.exists(dest):
+            try:
+                png = compose_avatar(mask, face, avatar_color(color_name))
+            except (OSError, ValueError):
+                continue
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as handle:
+                handle.write(png)
+        entry = {
+            "name": bot.get("name") or key,
+            "icon": rel,
+            "tint": False,
+            "tile": "#111111",
+            "color": avatar_color(color_name),
+            "match": [key],
+        }
+        made[key] = entry
+        if programs.get(key) != entry:
+            programs[key] = entry
+            changed = True
+    if changed:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(table, handle, indent=2)
+            handle.write("\n")
+        os.replace(tmp, path)
+    return made
+
+
+def show_avatar(bot, root=None, src=None):
+    global APP
+    made = install_avatars([bot], root, src)
+    key = program_key(bot.get("id") or "")
+    if key in made:
+        APP = key
 
 
 def match_bot(query, names):
@@ -537,6 +746,7 @@ class Chat:
     def load(self):
         page = read_thread(self.target)
         self.apply(page, replace=True)
+        show_avatar(page)
         phase = "blocked" if pending_approval(self.messages) else "idle"
         self.phase = phase
         publish(phase, self.title, self.session_id, self.resume)
@@ -864,6 +1074,9 @@ def pick(stdscr, bots):
 
 
 def open_chat(target):
+    bot = ROSTER.get(target)
+    if bot:
+        show_avatar(bot)
     chat = Chat(target)
     publish("idle", target, "", chat.resume)
     try:
