@@ -6,8 +6,10 @@ import curses
 import json
 import locale
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 
 SOURCE = "gbot-tui"
@@ -278,8 +280,13 @@ def avatar_color(name):
 
 
 def program_key(bot_id):
+    # Herdr throws away an OSC 7501 report whose app is longer than 32 bytes.
     safe = "".join(ch for ch in str(bot_id) if ch.isalnum() or ch == "-")
-    return f"gbot-{safe}" if safe else ""
+    key = f"gbot-{safe}" if safe else ""
+    if len(key) <= 32:
+        return key
+    compact = "".join(ch for ch in safe if ch != "-")
+    return ("gbot-" + compact)[:32]
 
 
 def list_bots():
@@ -672,12 +679,15 @@ def tell_herdr(phase, label, session_id, resume):
     if os.environ.get("HERDR_ENV") != "1" or not herdr or not pane:
         return
     seq = time.time_ns() // 1_000_000
-    subprocess.run(
-        report_command(herdr, pane, phase, label, session_id, seq, resume),
-        capture_output=True,
-        text=True,
-        timeout=2,
-    )
+    command = report_command(herdr, pane, phase, label, session_id, seq, resume)
+
+    def run():
+        try:
+            subprocess.run(command, capture_output=True, text=True, timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 def silence_herdr(label):
@@ -763,36 +773,34 @@ class Chat:
             self.cursor = page["cursor"]
         return fresh
 
-    def load(self):
-        page = read_thread(self.target)
-        self.apply(page, replace=True)
-        show_avatar(page)
-        phase = "blocked" if pending_approval(self.messages) else "idle"
-        self.phase = phase
-        publish(phase, self.title, self.session_id, self.resume)
-        info, alone = own_terminal()
-        if info and alone:
-            try:
-                rename_tab(info, self.title)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-
-    def poll(self):
-        if not self.cursor:
-            page = read_thread(self.target)
+    def ingest(self, page, first=False):
+        replace = first or not self.cursor or page["gap_reset"]
+        if replace:
             self.apply(page, replace=True)
             fresh = []
+            if self.phase == "working" and any(
+                not is_user(entry) and entry_text(entry).strip() for entry in self.messages
+            ):
+                self.saw_other = True
         else:
-            page = read_thread(self.target, self.cursor)
-            if page["gap_reset"]:
-                self.apply(page, replace=True)
-                fresh = []
-                if self.phase == "working" and any(
-                    not is_user(entry) and entry_text(entry).strip() for entry in self.messages
-                ):
-                    self.saw_other = True
-            else:
-                fresh = self.apply(page, replace=False)
+            fresh = self.apply(page, replace=False)
+        if first:
+            show_avatar(page)
+            phase = "blocked" if pending_approval(self.messages) else "idle"
+            self.phase = phase
+            publish(phase, self.title, self.session_id, self.resume)
+            title = self.title
+
+            def rename():
+                try:
+                    info, alone = own_terminal()
+                    if info and alone:
+                        rename_tab(info, title)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+
+            threading.Thread(target=rename, daemon=True).start()
+            return
         phase, self.quiet, self.saw_other = watch_step(
             self.phase,
             fresh,
@@ -802,17 +810,16 @@ class Chat:
         )
         self.note(phase)
 
-    def send(self):
+    def arm_send(self):
         text = self.typed.strip()
         if not text:
-            return
+            return ""
         self.typed = ""
         self.error = ""
         self.saw_other = False
         self.quiet = 0
         self.note("working")
-        send_message(self.target, text)
-        self.poll()
+        return text
 
 
 def dark_terminal():
@@ -844,6 +851,16 @@ def layout(height):
         composer, footer = 0, 0
     body = max(height - header - composer - footer, 0)
     return header, body, composer, footer
+
+
+def visible_rows(chat, width):
+    # Wrapping the whole thread on every keystroke is what made typing feel late.
+    last = chat.messages[-1] if chat.messages else None
+    key = (id(chat.messages), len(chat.messages), width, entry_text(last) if last else "")
+    if getattr(chat, "_rows_key", None) != key:
+        chat._rows = transcript_rows(chat.messages, width)
+        chat._rows_key = key
+    return chat._rows
 
 
 def transcript_rows(entries, width):
@@ -968,7 +985,7 @@ def draw(stdscr, chat):
     if header:
         put(stdscr, 0, 1, "│", ATTR["default"])
         put(stdscr, 0, 3, clip(chat.title, max(width - 4, 0)), ATTR["default"])
-    rows = transcript_rows(chat.messages, width)
+    rows = visible_rows(chat, width)
     if chat.follow:
         chat.scroll = max(len(rows) - body_h, 0)
     start = min(chat.scroll, max(len(rows) - body_h, 0))
@@ -984,15 +1001,13 @@ def draw(stdscr, chat):
         elif kind == "text":
             put(stdscr, y, 1, text, ATTR["default"])
     composer_at = header + body_h
+    cursor = None
     if composer_h >= 3:
         top, _mid, bot = composer_lines(width, chat.typed)
         put(stdscr, composer_at, 0, top, ATTR["default"])
         paint_composer(stdscr, composer_at + 1, width, chat.typed)
         put(stdscr, composer_at + 2, 0, bot, ATTR["default"])
-        try:
-            stdscr.move(composer_at + 1, min(4 + len(chat.typed), max(width - 3, 0)))
-        except curses.error:
-            pass
+        cursor = (composer_at + 1, min(4 + len(chat.typed), max(width - 3, 0)))
     elif composer_h == 1:
         shown = chat.typed or "Add a follow-up"
         put(
@@ -1002,8 +1017,15 @@ def draw(stdscr, chat):
             clip("→ " + shown, max(width - 1, 0)),
             ATTR["default"] if chat.typed else ATTR["dim"],
         )
+        cursor = (composer_at, min(2 + len(chat.typed), max(width - 2, 0)))
     if footer_h:
         paint_spans(stdscr, height - 1, 1, footer_spans(chat.phase, chat.error))
+    # The footer write leaves the cursor on "scroll". Put it back in the box.
+    if cursor:
+        try:
+            stdscr.move(*cursor)
+        except curses.error:
+            pass
     stdscr.refresh()
 
 
@@ -1018,49 +1040,107 @@ def chat_loop(stdscr, chat):
     apply_theme(stdscr)
     place_cursor(True)
     stdscr.keypad(True)
-    stdscr.timeout(2000)
-    chat.load()
-    while True:
-        draw(stdscr, chat)
-        try:
-            key = stdscr.get_wch()
-        except curses.error:
+    # gbot's network calls used to run here, so typing froze until each one returned.
+    stdscr.timeout(100)
+    jobs = queue.Queue()
+    done = queue.Queue()
+
+    def worker():
+        while True:
+            job = jobs.get()
+            if job is None:
+                return
+            kind, args = job
             try:
-                chat.poll()
+                if kind == "read":
+                    done.put(("page", read_thread(*args)))
+                else:
+                    send_message(*args)
+                    done.put(("sent", None))
             except GbotError as error:
-                chat.error = str(error)
-            continue
-        except KeyboardInterrupt:
-            return
-        if key in (curses.KEY_RESIZE,):
-            continue
-        if key in ("\x03", "\x04"):
-            return
-        if key == curses.KEY_PPAGE:
-            chat.follow = False
-            chat.scroll = max(chat.scroll - max(curses.LINES - 4, 1), 0)
-            continue
-        if key == curses.KEY_NPAGE:
-            chat.scroll += max(curses.LINES - 4, 1)
-            height, width = stdscr.getmaxyx()
-            _header, body_h, _composer, _footer = layout(height)
-            rows = transcript_rows(chat.messages, width)
-            if chat.scroll >= max(len(rows) - body_h, 0):
+                done.put(("error", (kind, str(error))))
+
+    threading.Thread(target=worker, daemon=True).start()
+    jobs.put(("read", (chat.target,)))
+    waiting = 1
+    loaded = False
+    next_poll = 0
+    dirty = True
+    try:
+        while True:
+            while True:
+                try:
+                    kind, payload = done.get_nowait()
+                except queue.Empty:
+                    break
+                waiting -= 1
+                dirty = True
+                if kind == "error":
+                    source, message = payload
+                    chat.error = message
+                    if source == "send" and chat.phase == "working":
+                        chat.note("idle")
+                    if source == "read":
+                        next_poll = time.monotonic() + 2
+                elif kind == "sent":
+                    next_poll = 0
+                elif not loaded:
+                    chat.ingest(payload, first=True)
+                    loaded = True
+                    next_poll = time.monotonic() + 2
+                else:
+                    chat.ingest(payload, first=False)
+            now = time.monotonic()
+            if waiting == 0 and now >= next_poll and (loaded or chat.error):
+                after = chat.cursor
+                jobs.put(("read", (chat.target, after) if after else (chat.target,)))
+                waiting += 1
+                next_poll = now + 2
+            if dirty:
+                draw(stdscr, chat)
+                dirty = False
+            try:
+                key = stdscr.get_wch()
+            except curses.error:
+                continue
+            except KeyboardInterrupt:
+                return
+            dirty = True
+            if key in (curses.KEY_RESIZE,):
+                continue
+            if key in ("\x03", "\x04"):
+                return
+            if key == curses.KEY_PPAGE:
+                chat.follow = False
+                chat.scroll = max(chat.scroll - max(curses.LINES - 4, 1), 0)
+                continue
+            if key == curses.KEY_NPAGE:
+                chat.scroll += max(curses.LINES - 4, 1)
+                height, width = stdscr.getmaxyx()
+                _header, body_h, _composer, _footer = layout(height)
+                rows = visible_rows(chat, width)
+                if chat.scroll >= max(len(rows) - body_h, 0):
+                    chat.follow = True
+                continue
+            if key in ("\n", "\r", curses.KEY_ENTER):
+                text = chat.arm_send()
+                if not text:
+                    dirty = False
+                    continue
                 chat.follow = True
-            continue
-        if key in ("\n", "\r", curses.KEY_ENTER):
-            try:
-                chat.send()
-            except GbotError as error:
-                chat.error = str(error)
-                chat.note("idle")
-            chat.follow = True
-            continue
-        if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
-            chat.typed = chat.typed[:-1]
-            continue
-        if isinstance(key, str) and key.isprintable():
-            chat.typed += key
+                draw(stdscr, chat)
+                jobs.put(("send", (chat.target, text)))
+                waiting += 1
+                continue
+            if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                chat.typed = chat.typed[:-1]
+                continue
+            if isinstance(key, str) and key.isprintable():
+                chat.typed += key
+                continue
+            dirty = False
+    finally:
+        jobs.put(None)
 
 
 def pick(stdscr, bots):

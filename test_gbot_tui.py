@@ -35,6 +35,10 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(page["avatar_shape"], "heart")
         self.assertEqual(page["avatar_color"], "brown")
         self.assertEqual(gbot_tui.program_key(page["id"]), "gbot-bot-1")
+        # A full bot id used to make app= longer than 32 bytes, so Herdr dropped the report.
+        key = gbot_tui.program_key("ea566f99-aded-40c2-99fc-60e5477d2a61")
+        self.assertLessEqual(len(key), 32)
+        self.assertNotEqual(key, gbot_tui.program_key("aa566f99-aded-40c2-99fc-60e5477d2a61"))
         self.assertEqual(gbot_tui.avatar_color("brown"), "#936439")
         self.assertEqual(
             gbot_tui.client_version_from_name("Grok_Bot_0.78.1_abc.AppImage"),
