@@ -7,9 +7,9 @@ You work in `/home/philipp/git/gbot-tui`. The program is `gbot_tui.py`. Read `do
 
 ## Enter feels late
 
-Pressing Enter runs `Chat.arm_send`, which clears the composer and sets phase `working`, then draws. The typed line is not in `chat.messages`. A single background worker then runs `send_message` (`gbot send -- <target> <text>`, gateway `POST /api/sendPrompt`, timeout 90s). Only after that returns does the loop queue `read_thread`. The line shows up when `gbot thread` comes back.
+Pressing Enter runs `Chat.arm_send`, which appends a local user row, clears the composer, sets phase `working`, and draws before `jobs.put(("send", ...))`. A single background worker then runs `send_message` (`gbot send -- <target> <text>`, gateway `POST /api/sendPrompt`, timeout 90s) and the next `read_thread`. When that poll returns the same user text, the local row is replaced instead of appended. `bench/latency.py` measures Enter to bubble against a mock `gbot`.
 
-The wait is those two `gbot` subprocesses. Show the user's line in the transcript before `jobs.put(("send", ...))`, and when the later poll returns the same user text, replace the local row instead of appending a second copy. Do not block the curses loop on `gbot`. Do not start a second worker that can reorder send and read.
+Do not block the curses loop on `gbot`. Do not start a second worker that can reorder send and read. Threads that only list bots or compose icons are fine; they never touch the send/read queue or write to the terminal.
 
 ## Herdr icons
 

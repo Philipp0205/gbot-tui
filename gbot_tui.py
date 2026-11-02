@@ -3,10 +3,12 @@
 
 import base64
 import curses
+import hashlib
 import json
 import locale
 import os
 import queue
+import select
 import subprocess
 import sys
 import threading
@@ -17,6 +19,15 @@ APP = "gbot-tui"
 # shortcut: two empty polls after a reply count as finished, so a bot that
 # pauses longer than that looks done while it is still working.
 QUIET_POLLS = 2
+# Poll cadence in seconds. Each read is one gbot process, so idle backs off.
+WAITING_DELAY = 0.3
+STREAM_DELAY = 1.0
+SETTLE_DELAY = 2.0
+BLOCKED_DELAY = 1.0
+IDLE_DELAYS = (2.0, 2.0, 3.0, 5.0, 8.0)
+# The loop sleeps in select, so a finished read wakes it at once. This cap is
+# how late a resize can be noticed.
+WAKE_CAP = 0.1
 
 locale.setlocale(locale.LC_ALL, "")
 
@@ -409,21 +420,131 @@ def program_ids(bot_id):
     return keys
 
 
-def list_bots():
+def list_bots(avatars="later"):
+    """Fetch the bots. `avatars` is "later" (a background thread), "now", or "skip"."""
     payload = gbot("bots", "list", timeout=30)
     rows = payload if isinstance(payload, list) else []
     bots = []
     for row in rows:
         if isinstance(row, dict) and row.get("name") and row.get("kind", "bot") != "group":
             bots.append(row)
-    ROSTER.clear()
-    ROSTER.update({bot["name"]: bot for bot in bots})
+    # A refresh runs beside the UI, so ROSTER is never empty in between.
+    fresh = {bot["name"]: bot for bot in bots}
+    ROSTER.update(fresh)
+    for name in [name for name in ROSTER if name not in fresh]:
+        ROSTER.pop(name, None)
     write_names([bot["name"] for bot in bots])
-    try:
-        install_avatars(bots)
-    except (OSError, ImportError):
-        pass
+    write_roster(bots)
+    if avatars == "later":
+        install_avatars_later(bots)
+    elif avatars == "now":
+        try:
+            install_avatars(bots)
+        except (OSError, ImportError):
+            pass
     return bots
+
+
+def cache_dir():
+    return os.path.expanduser("~/.cache/gbot-tui")
+
+
+ROSTER_KEYS = ("id", "name", "title", "tagline", "avatarColor", "avatarShape", "kind")
+
+
+def roster_path():
+    return os.path.join(cache_dir(), "roster.json")
+
+
+def write_private(path, data):
+    """Write a cache file only this user can read. Transcripts can be private."""
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        return
+
+
+def read_json(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def write_roster(bots):
+    rows = [{key: bot[key] for key in ROSTER_KEYS if key in bot} for bot in bots]
+    write_private(roster_path(), rows)
+
+
+def read_roster():
+    """The last bot list, so the picker and a named open paint before gbot answers."""
+    rows = read_json(roster_path())
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict) and isinstance(row.get("name"), str) and row["name"]]
+
+
+THREAD_KEEP = 80
+
+
+def thread_cache_path(target):
+    digest = hashlib.sha1(str(target).encode("utf-8")).hexdigest()[:16]
+    return os.path.join(cache_dir(), "threads", digest + ".json")
+
+
+def write_thread_cache(target, messages):
+    kept = [entry for entry in messages if isinstance(entry, dict) and not entry.get("local")]
+    write_private(thread_cache_path(target), {"target": target, "entries": kept[-THREAD_KEEP:]})
+
+
+def read_thread_cache(target):
+    data = read_json(thread_cache_path(target))
+    if not isinstance(data, dict) or data.get("target") != target:
+        return []
+    entries = data.get("entries")
+    if not isinstance(entries, list):
+        return []
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+AVATAR_LOCK = threading.Lock()
+
+
+def install_avatars_later(bots, done=None):
+    """Compose Herdr icons off the UI thread. The AppImage mount can take seconds."""
+    bots = [dict(bot) for bot in bots]
+
+    def run():
+        made = {}
+        try:
+            with AVATAR_LOCK:
+                made = install_avatars(bots)
+        except (OSError, ImportError, ValueError):
+            made = {}
+        if done:
+            done(made)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+
+def show_avatar_later(bot):
+    """Set APP once the icon exists. The UI loop re-reports the pane when APP changes."""
+
+    def done(made):
+        global APP
+        key = program_key(bot.get("id") or "")
+        if key in made:
+            APP = key
+
+    return install_avatars_later([bot], done)
 
 
 # shortcut: tab completion reuses this file for 10 minutes, refresh sooner if bots are renamed often.
@@ -942,6 +1063,36 @@ class Chat:
         self.full_reload = False
         self.replacing = False
         self.rows_rev = 0
+        self.loaded = False
+        self.idle_polls = 0
+        self.app_seen = APP
+
+    def show_cached(self, entries):
+        """Paint the last thread seen while the first read is still out.
+
+        Phase stays idle, so y/n cannot answer a card from the cache.
+        """
+        if entries and not self.messages:
+            self.messages = list(entries)
+            self.touch_rows()
+
+    def poll_delay(self):
+        """Seconds until the next thread read.
+
+        Fast while a reply is coming, slower once it settles, so two quiet
+        polls still span about four seconds. An idle chat backs off to
+        IDLE_DELAYS[-1]; a key press brings it back to the first step.
+        """
+        if self.phase == "blocked":
+            return BLOCKED_DELAY
+        if self.phase == "working":
+            if not self.saw_other:
+                return WAITING_DELAY
+            return STREAM_DELAY if self.quiet == 0 else SETTLE_DELAY
+        return IDLE_DELAYS[min(self.idle_polls, len(IDLE_DELAYS) - 1)]
+
+    def nudge(self):
+        self.idle_polls = 0
 
     def note(self, phase):
         if phase != self.phase:
@@ -1097,8 +1248,13 @@ class Chat:
                 self.saw_other = True
         else:
             fresh = self.apply(page, replace=False)
+        if fresh or replace:
+            self.idle_polls = 0
+        elif self.phase in {"idle", "done"}:
+            self.idle_polls += 1
         if first:
-            show_avatar(page)
+            self.loaded = True
+            show_avatar_later(page)
             if pending_approval(self.messages):
                 phase = "blocked"
             elif self.phase == "working":
@@ -1634,42 +1790,126 @@ def fast_escape():
         return
 
 
+def chat_key(chat, key, stdscr):
+    """Apply one key. Returns "quit", "back", a job tuple, or None."""
+    if key == curses.KEY_RESIZE:
+        return None
+    if key in ("\x03", "\x04"):
+        return "quit"
+    if key in ("\x1b", 27):
+        return "back"
+    chat.nudge()
+    if key == curses.KEY_PPAGE:
+        chat.follow = False
+        chat.scroll = max(chat.scroll - max(curses.LINES - 4, 1), 0)
+        return None
+    if key == curses.KEY_NPAGE:
+        chat.scroll += max(curses.LINES - 4, 1)
+        height, width = stdscr.getmaxyx()
+        page_header, body_h, _composer, _footer = layout(height, len(draft_lines(chat.typed, width)) or 1)
+        room = max(body_h - header_gap(page_header, chat.label, body_h), 0)
+        rows = visible_rows(chat, width)
+        if chat.scroll >= max(len(rows) - room, 0):
+            chat.follow = True
+        return None
+    if key in ("\n", "\r", curses.KEY_ENTER):
+        text = chat.arm_send()
+        if not text:
+            return None
+        chat.follow = True
+        return ("send", (chat.target, text))
+    handled = composer_key(chat, key)
+    if handled is not None:
+        action, value = handled
+        if action == "ignore":
+            return None
+        if action == "decide":
+            args = chat.begin_decision(value)
+            if not args:
+                chat.typed += "y" if value == "accept" else "n"
+                return None
+            chat.error = ""
+            return ("decide", args)
+        chat.typed += value
+        return None
+    if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+        chat.typed = chat.typed[:-1]
+        return None
+    if isinstance(key, str) and key.isprintable():
+        chat.typed += key
+    return None
+
+
+def read_keys(stdscr):
+    """Every key curses has now. A paste is one redraw, not one per character."""
+    keys = []
+    while len(keys) < 4096:
+        try:
+            keys.append(stdscr.get_wch())
+        except curses.error:
+            break
+    return keys
+
+
 def chat_loop(stdscr, chat):
     apply_theme(stdscr)
     fast_escape()
     place_cursor(True)
     stdscr.keypad(True)
     # gbot's network calls used to run here, so typing froze until each one returned.
-    stdscr.timeout(100)
+    # Keys are read without waiting; the loop sleeps in select on the tty and a pipe.
+    stdscr.timeout(0)
     jobs = queue.Queue()
     done = queue.Queue()
+    wake_r, wake_w = os.pipe()
+    os.set_blocking(wake_r, False)
+    os.set_blocking(wake_w, False)
+
+    def finish(item):
+        done.put(item)
+        try:
+            os.write(wake_w, b"x")
+        except OSError:
+            pass
 
     def worker():
+        # One worker, so a send never overtakes the read before it.
         while True:
             job = jobs.get()
             if job is None:
+                # The worker owns the write end, so a late result never lands
+                # on a descriptor number the next chat has reused.
+                os.close(wake_w)
                 return
             kind, args = job
             try:
                 if kind == "read":
-                    done.put(("page", read_thread(*args)))
+                    finish(("page", read_thread(*args)))
                 elif kind == "decide":
                     respond_approval(*args)
-                    done.put(("decided", None))
+                    finish(("decided", None))
                 else:
                     send_message(*args)
-                    done.put(("sent", None))
+                    finish(("sent", None))
             except GbotError as error:
-                done.put(("error", (kind, str(error))))
+                finish(("error", (kind, str(error))))
 
     threading.Thread(target=worker, daemon=True).start()
     jobs.put(("read", (chat.target,)))
     waiting = 1
-    loaded = False
     next_poll = 0
     dirty = True
     try:
+        tty = sys.stdin.fileno()
+    except (AttributeError, ValueError, OSError):
+        tty = None
+    try:
         while True:
+            try:
+                while os.read(wake_r, 4096):
+                    pass
+            except OSError:
+                pass
             while True:
                 try:
                     kind, payload = done.get_nowait()
@@ -1686,86 +1926,70 @@ def chat_loop(stdscr, chat):
                         chat.note("idle")
                     if source == "read":
                         chat.read_failed()
-                        next_poll = time.monotonic() + 2
+                        next_poll = time.monotonic() + IDLE_DELAYS[0]
                 elif kind in {"sent", "decided"}:
                     if kind == "decided":
                         chat.finish_decision()
                     next_poll = 0
-                elif not loaded:
+                elif not chat.loaded:
                     chat.ingest(payload, first=True)
-                    loaded = True
-                    next_poll = time.monotonic() + 2
+                    write_thread_cache(chat.target, chat.messages)
+                    next_poll = time.monotonic() + chat.poll_delay()
                 else:
                     chat.ingest(payload, first=False)
+                    next_poll = min(next_poll, time.monotonic() + chat.poll_delay())
+            if chat.app_seen != APP:
+                chat.app_seen = APP
+                publish(chat.phase, chat.title, chat.session_id, chat.resume)
+            if not chat.label and chat.target in ROSTER:
+                # A list refresh behind a named open can bring the tagline late.
+                bot = ROSTER.get(chat.target) or {}
+                label = (bot.get("title") or bot.get("tagline") or "").strip()
+                if label:
+                    chat.label = label
+                    chat.avatar_color = chat.avatar_color or bot.get("avatarColor") or ""
+                    dirty = True
             now = time.monotonic()
-            if waiting == 0 and now >= next_poll and (loaded or chat.error):
+            if waiting == 0 and now >= next_poll and (chat.loaded or chat.error):
                 jobs.put(("read", chat.take_read()))
                 waiting += 1
-                next_poll = now + 2
+                next_poll = now + chat.poll_delay()
             if dirty:
                 draw(stdscr, chat)
                 dirty = False
-            try:
-                key = stdscr.get_wch()
-            except curses.error:
-                continue
-            except KeyboardInterrupt:
-                return
-            dirty = True
-            if key in (curses.KEY_RESIZE,):
-                continue
-            if key in ("\x03", "\x04"):
-                return
-            if key in ("\x1b", 27):
-                return "back"
-            if key == curses.KEY_PPAGE:
-                chat.follow = False
-                chat.scroll = max(chat.scroll - max(curses.LINES - 4, 1), 0)
-                continue
-            if key == curses.KEY_NPAGE:
-                chat.scroll += max(curses.LINES - 4, 1)
-                height, width = stdscr.getmaxyx()
-                page_header, body_h, _composer, _footer = layout(height, len(draft_lines(chat.typed, width)) or 1)
-                room = max(body_h - header_gap(page_header, chat.label, body_h), 0)
-                rows = visible_rows(chat, width)
-                if chat.scroll >= max(len(rows) - room, 0):
-                    chat.follow = True
-                continue
-            if key in ("\n", "\r", curses.KEY_ENTER):
-                text = chat.arm_send()
-                if not text:
-                    dirty = False
-                    continue
-                chat.follow = True
-                draw(stdscr, chat)
-                jobs.put(("send", (chat.target, text)))
-                waiting += 1
-                continue
-            handled = composer_key(chat, key)
-            if handled is not None:
-                action, value = handled
-                if action == "ignore":
-                    continue
-                if action == "decide":
-                    args = chat.begin_decision(value)
-                    if not args:
-                        chat.typed += "y" if value == "accept" else "n"
-                        continue
-                    chat.error = ""
-                    jobs.put(("decide", args))
+            keys = read_keys(stdscr)
+            if not keys:
+                wait = WAKE_CAP
+                if waiting == 0 and (chat.loaded or chat.error):
+                    wait = min(WAKE_CAP, max(next_poll - time.monotonic(), 0))
+                watch = [wake_r] + ([tty] if tty is not None else [])
+                try:
+                    select.select(watch, [], [], wait)
+                except (OSError, ValueError):
+                    time.sleep(min(wait, 0.02))
+                keys = read_keys(stdscr)
+            for key in keys:
+                dirty = True
+                result = chat_key(chat, key, stdscr)
+                if result == "quit":
+                    return None
+                if result == "back":
+                    return "back"
+                if isinstance(result, tuple):
+                    if result[0] == "send":
+                        # The bubble is on screen before gbot starts.
+                        draw(stdscr, chat)
+                        dirty = False
+                    jobs.put(result)
                     waiting += 1
-                    continue
-                chat.typed += value
-                continue
-            if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
-                chat.typed = chat.typed[:-1]
-                continue
-            if isinstance(key, str) and key.isprintable():
-                chat.typed += key
-                continue
-            dirty = False
+                    if result[0] == "send":
+                        next_poll = min(next_poll, time.monotonic() + chat.poll_delay())
+    except KeyboardInterrupt:
+        return None
     finally:
         jobs.put(None)
+        write_thread_cache(chat.target, chat.messages)
+        os.close(wake_r)
 
 
 def fuzzy_score(query, name):
@@ -1836,17 +2060,68 @@ def fuzzy_bots(query, bots):
     return [bot for _score, _index, bot in ranked]
 
 
-def pick(stdscr, bots):
-    # The chat loop waits 100ms for a key. Leaving that on makes get_wch
+class Loader:
+    """Run one gbot call on a thread. The UI polls `ready` instead of waiting."""
+
+    def __init__(self, call):
+        self.result = None
+        self.error = None
+        self.ready = False
+        self.lock = threading.Lock()
+
+        def run():
+            try:
+                value = call()
+                with self.lock:
+                    self.result = value
+            except GbotError as error:
+                with self.lock:
+                    self.error = str(error)
+            with self.lock:
+                self.ready = True
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def take(self):
+        with self.lock:
+            return self.ready, self.result, self.error
+
+
+def pick(stdscr, bots, refresh=None):
+    """The bot list. `refresh` fetches a newer list on a thread while this one is shown."""
+    # The chat loop reads keys without waiting. Leaving that on makes get_wch
     # raise "no input" the moment this list draws.
     stdscr.timeout(-1)
     apply_theme(stdscr)
     fast_escape()
     place_cursor(False)
     stdscr.keypad(True)
+    bots = list(bots)
+    loader = Loader(refresh) if refresh else None
+    if loader:
+        stdscr.timeout(30)
+    note = ""
     selected = 0
     query = ""
     while True:
+        if loader:
+            ready, fresh, error = loader.take()
+            if ready:
+                loader = None
+                stdscr.timeout(-1)
+                if error and not bots:
+                    raise GbotError(error)
+                if error:
+                    note = error
+                elif fresh is not None:
+                    if not fresh and not bots:
+                        raise GbotError("No bots.")
+                    current = fuzzy_bots(query, bots)
+                    name = current[selected]["name"] if current and selected < len(current) else ""
+                    bots = list(fresh)
+                    shown = fuzzy_bots(query, bots)
+                    names = [bot["name"] for bot in shown]
+                    selected = names.index(name) if name in names else 0
         shown = fuzzy_bots(query, bots)
         if not shown:
             selected = 0
@@ -1863,12 +2138,17 @@ def pick(stdscr, bots):
         if body_h and selected >= body_h:
             top = selected - body_h + 1
         if not shown and body_h:
-            put(stdscr, 2, 1, clip("  no match", max(width - 2, 0)), ATTR["dim"])
+            empty = "  loading bots…" if loader and not bots else "  no match"
+            put(stdscr, 2, 1, clip(empty, max(width - 2, 0)), ATTR["dim"])
         for index, bot in enumerate(shown[top : top + body_h]):
             actual = top + index
             paint_spans(stdscr, 2 + index, 1, picker_spans(bot, actual == selected, width))
         if footer:
-            paint_spans(stdscr, height - 1, 1, [("type to search · enter open · ctrl-c quit", "dim")])
+            if note:
+                spans = [(clip(note, max(width - 2, 0)), "red")]
+            else:
+                spans = [("type to search · enter open · ctrl-c quit", "dim")]
+            paint_spans(stdscr, height - 1, 1, spans)
         stdscr.refresh()
         try:
             key = stdscr.get_wch()
@@ -1899,20 +2179,65 @@ def pick(stdscr, bots):
             selected = 0
 
 
-def open_chat(target):
+def start_chat(target):
+    """A chat with the last thread already on screen. The real read is the loop's first job."""
     bot = ROSTER.get(target)
     if bot:
-        show_avatar(bot)
+        show_avatar_later(bot)
     chat = Chat(target)
+    chat.show_cached(read_thread_cache(target))
     publish("idle", target, "", chat.resume)
-    try:
-        return curses.wrapper(lambda stdscr: chat_loop(stdscr, chat))
-    finally:
-        emit("clear", chat.title)
+    return chat
+
+
+def leave_chat(chat, final):
+    emit("clear", chat.title)
+
+    def release():
         try:
             silence_herdr(chat.title)
         except (OSError, subprocess.TimeoutExpired):
             pass
+
+    if final:
+        release()
+    else:
+        # Back to the list should not wait on the herdr CLI.
+        threading.Thread(target=release, daemon=True).start()
+
+
+def open_chat(target):
+    chat = start_chat(target)
+    back = None
+    try:
+        back = curses.wrapper(lambda stdscr: chat_loop(stdscr, chat))
+        return back
+    finally:
+        leave_chat(chat, True)
+
+
+def screens(stdscr, target):
+    """The list and the chat share one curses session, so Esc and Enter do not flash the shell."""
+    first = True
+    while True:
+        if not target:
+            cached = list(ROSTER.values()) or read_roster()
+            if cached and not ROSTER:
+                ROSTER.update({bot["name"]: bot for bot in cached})
+            refresh = list_bots if first or not cached else (lambda: list_bots(avatars="skip"))
+            target = pick(stdscr, cached, refresh=refresh)
+            first = False
+            if not target:
+                return 0
+        chat = start_chat(target)
+        back = None
+        try:
+            back = chat_loop(stdscr, chat)
+        finally:
+            leave_chat(chat, back != "back")
+        if back != "back":
+            return 0
+        target = ""
 
 
 USAGE = """\
@@ -1927,7 +2252,7 @@ Run it inside a Herdr tab and that bot shows up in the agents list.
 
 def print_bots():
     try:
-        bots = list_bots()
+        bots = list_bots(avatars="now")
     except GbotError as error:
         print(error, file=sys.stderr)
         return 1
@@ -1943,7 +2268,7 @@ def complete_names():
     names = read_names(NAMES_TTL)
     if not names:
         try:
-            names = [bot["name"] for bot in list_bots()]
+            names = [bot["name"] for bot in list_bots(avatars="skip")]
         except GbotError:
             names = read_names()
     for name in names:
@@ -1952,38 +2277,44 @@ def complete_names():
 
 
 def session(target):
-    while True:
-        if not target:
-            try:
-                bots = list(ROSTER.values())
-                if not bots:
-                    bots = list_bots()
-            except GbotError as error:
-                print(error, file=sys.stderr)
-                return 1
-            if not bots:
-                print("No bots.", file=sys.stderr)
-                return 1
-            try:
-                target = curses.wrapper(lambda stdscr: pick(stdscr, bots))
-            except KeyboardInterrupt:
-                return 130
-            if not target:
-                return 0
+    try:
+        return curses.wrapper(lambda stdscr: screens(stdscr, target))
+    except GbotError as error:
+        print(error, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+def refresh_roster_later():
+    def run():
         try:
-            back = open_chat(target)
-        except GbotError as error:
-            print(error, file=sys.stderr)
-            return 1
-        except KeyboardInterrupt:
-            return 130
-        if back != "back":
-            return 0
-        target = ""
+            list_bots()
+        except GbotError:
+            pass
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
 
 
 def resolve_for_open(query):
-    """Load the bot list so a direct name still has its tagline."""
+    """Match a name from the cached list and refresh it behind the chat.
+
+    With no cache, or a name the cache does not have, the list is loaded
+    first, so a direct name still has its tagline.
+    """
+    cached = read_roster()
+    if cached:
+        try:
+            chosen = match_bot(query, [bot["name"] for bot in cached])
+        except GbotError:
+            chosen = None
+        if chosen:
+            if not ROSTER:
+                ROSTER.update({bot["name"]: bot for bot in cached})
+            refresh_roster_later()
+            return chosen
     try:
         names = [bot["name"] for bot in list_bots()]
     except GbotError:
@@ -1999,16 +2330,7 @@ def open_named(query):
     except GbotError as error:
         print(error, file=sys.stderr)
         return 1
-    try:
-        back = open_chat(chosen)
-    except GbotError as error:
-        print(error, file=sys.stderr)
-        return 1
-    except KeyboardInterrupt:
-        return 130
-    if back != "back":
-        return 0
-    return session("")
+    return session(chosen)
 
 
 def main(argv):

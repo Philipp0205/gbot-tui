@@ -6,6 +6,23 @@ from pathlib import Path
 
 import gbot_tui
 
+_HOME = {}
+
+
+def setUpModule():
+    # The roster and thread caches live under ~/.cache. Keep a real one out of the tests.
+    _HOME["old"] = os.environ.get("HOME")
+    _HOME["dir"] = tempfile.TemporaryDirectory()
+    os.environ["HOME"] = _HOME["dir"].name
+
+
+def tearDownModule():
+    if _HOME["old"] is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = _HOME["old"]
+    _HOME["dir"].cleanup()
+
 
 class ParseTests(unittest.TestCase):
     def test_entry_text_and_user(self):
@@ -836,6 +853,156 @@ class SendTests(unittest.TestCase):
         done = gbot_tui.footer_spans(chat.phase, "")
         self.assertEqual(done, gbot_tui.footer_spans("idle", ""))
         self.assertNotIn("Generating", "".join(text for text, _style in done))
+
+
+class FakeScreen:
+    def __init__(self, height=24, width=58):
+        self.size = (height, width)
+        self.rows = {}
+
+    def getmaxyx(self):
+        return self.size
+
+    def erase(self):
+        self.rows.clear()
+
+    def addnstr(self, y, x, text, n, attr=0):
+        self.rows.setdefault(y, []).append(text[:n])
+
+    def move(self, y, x):
+        pass
+
+    def refresh(self):
+        pass
+
+
+class SpeedTests(unittest.TestCase):
+    def test_polls_fast_while_a_reply_comes_and_back_off_when_idle(self):
+        chat = gbot_tui.Chat("Researcher")
+        chat.phase = "working"
+        self.assertLessEqual(chat.poll_delay(), 0.5)
+        chat.saw_other = True
+        self.assertEqual(chat.poll_delay(), gbot_tui.STREAM_DELAY)
+        chat.quiet = 1
+        # Two quiet polls still span about four seconds before "done".
+        self.assertGreaterEqual(chat.poll_delay() * gbot_tui.QUIET_POLLS, 4)
+        chat.phase = "blocked"
+        self.assertEqual(chat.poll_delay(), gbot_tui.BLOCKED_DELAY)
+        chat.phase = "idle"
+        chat.cursor = "m1"
+        chat.loaded = True
+        delays = []
+        quiet = gbot_tui.parse_thread({"transcript": {"entries": []}, "cursor": "m1"})
+        for _ in range(8):
+            delays.append(chat.poll_delay())
+            chat.ingest(quiet)
+        self.assertEqual(delays[0], gbot_tui.IDLE_DELAYS[0])
+        self.assertEqual(delays[-1], gbot_tui.IDLE_DELAYS[-1])
+        self.assertEqual(delays, sorted(delays))
+        chat.nudge()
+        self.assertEqual(chat.poll_delay(), gbot_tui.IDLE_DELAYS[0])
+        fresh = gbot_tui.parse_thread(
+            {"transcript": {"entries": [{"id": "m2", "role": "assistant", "text": "hi"}]}, "cursor": "m2"}
+        )
+        chat.idle_polls = 4
+        chat.ingest(fresh)
+        self.assertEqual(chat.idle_polls, 0)
+
+    def test_the_bot_list_comes_from_the_cache(self):
+        bots = [
+            {"id": "a1", "name": "Outfitly", "title": "what to wear", "avatarColor": "red", "secret": "x"},
+            {"id": "a2", "name": "Chef", "title": "what to cook"},
+        ]
+        gbot_tui.write_roster(bots)
+        cached = gbot_tui.read_roster()
+        self.assertEqual([bot["name"] for bot in cached], ["Outfitly", "Chef"])
+        self.assertNotIn("secret", cached[0])
+        self.assertEqual(os.stat(gbot_tui.roster_path()).st_mode & 0o777, 0o600)
+        calls = []
+        original_list = gbot_tui.list_bots
+        original_later = gbot_tui.refresh_roster_later
+        gbot_tui.list_bots = lambda *args, **kwargs: calls.append("list") or bots
+        gbot_tui.refresh_roster_later = lambda: calls.append("later")
+        gbot_tui.ROSTER.clear()
+        try:
+            self.assertEqual(gbot_tui.resolve_for_open("out"), "Outfitly")
+            self.assertEqual(calls, ["later"])
+            self.assertEqual(gbot_tui.Chat("Outfitly").label, "what to wear")
+            # A name the cache does not know still waits for the real list.
+            bots.append({"id": "a3", "name": "Nomad", "title": "new"})
+            self.assertEqual(gbot_tui.resolve_for_open("nom"), "Nomad")
+            self.assertEqual(calls, ["later", "list"])
+        finally:
+            gbot_tui.list_bots = original_list
+            gbot_tui.refresh_roster_later = original_later
+            gbot_tui.ROSTER.clear()
+            os.remove(gbot_tui.roster_path())
+
+    def test_a_chat_opens_on_its_cached_thread(self):
+        card = {
+            "id": "card",
+            "kind": "send-message",
+            "message": {"type": "auto-review-approval", "approval": {"status": "pending", "requestId": "ask"}},
+        }
+        messages = [
+            {"id": "m1", "role": "assistant", "text": "earlier"},
+            card,
+            {"role": "user", "text": "unsent", "local": True},
+        ]
+        gbot_tui.write_thread_cache("Researcher", messages)
+        path = gbot_tui.thread_cache_path("Researcher")
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        cached = gbot_tui.read_thread_cache("Researcher")
+        self.assertEqual([entry.get("id") for entry in cached], ["m1", "card"])
+        self.assertEqual(gbot_tui.read_thread_cache("Chef"), [])
+        chat = gbot_tui.Chat("Researcher")
+        chat.show_cached(cached)
+        rows = gbot_tui.transcript_rows(chat.messages, 40)
+        self.assertIn(("text", "earlier"), rows)
+        # A cached card is not live, so y is text until the first read.
+        self.assertFalse(chat.loaded)
+        self.assertEqual(gbot_tui.composer_key(chat, "y"), ("type", "y"))
+        self.assertEqual(chat.take_read(), ("Researcher",))
+        page = gbot_tui.parse_thread(
+            {"transcript": {"entries": [{"id": "m1", "role": "assistant", "text": "earlier"}]}, "cursor": "m1"}
+        )
+        chat.ingest(page, first=True)
+        self.assertTrue(chat.loaded)
+        self.assertEqual([entry.get("id") for entry in chat.messages], ["m1"])
+        os.remove(path)
+
+    def test_a_paste_is_one_batch_of_keys(self):
+        class Keys:
+            def __init__(self, keys):
+                self.keys = list(keys)
+
+            def get_wch(self):
+                if not self.keys:
+                    raise gbot_tui.curses.error("no input")
+                return self.keys.pop(0)
+
+        screen = Keys("hello world")
+        self.assertEqual("".join(gbot_tui.read_keys(screen)), "hello world")
+        self.assertEqual(gbot_tui.read_keys(screen), [])
+        chat = gbot_tui.Chat("Researcher")
+        for key in "hi":
+            self.assertIsNone(gbot_tui.chat_key(chat, key, None))
+        self.assertEqual(chat.typed, "hi")
+        self.assertEqual(gbot_tui.chat_key(chat, "\r", None), ("send", ("Researcher", "hi")))
+        self.assertTrue(chat.messages[-1].get("local"))
+        self.assertEqual(gbot_tui.chat_key(chat, "\x1b", None), "back")
+
+    def test_a_long_error_gets_its_own_rows_on_screen(self):
+        chat = gbot_tui.Chat("Researcher")
+        chat.messages = [{"role": "assistant", "text": "hello"}]
+        chat.error = "EnsureSandBox failed: 401 Unauthorized. Sign in to Grok Bot again and retry."
+        screen = FakeScreen(24, 58)
+        gbot_tui.draw(screen, chat)
+        lines = [" ".join(screen.rows.get(y, [])).strip() for y in (21, 22, 23)]
+        self.assertTrue(lines[0].startswith("EnsureSandBox"))
+        self.assertEqual(" ".join(lines[:2]), chat.error)
+        self.assertIn("enter send", lines[2])
+        self.assertTrue(any("hello" in text for row in screen.rows.values() for text in row))
 
 
 class HerdrTests(unittest.TestCase):

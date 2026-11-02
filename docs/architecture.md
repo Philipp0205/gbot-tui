@@ -4,7 +4,8 @@
 
 ```
 terminal
-  curses loop (poll every 2s, draw, read keys)
+  curses loop (sleep in select, read every key, draw once, schedule polls)
+       |  one worker thread runs gbot, in order
        |
        v
      Chat  -- phase: idle | working | blocked | done
@@ -28,14 +29,25 @@ side channel, only inside Herdr:
 
 | Invocation | What happens |
 |---|---|
-| `gbot-tui` | `gbot bots list`, then a curses picker |
+| `gbot-tui` | a curses picker, filled from the cached list while `gbot bots list` runs |
 | `gbot-tui <name>` | exact name, case-insensitive name, or a unique prefix |
 | `gbot-tui --list` | print names and exit |
 | `gbot-tui --complete` | names for the zsh completion in `gbot-tui.zsh` |
 
-A typed name is resolved from `~/.cache/gbot-tui/bots` first. That file is rewritten whenever the bot list is fetched. Completion treats it as fresh for 10 minutes (`NAMES_TTL`). If the cached name is wrong, the TUI lists bots again and retries.
+A typed name is resolved from `~/.cache/gbot-tui/roster.json` first, so the chat opens without waiting on `gbot`, and the list is refreshed on a thread behind it. A name the cache does not have waits for `gbot bots list`. Completion reads `~/.cache/gbot-tui/bots` and treats it as fresh for 10 minutes (`NAMES_TTL`).
 
-`gbot bots list` drops groups. The remaining bots go into an in-memory `ROSTER` and into the cache file.
+`gbot bots list` drops groups. The remaining bots go into an in-memory `ROSTER` and both cache files. A refresh swaps `ROSTER` in place so the UI never sees it empty. Herdr icons are composed on a thread after a list or a first thread read; the AppImage mount behind them can take seconds. When the icon is ready the loop re-reports the pane with the new `app` key.
+
+The picker and the chat share one curses session, so Enter and Esc do not drop back to the shell between screens. Leaving a chat for the list releases the Herdr agent on a thread; quitting releases it before exit.
+
+## Speed
+
+`bench/latency.py` times the TUI in a pseudo-terminal against `bench/mock_gbot.py` (needs `pyte`). Each `gbot` call costs a process start plus the gateway, so the work is in not waiting on one:
+
+- The bot list paints from `roster.json`, and a chat paints its last 80 entries from `~/.cache/gbot-tui/threads/<sha1>.json` (mode 0600) while the first `gbot thread` runs. That read replaces the cached rows. Cached cards cannot be answered: y/n are live only after the first read.
+- Keys are read without waiting. Every key curses already has is applied before one redraw, so a paste is one frame. No key calls `gbot`.
+- The loop sleeps in `select` on the terminal and a pipe the worker writes to, so a finished read draws at once. The sleep is capped at 0.1s, which is how late a resize shows.
+- Reads are 0.3s apart while waiting for a reply, 1s while new entries arrive, 2s once they stop (so two quiet polls still take about four seconds), 1s while a card is pending, and 2s backing off to 8s in an idle chat. A key press puts an idle chat back on 2s.
 
 ## How a message reaches Grok Bot
 
@@ -78,7 +90,7 @@ Sending clears the draft, appends the user's line to the transcript, and marks t
 - Each poll with no new entries increments a quiet counter. Two quiet polls after a non-user message with text count as `done`.
 - `done` is reported to Herdr as `idle`. The footer goes back to the idle hint.
 
-The two-poll window is about four seconds, because the curses loop waits up to 2 seconds for a key and a timeout is a poll. A bot that pauses longer than that looks finished while it is still working.
+The two-poll window is about four seconds, because once a reply stops growing, reads are 2 seconds apart. A bot that pauses longer than that looks finished while it is still working.
 
 ## The screen
 
@@ -103,4 +115,4 @@ The chat works without Herdr. When the phase changes, `publish` reports it two w
 
 If this process is the only live terminal in its Herdr tab, the tab is renamed to the bot. The check walks `/proc` for ancestor pids, then asks `hc ls` / `hc get` which terminal owns this process.
 
-Avatars are optional and only for Herdr's program icons. On `bots list`, the TUI mounts the Grok Bot AppImage with `squashfuse`, pulls `bot-*.png` masks and faces out of `app.asar`, and writes `~/.config/herdr-app/icons/gbot/` plus `programs.json`. The face file is 29 frames of 18px. Frame 0 is the resting pose. Its RGB is black and is not drawn; the icon uses the bot's color and that frame's alpha, so the body is filled and the eyes stay holes. Herdr's program icon is one static path, so the strip is not animated. A png already on disk is replaced when the bytes differ. The OSC `app` field is `program_key`, at most 32 bytes, which is the key Herdr matches. `programs.json` may also keep the longer `gbot-<id>` key, and both point at that same icon. A missing AppImage, `squashfuse`, or Pillow is ignored. The chat still runs.
+Avatars are optional and only for Herdr's program icons. After `bots list`, a background thread mounts the Grok Bot AppImage with `squashfuse`, pulls `bot-*.png` masks and faces out of `app.asar`, and writes `~/.config/herdr-app/icons/gbot/` plus `programs.json`. The face file is 29 frames of 18px. Frame 0 is the resting pose. Its RGB is black and is not drawn; the icon uses the bot's color and that frame's alpha, so the body is filled and the eyes stay holes. Herdr's program icon is one static path, so the strip is not animated. A png already on disk is replaced when the bytes differ. The OSC `app` field is `program_key`, at most 32 bytes, which is the key Herdr matches. `programs.json` may also keep the longer `gbot-<id>` key, and both point at that same icon. A missing AppImage, `squashfuse`, or Pillow is ignored. The chat still runs.
