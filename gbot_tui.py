@@ -69,20 +69,55 @@ def is_user(entry):
     return role in {"user", "human"} or role.endswith(":user")
 
 
+# Fields gbot copies off a pending auto-review or local-tool card.
+DETAIL_KEYS = (
+    "summary",
+    "description",
+    "action",
+    "command",
+    "reason",
+    "target",
+    "workingDirectory",
+    "surface",
+    "machineId",
+)
+
+
+def approval_of(entry):
+    """The pending card on one transcript entry, or None."""
+    if not isinstance(entry, dict) or entry.get("kind") != "send-message":
+        return None
+    message = entry.get("message")
+    if not isinstance(message, dict):
+        return None
+    kind = message.get("type")
+    card = message.get("approval") if kind == "auto-review-approval" else None
+    if kind == "local-tool-permission":
+        card = message.get("ask")
+    if not isinstance(card, dict) or card.get("status") != "pending":
+        return None
+    details = []
+    for key in DETAIL_KEYS:
+        value = card.get(key)
+        if isinstance(value, str) and value.strip():
+            details.append(value.strip())
+    entry_id = entry.get("id") if isinstance(entry.get("id"), str) else ""
+    request_id = card.get("requestId") if isinstance(card.get("requestId"), str) else ""
+    return {"entry_id": entry_id, "request_id": request_id, "details": details}
+
+
 def pending_approval(entries):
+    return any(approval_of(entry) for entry in entries)
+
+
+def latest_decision(entries):
+    """Newest card gbot can answer. Accept and decline need both ids."""
+    found = None
     for entry in entries:
-        if not isinstance(entry, dict) or entry.get("kind") != "send-message":
-            continue
-        message = entry.get("message")
-        if not isinstance(message, dict):
-            continue
-        kind = message.get("type")
-        card = message.get("approval") if kind == "auto-review-approval" else None
-        if kind == "local-tool-permission":
-            card = message.get("ask")
-        if isinstance(card, dict) and card.get("status") == "pending":
-            return True
-    return False
+        card = approval_of(entry)
+        if card and card["entry_id"] and card["request_id"]:
+            found = card
+    return found
 
 
 def watch_step(phase, new_entries, quiet, saw_other, pending):
@@ -593,6 +628,23 @@ def send_message(target, text):
     gbot("send", "--", target, text, timeout=90)
 
 
+def respond_approval(target, entry_id, request_id, decision):
+    # gbot approvals respond rechecks the card, then resolves it once.
+    gbot(
+        "approvals",
+        "respond",
+        "--target",
+        target,
+        "--entry-id",
+        entry_id,
+        "--request-id",
+        request_id,
+        "--decision",
+        decision,
+        timeout=30,
+    )
+
+
 def ancestor_pids():
     pids = set()
     pid = os.getpid()
@@ -750,13 +802,31 @@ def clip(text, width):
 
 
 def wrap(text, width):
+    """Wrap on spaces. A word longer than the width is the only hard break.
+
+    The space at the break is not drawn on the next line, or the continuation
+    looks indented.
+    """
     width = max(width, 1)
     lines = []
     for raw in text.splitlines() or [""]:
-        while len(raw) > width:
-            lines.append(raw[:width])
-            raw = raw[width:]
-        lines.append(raw)
+        rest = raw
+        if rest == "":
+            lines.append("")
+            continue
+        while rest:
+            if len(rest) <= width:
+                lines.append(rest)
+                break
+            window = rest[: width + 1]
+            cut = window.rfind(" ")
+            head = rest[:cut] if cut > 0 else ""
+            if cut > 0 and head.strip():
+                lines.append(head)
+                rest = rest[cut + 1 :].lstrip(" ")
+                continue
+            lines.append(rest[:width])
+            rest = rest[width:].lstrip(" ")
     return lines or [""]
 
 
@@ -778,7 +848,8 @@ class Chat:
         bot = ROSTER.get(target) or {}
         self.avatar_color = bot.get("avatarColor") or bot.get("avatar_color") or ""
         self.avatar_shape = bot.get("avatarShape") or bot.get("avatar_shape") or ""
-        self.label = bot.get("title") or ""
+        self.label = (bot.get("title") or bot.get("tagline") or "").strip()
+        self.deciding = False
 
     def note(self, phase):
         if phase != self.phase:
@@ -928,14 +999,51 @@ def avatar_attr(name):
     return AVATAR_ATTR.get((name or "").lower(), ATTR["default"])
 
 
+def _srgb(channel):
+    value = channel / 255
+    if value <= 0.04045:
+        return value / 12.92
+    return ((value + 0.055) / 1.055) ** 2.4
+
+
+def _luminance(red, green, blue):
+    return 0.2126 * _srgb(red) + 0.7152 * _srgb(green) + 0.0722 * _srgb(blue)
+
+
+def contrast_on_black(hex_color):
+    red = int(hex_color[1:3], 16)
+    green = int(hex_color[3:5], 16)
+    blue = int(hex_color[5:7], 16)
+    return (_luminance(red, green, blue) + 0.05) / 0.05
+
+
+def readable_hex(hex_color, dark=True):
+    """Lighten a bot color that is hard to read on black. Icons keep the original."""
+    red = int(hex_color[1:3], 16)
+    green = int(hex_color[3:5], 16)
+    blue = int(hex_color[5:7], 16)
+    if not dark:
+        return f"#{red:02X}{green:02X}{blue:02X}"
+    for _ in range(8):
+        if contrast_on_black(f"#{red:02X}{green:02X}{blue:02X}") >= 7:
+            break
+        red = min(255, red + max(1, (255 - red) // 4))
+        green = min(255, green + max(1, (255 - green) // 4))
+        blue = min(255, blue + max(1, (255 - blue) // 4))
+    return f"#{red:02X}{green:02X}{blue:02X}"
+
+
+TEXT_ATTR = {}
+
+
 def bot_text_attr(name):
     # Desktop 1:1 messages use the bot's color. Black would vanish on a dark terminal.
     folded = (name or "").lower()
     if folded == "black" and dark_terminal():
         return ATTR["default"]
-    if folded not in AVATAR_ATTR:
-        return ATTR["default"]
-    return AVATAR_ATTR[folded]
+    if folded in TEXT_ATTR:
+        return TEXT_ATTR[folded]
+    return avatar_attr(name)
 
 
 def bubble_column(width, text):
@@ -945,9 +1053,15 @@ def bubble_column(width, text):
 
 
 def composer_text_width(width):
-    # " → " plus the two box edges. The last column stays empty for the cursor.
-    span = max(width - 1, 0)
-    return max(span - 5, 1)
+    # " → " plus the two borders, and one cell so the cursor is not on the border.
+    return max(width - 6, 1)
+
+
+def composer_cursor_column(line, placeholder):
+    """Empty draft: sit on the space before the placeholder, not on its first letter."""
+    if placeholder:
+        return 3
+    return 4 + len(line or "")
 
 
 def draft_lines(typed, width):
@@ -987,19 +1101,15 @@ def visible_rows(chat, width):
     return chat._rows
 
 
-def card_text(entry):
-    if not isinstance(entry, dict) or entry.get("kind") != "send-message":
-        return ""
-    message = entry.get("message")
-    if not isinstance(message, dict):
-        return ""
-    kind = message.get("type")
-    card = message.get("approval") if kind == "auto-review-approval" else None
-    if kind == "local-tool-permission":
-        card = message.get("ask")
-    if isinstance(card, dict) and card.get("status") == "pending":
-        return "Needs approval"
-    return ""
+def card_lines(entry, width):
+    card = approval_of(entry)
+    if not card:
+        return []
+    lines = ["Needs approval"]
+    room = max(width - 2, 1)
+    for detail in card["details"]:
+        lines.extend(wrap(detail, room))
+    return lines
 
 
 def transcript_rows(entries, width):
@@ -1007,9 +1117,9 @@ def transcript_rows(entries, width):
     user_w = max(width - 8, 1)
     text_w = max(width - 4, 1)
     for entry in entries:
-        card = card_text(entry)
+        lines = card_lines(entry, width)
         text = entry_text(entry).strip()
-        if not text and not card:
+        if not text and not lines:
             continue
         if rows:
             rows.append(("gap", ""))
@@ -1023,15 +1133,16 @@ def transcript_rows(entries, width):
             else:
                 for line in wrapped:
                     rows.append(("text", line))
-        if card:
+        if lines:
             if text:
                 rows.append(("gap", ""))
-            rows.append(("card", card))
+            for line in lines:
+                rows.append(("card", line))
     return rows
 
 
 def composer_lines(width, typed):
-    span = max(width - 1, 0)
+    span = max(width, 0)
     if span <= 0:
         return "", "", ""
     if span == 1:
@@ -1044,11 +1155,14 @@ def composer_lines(width, typed):
     return "┌" + rule + "┐", "│" + body + "│", "└" + rule + "┘"
 
 
-def footer_spans(phase, error):
+def footer_spans(phase, error, decide=False):
     if error:
         return [(error, "red")]
     if phase == "blocked":
-        return [("Pending decision", "yellow")]
+        spans = [("Pending decision", "yellow")]
+        if decide:
+            spans.append(("  y approve · n decline", "dim"))
+        return spans
     if phase == "working":
         return [("Generating", "bold"), ("  —  pgup scroll", "dim")]
     return [("enter send · esc bots · ctrl-c quit · pgup scroll", "dim")]
@@ -1082,12 +1196,17 @@ def apply_theme(stdscr):
             curses.init_pair(2, -1, bubble)
             ATTR["user"] = curses.color_pair(2)
             AVATAR_ATTR.clear()
+            TEXT_ATTR.clear()
+            dark = dark_terminal()
             for index, (name, hex_color) in enumerate(AVATAR_COLORS.items()):
                 curses.init_pair(10 + index, xterm_color(hex_color), -1)
                 AVATAR_ATTR[name] = curses.color_pair(10 + index)
+                curses.init_pair(30 + index, xterm_color(readable_hex(hex_color, dark)), -1)
+                TEXT_ATTR[name] = curses.color_pair(30 + index)
         else:
             ATTR["user"] = ATTR["bold"]
             AVATAR_ATTR.clear()
+            TEXT_ATTR.clear()
         curses.init_pair(3, curses.COLOR_YELLOW, -1)
         curses.init_pair(4, curses.COLOR_RED, -1)
         ATTR["yellow"] = curses.color_pair(3)
@@ -1125,7 +1244,7 @@ def paint_spans(stdscr, y, x, spans):
 
 
 def paint_composer(stdscr, y, width, lines, placeholder=False):
-    span = max(width - 1, 0)
+    span = max(width, 0)
     if span < 2:
         return
     inner = span - 2
@@ -1179,7 +1298,8 @@ def draw(stdscr, chat):
         paint_composer(stdscr, composer_at + 1, width, shown, placeholder=not lines)
         put(stdscr, composer_at + composer_h - 1, 0, bot, ATTR["default"])
         last = "" if not lines else shown[-1]
-        cursor = (composer_at + len(shown), min(4 + len(last), max(width - 3, 0)))
+        column = composer_cursor_column(last, placeholder=not lines)
+        cursor = (composer_at + len(shown), min(column, max(width - 2, 0)))
     elif composer_h == 1:
         shown = chat.typed or "Add a follow-up"
         put(
@@ -1189,9 +1309,11 @@ def draw(stdscr, chat):
             clip("→ " + shown, max(width - 1, 0)),
             ATTR["default"] if chat.typed else ATTR["dim"],
         )
-        cursor = (composer_at, min(2 + len(chat.typed), max(width - 2, 0)))
+        column = 1 if not chat.typed else 2 + len(chat.typed)
+        cursor = (composer_at, min(column, max(width - 2, 0)))
     if footer_h:
-        paint_spans(stdscr, height - 1, 1, footer_spans(chat.phase, chat.error))
+        decide = bool(latest_decision(chat.messages)) and not chat.deciding
+        paint_spans(stdscr, height - 1, 1, footer_spans(chat.phase, chat.error, decide=decide))
     # The footer write leaves the cursor on "scroll". Put it back in the box.
     if cursor:
         try:
@@ -1234,6 +1356,9 @@ def chat_loop(stdscr, chat):
             try:
                 if kind == "read":
                     done.put(("page", read_thread(*args)))
+                elif kind == "decide":
+                    respond_approval(*args)
+                    done.put(("decided", None))
                 else:
                     send_message(*args)
                     done.put(("sent", None))
@@ -1258,11 +1383,15 @@ def chat_loop(stdscr, chat):
                 if kind == "error":
                     source, message = payload
                     chat.error = message
+                    if source == "decide":
+                        chat.deciding = False
                     if source == "send" and chat.phase == "working":
                         chat.note("idle")
                     if source == "read":
                         next_poll = time.monotonic() + 2
-                elif kind == "sent":
+                elif kind in {"sent", "decided"}:
+                    if kind == "decided":
+                        chat.deciding = False
                     next_poll = 0
                 elif not loaded:
                     chat.ingest(payload, first=True)
@@ -1314,6 +1443,25 @@ def chat_loop(stdscr, chat):
                 jobs.put(("send", (chat.target, text)))
                 waiting += 1
                 continue
+            if (
+                key in ("y", "Y", "n", "N")
+                and chat.phase == "blocked"
+                and not chat.typed
+                and not chat.deciding
+            ):
+                card = latest_decision(chat.messages)
+                if card:
+                    decision = "accept" if key in ("y", "Y") else "decline"
+                    chat.deciding = True
+                    chat.error = ""
+                    jobs.put(
+                        (
+                            "decide",
+                            (chat.target, card["entry_id"], card["request_id"], decision),
+                        )
+                    )
+                    waiting += 1
+                    continue
             if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
                 chat.typed = chat.typed[:-1]
                 continue
@@ -1352,16 +1500,25 @@ def fuzzy_score(query, name):
 
 
 def picker_spans(bot, selected, width):
-    """One sidebar row: selection mark, avatar, name, and label."""
-    title = bot.get("title") or ""
-    name = bot["name"] + (f"  {title}" if title else "")
-    style = "bold" if selected else "dim"
+    """One sidebar row: selection mark, avatar, name, and a dim tagline."""
+    title = (bot.get("title") or bot.get("tagline") or "").strip()
+    name = bot["name"]
+    name_style = "bold" if selected else "default"
     lead = "→ " if selected else "  "
+    lead_style = "bold" if selected else "dim"
     color = (bot.get("avatarColor") or bot.get("avatar_color") or "").lower()
+    room = max(width - 7, 1)
+    mark = ("● ", color or "default")
+    if not title:
+        return [(lead, lead_style), mark, (clip(name, room), name_style)]
+    name_room = min(len(name), max(room // 2, 1))
+    title_room = max(room - min(len(name), name_room) - 5, 1)
     return [
-        (lead, style),
-        ("● ", color or "default"),
-        (clip(name, max(width - 7, 0)), style),
+        (lead, lead_style),
+        mark,
+        (clip(name, name_room), name_style),
+        ("  ·  ", "dim"),
+        (clip(title, title_room), "dim"),
     ]
 
 
@@ -1382,6 +1539,9 @@ def fuzzy_bots(query, bots):
 
 
 def pick(stdscr, bots):
+    # The chat loop waits 100ms for a key. Leaving that on makes get_wch
+    # raise "no input" the moment this list draws.
+    stdscr.timeout(-1)
     apply_theme(stdscr)
     fast_escape()
     place_cursor(False)
@@ -1412,7 +1572,10 @@ def pick(stdscr, bots):
         if footer:
             paint_spans(stdscr, height - 1, 1, [("type to search · enter open · ctrl-c quit", "dim")])
         stdscr.refresh()
-        key = stdscr.get_wch()
+        try:
+            key = stdscr.get_wch()
+        except curses.error:
+            continue
         if key in ("\x03", "\x04"):
             return None
         if key in ("\x1b", 27):
@@ -1521,35 +1684,33 @@ def session(target):
         target = ""
 
 
+def resolve_for_open(query):
+    """Load the bot list so a direct name still has its tagline."""
+    try:
+        names = [bot["name"] for bot in list_bots()]
+    except GbotError:
+        names = read_names()
+        if not names:
+            raise
+    return match_bot(query, names)
+
+
 def open_named(query):
-    chosen = query
-    cached = read_names()
-    if cached:
-        try:
-            chosen = match_bot(query, cached)
-        except GbotError as error:
-            if str(error).startswith("Several"):
-                print(error, file=sys.stderr)
-                return 1
-            chosen = query
     try:
-        back = open_chat(chosen)
-    except GbotError as error:
-        if "No bot or group named" not in str(error):
-            print(error, file=sys.stderr)
-            return 1
-    except KeyboardInterrupt:
-        return 130
-    else:
-        if back != "back":
-            return 0
-        return session("")
-    try:
-        chosen = match_bot(query, [bot["name"] for bot in list_bots()])
+        chosen = resolve_for_open(query)
     except GbotError as error:
         print(error, file=sys.stderr)
         return 1
-    return session(chosen)
+    try:
+        back = open_chat(chosen)
+    except GbotError as error:
+        print(error, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    if back != "back":
+        return 0
+    return session("")
 
 
 def main(argv):

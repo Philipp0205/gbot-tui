@@ -58,6 +58,37 @@ class ParseTests(unittest.TestCase):
             gbot_tui.gbot_argv(("send", "--", "Researcher", "hi")),
             ["gbot", "send", "--gateway", "--json", "--", "Researcher", "hi"],
         )
+        self.assertEqual(
+            gbot_tui.gbot_argv(
+                (
+                    "approvals",
+                    "respond",
+                    "--target",
+                    "Outfitly",
+                    "--entry-id",
+                    "card",
+                    "--request-id",
+                    "ask",
+                    "--decision",
+                    "decline",
+                )
+            ),
+            [
+                "gbot",
+                "approvals",
+                "respond",
+                "--target",
+                "Outfitly",
+                "--entry-id",
+                "card",
+                "--request-id",
+                "ask",
+                "--decision",
+                "decline",
+                "--gateway",
+                "--json",
+            ],
+        )
 
     def test_failure_uses_stderr_when_stdout_is_empty(self):
         self.assertEqual(
@@ -252,6 +283,10 @@ class LookTests(unittest.TestCase):
         _top, typed, _bot = gbot_tui.composer_lines(32, "hello")
         self.assertIn("hello", typed)
         self.assertNotIn("Add a follow-up", typed)
+        wide, _middle, wide_bottom = gbot_tui.composer_lines(58, "")
+        self.assertEqual(len(wide), 58)
+        self.assertEqual(len(wide_bottom), 58)
+        self.assertEqual(gbot_tui.composer_cursor_column("", True), 3)
 
     def test_long_draft_wraps_and_the_box_grows(self):
         text = "abcdefghijklmnopqrstuvwxyz"
@@ -290,8 +325,9 @@ class LookTests(unittest.TestCase):
         )
         self.assertEqual(spans[0], ("→ ", "bold"))
         self.assertEqual(spans[1], ("● ", "violet"))
-        self.assertIn("Outfitly", spans[2][0])
-        self.assertIn("wardrobe", spans[2][0])
+        self.assertEqual(spans[2], ("Outfitly", "bold"))
+        self.assertEqual(spans[3], ("  ·  ", "dim"))
+        self.assertEqual(spans[4], ("wardrobe", "dim"))
 
     def test_user_text_is_a_bubble_and_the_reply_is_plain(self):
         rows = gbot_tui.transcript_rows(
@@ -319,11 +355,85 @@ class LookTests(unittest.TestCase):
         )
         self.assertEqual(rows, [("card", "Needs approval")])
 
+    def test_approval_card_shows_what_is_pending(self):
+        entry = {
+            "id": "card",
+            "kind": "send-message",
+            "message": {
+                "type": "auto-review-approval",
+                "approval": {
+                    "status": "pending",
+                    "requestId": "ask",
+                    "command": "npm publish",
+                    "reason": "ship the package",
+                },
+            },
+        }
+        rows = gbot_tui.transcript_rows([entry], 40)
+        texts = [text for kind, text in rows if kind == "card"]
+        self.assertEqual(texts[0], "Needs approval")
+        self.assertIn("npm publish", texts)
+        self.assertIn("ship the package", texts)
+        self.assertTrue(all(not line.startswith(" ") for line in texts))
+        card = gbot_tui.latest_decision([entry])
+        self.assertEqual((card["entry_id"], card["request_id"]), ("card", "ask"))
+
+    def test_wrap_keeps_words_together(self):
+        self.assertEqual(gbot_tui.wrap("right now", 7), ["right", "now"])
+        self.assertEqual(gbot_tui.wrap("your turn", 4), ["your", "turn"])
+        self.assertEqual(gbot_tui.wrap("Bedrock's next", 12), ["Bedrock's", "next"])
+        self.assertEqual(gbot_tui.draft_lines("before I review", 20), ["before I", "review"])
+        self.assertEqual(
+            gbot_tui.wrap("abcdefghijklmnopqrstuvwxyz", 10),
+            ["abcdefghij", "klmnopqrst", "uvwxyz"],
+        )
+        self.assertTrue(all(not line.startswith(" ") for line in gbot_tui.wrap("hello world", 6)))
+
+    def test_red_text_is_lighter_on_black(self):
+        original = gbot_tui.avatar_color("red")
+        self.assertEqual(original, "#FF263C")
+        lifted = gbot_tui.readable_hex(original, dark=True)
+        self.assertGreater(gbot_tui.contrast_on_black(lifted), gbot_tui.contrast_on_black(original))
+        self.assertGreaterEqual(gbot_tui.contrast_on_black(lifted), 7)
+        self.assertEqual(gbot_tui.readable_hex(original, dark=False), original)
+
     def test_footer_states(self):
         self.assertEqual(gbot_tui.footer_spans("blocked", "")[0], ("Pending decision", "yellow"))
         working = "".join(text for text, _style in gbot_tui.footer_spans("working", ""))
         self.assertIn("Generating", working)
         self.assertEqual(gbot_tui.footer_spans("idle", "no session")[0][1], "red")
+        blocked = gbot_tui.footer_spans("blocked", "", decide=True)
+        self.assertEqual(blocked[0], ("Pending decision", "yellow"))
+        self.assertIn("approve", blocked[1][0])
+        self.assertIn("decline", blocked[1][0])
+
+    def test_pick_restores_blocking_input(self):
+        class Screen:
+            def timeout(self, value):
+                self.value = value
+                raise StopIteration
+
+        screen = Screen()
+        with self.assertRaises(StopIteration):
+            gbot_tui.pick(screen, [])
+        self.assertEqual(screen.value, -1)
+
+    def test_direct_name_loads_the_tagline(self):
+        bots = [{"name": "Outfitly", "title": "what to wear", "avatarColor": "red"}]
+
+        def fake_list():
+            gbot_tui.ROSTER.clear()
+            gbot_tui.ROSTER["Outfitly"] = bots[0]
+            return bots
+
+        original = gbot_tui.list_bots
+        gbot_tui.list_bots = fake_list
+        try:
+            self.assertEqual(gbot_tui.resolve_for_open("out"), "Outfitly")
+            self.assertEqual(gbot_tui.Chat("Outfitly").label, "what to wear")
+        finally:
+            gbot_tui.list_bots = original
+            gbot_tui.ROSTER.clear()
 
 
 class SendTests(unittest.TestCase):
@@ -394,6 +504,35 @@ class SendTests(unittest.TestCase):
             ["prior", "hello"],
         )
         self.assertTrue(chat.messages[-1].get("local"))
+
+    def test_footer_returns_to_idle_after_the_reply(self):
+        chat = gbot_tui.Chat("Researcher")
+        chat.cursor = "old"
+        chat.phase = "working"
+        chat.messages = [{"role": "user", "text": "hi", "local": True}]
+        reply = gbot_tui.parse_thread(
+            {
+                "target": {"id": "a1", "name": "Researcher"},
+                "transcript": {
+                    "entries": [
+                        {"id": "m1", "role": "user", "text": "hi"},
+                        {"id": "m2", "role": "assistant", "text": "shipped"},
+                    ]
+                },
+                "cursor": "m2",
+            }
+        )
+        chat.ingest(reply)
+        self.assertEqual(chat.phase, "working")
+        working = "".join(text for text, _style in gbot_tui.footer_spans(chat.phase, ""))
+        self.assertIn("Generating", working)
+        quiet = gbot_tui.parse_thread({"transcript": {"entries": []}, "cursor": "m2"})
+        chat.ingest(quiet)
+        chat.ingest(quiet)
+        self.assertEqual(chat.phase, "done")
+        done = gbot_tui.footer_spans(chat.phase, "")
+        self.assertEqual(done, gbot_tui.footer_spans("idle", ""))
+        self.assertNotIn("Generating", "".join(text for text, _style in done))
 
 
 class HerdrTests(unittest.TestCase):
