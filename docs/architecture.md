@@ -1,6 +1,6 @@
 # How gbot-tui works
 
-`gbot-tui` is one Python program, `gbot_tui.py`. It chats with one Grok bot in a curses terminal. It does not talk to Grok itself, and it does not attach to the Grok Bot desktop app. Every list, thread read, and send is a subprocess of the third-party `gbot` CLI (`grok-bot-cli`), which then calls the same HTTPS gateway the desktop app uses.
+`gbot-tui` is one Python program. `gbot_tui.py` starts it and the code lives in the `gbottui` package beside that file. It chats with one Grok bot in a curses terminal. It does not talk to Grok itself, and it does not attach to the Grok Bot desktop app. Every list, thread read, and send is a subprocess of the third-party `gbot` CLI (`grok-bot-cli`), which then calls the same HTTPS gateway the desktop app uses.
 
 ```
 terminal
@@ -22,6 +22,34 @@ side channel, only inside Herdr:
   tab rename via hc / herdr-app
   avatar icons in ~/.config/herdr-app
 ```
+
+Run it from this directory, or symlink `gbot_tui.py` (the link resolves to the package next to it). Copying `gbot_tui.py` somewhere else, without the `gbottui` directory, does not run.
+
+## Where the code lives
+
+Each module in `gbottui/` does one job. Modules import each other as `from . import herdr` and read `herdr.APP`, `tabs.TAB`, `roster.ROSTER`, or `activity.ACTIVITY` through the module, because those values are rebound at run time and swapped in tests.
+
+| Module | Job |
+|---|---|
+| `app.py` | arguments, the curses session that holds the list and the chat, exit and signals |
+| `picker.py` | the bot list, its fuzzy filter, and the status columns |
+| `activity.py` | needs you / new / running / idle, the seen cursor, `--overview` |
+| `chat.py` | `Chat`: transcript, draft, phase, decisions, poll delays |
+| `chat_screen.py` | chat keys, the one gbot worker thread, the loop |
+| `chat_view.py` | drawing one chat |
+| `layout.py` | wrapping, transcript rows, composer and footer text (no curses) |
+| `paint.py` | curses helpers both screens use |
+| `styles.py` | curses attributes for styles and bot colors |
+| `theme.py` | light or dark: `GBOT_TUI_THEME`, OSC 11, `COLORFGBG` |
+| `colors.py` | avatar colors, the default shape and color, contrast, the 256-color palette |
+| `transcript.py` | reading a thread page: text, roles, approval cards, `watch_step` |
+| `gbot.py` | running `gbot`, one process at a time, and the calls the TUI makes |
+| `roster.py` | the bot list in memory, name matching |
+| `cache.py` | files under `~/.cache/gbot-tui` |
+| `herdr.py` | OSC 7501 and `herdr pane report-agent` |
+| `tabs.py` | `TabTitle`, the Herdr tab rename |
+| `icons.py` | Herdr program icons from the AppImage |
+| `terminal.py` | writes to `/dev/tty` and the window title |
 
 ## Starting a session
 

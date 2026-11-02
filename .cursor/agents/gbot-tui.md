@@ -3,19 +3,19 @@ name: gbot-tui
 description: Specialist for the gbot-tui curses chat and its Herdr integration. Use proactively for a slow Enter-to-message delay, Herdr program icons that look like lines instead of a filled Grok bot avatar, or playing the Grok Bot avatar animations in Herdr.
 ---
 
-You work in `/home/philipp/git/gbot-tui`. The program is `gbot_tui.py`. Read `docs/architecture.md` before changing behavior. Keep the chat working when Herdr, the AppImage, squashfuse, or Pillow is missing.
+You work in `/home/philipp/git/gbot-tui`. `gbot_tui.py` starts the program; the code is the `gbottui` package, one module per job (see "Where the code lives" in `docs/architecture.md`). Read `docs/architecture.md` before changing behavior. Keep the chat working when Herdr, the AppImage, squashfuse, or Pillow is missing.
 
 ## Enter feels late
 
-Pressing Enter runs `Chat.arm_send`, which appends a local user row, clears the composer, sets phase `working`, and draws before `jobs.put(("send", ...))`. A single background worker then runs `send_message` (`gbot send -- <target> <text>`, gateway `POST /api/sendPrompt`, timeout 90s) and the next `read_thread`. When that poll returns the same user text, the local row is replaced instead of appended. `bench/latency.py` measures Enter to bubble against a mock `gbot`.
+Pressing Enter runs `Chat.arm_send` (`gbottui/chat.py`), which appends a local user row, clears the composer, sets phase `working`, and draws before `worker.put(("send", ...))` in `chat_loop` (`gbottui/chat_screen.py`). The single `Worker` thread then runs `send_message` (`gbot send -- <target> <text>`, gateway `POST /api/sendPrompt`, timeout 90s) and the next `read_thread`. When that poll returns the same user text, the local row is replaced instead of appended. `bench/latency.py` measures Enter to bubble against a mock `gbot`.
 
-Do not block the curses loop on `gbot`. Do not start a second worker that can reorder send and read. Threads that only list bots or compose icons are fine; they never touch the send/read queue or write to the terminal.
+Do not block the curses loop on `gbot`. Do not start a second worker that can reorder send and read. `GBOT_LOCK` in `gbottui/gbot.py` is that order: the overview scan, a send, and a chat read share it, so a scan cannot pass a send. Threads that only list bots or compose icons are fine; they never touch the send/read queue or write to the terminal.
 
 ## Herdr icons
 
-`compose_avatar` tints frame 0 of `bot-<shape>-face.png` and writes a straight-alpha PNG: RGB is the avatar color, alpha is the frame's alpha. The strip is 29 frames of 18×18. RGB in that file is black and must not be drawn. Eyes are transparent holes. Pasting the black frame onto the mask paints a silhouette, which is only a rim on the dark tile.
+`compose_avatar` (`gbottui/icons.py`) tints frame 0 of `bot-<shape>-face.png` and writes a straight-alpha PNG: RGB is the avatar color, alpha is the frame's alpha. The strip is 29 frames of 18×18. RGB in that file is black and must not be drawn. Eyes are transparent holes. Pasting the black frame onto the mask paints a silhouette, which is only a rim on the dark tile.
 
-`install_avatars` rewrites `~/.config/herdr-app/icons/gbot/*.png` when the bytes differ. `programs.json` may contain both the full `gbot-<uuid>` key and the 32-byte compact key from `program_key`. Herdr drops an OSC 7501 `app` longer than 32 bytes, and also drops one that contains whitespace (space, nbsp, en space), so `notice_name` turns whitespace into hyphens and `programs.json` `match` includes that hyphenated name. Herdr Desktop 0.1.11 is a Herdr session via `HC_TERMINAL_ID`, `HC_SCOPE`, or `HC_TERMINAL_SOCKET`, not `HERDR_ENV`. A first OSC 11 reply of `#282C34` is rechecked up to five times. One still icon. Do not add animation. Colors stay `AVATAR_COLORS`. `tint` stays false. Do not mount the AppImage in tests.
+A bot that never picked a shape or color still gets an icon. `bot_avatar` (`gbottui/colors.py`) hashes the agent id the way the desktop app does, so the color is never empty. `install_avatars` rewrites `~/.config/herdr-app/icons/gbot/*.png` when the bytes differ. `programs.json` may contain both the full `gbot-<uuid>` key and the 32-byte compact key from `program_key`. Herdr drops an OSC 7501 `app` longer than 32 bytes, and also drops one that contains whitespace (space, nbsp, en space), so `notice_name` turns whitespace into hyphens and `programs.json` `match` includes that hyphenated name. Herdr Desktop 0.1.11 is a Herdr session via `HC_TERMINAL_ID`, `HC_SCOPE`, or `HC_TERMINAL_SOCKET`, not `HERDR_ENV`. A first OSC 11 reply of `#282C34` is rechecked up to five times. One still icon. Do not add animation. Colors stay `AVATAR_COLORS`. `tint` stays false. Do not mount the AppImage in tests.
 
 ## Animations
 
