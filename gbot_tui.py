@@ -398,6 +398,76 @@ AVATAR_COLORS = {
 }
 
 
+# Shapes the app will draw. A bot that never picked one gets one of the eight
+# defaults below; the rest (heart, pumpkin, …) are explicit choices.
+AVATAR_SHAPES = {
+    "blob", "pebble", "bean", "egg", "squircle", "tablet", "capsule", "cylinder",
+    "hex", "gem", "crystal", "wedge", "shield", "dome", "arch", "cloud", "teardrop",
+    "leaf", "square", "sparkle", "clover", "flower", "heart", "house", "star", "pumpkin",
+}
+
+# Grok Bot's own fallback (index.eager-common An/Dn/Tn). The hash indexes these
+# lists, so the order is part of the result. Black is a chosen color only.
+DEFAULT_SHAPES = ["blob", "pebble", "squircle", "tablet", "wedge", "hex", "cloud", "teardrop"]
+DEFAULT_COLORS = [name for name in AVATAR_COLORS if name != "black"]
+
+
+def _imul(a, b):
+    """Low 32 bits of a product, matching JavaScript Math.imul."""
+    return (a * b) & 0xFFFFFFFF
+
+
+def _fnv(text):
+    """FNV-1a over UTF-16 code units, the way JS charCodeAt walks a string."""
+    h = 2166136261
+    for ch in str(text):
+        code = ord(ch)
+        if code < 0x10000:
+            units = (code,)
+        else:
+            code -= 0x10000
+            units = (0xD800 + (code >> 10), 0xDC00 + (code & 0x3FF))
+        for unit in units:
+            h = _imul(h ^ unit, 16777619)
+    return h
+
+
+def default_shape(agent_id):
+    t = _fnv(agent_id)
+    t = _imul(t ^ (t >> 16), 73244475)
+    t = _imul(t ^ (t >> 13), 3266489909)
+    return DEFAULT_SHAPES[((t ^ (t >> 16)) & 0xFFFFFFFF) % len(DEFAULT_SHAPES)]
+
+
+def default_color(agent_id):
+    # Math.imul(1, 0x9E3779B9) is applied twice and cancels. Both steps stay
+    # so the seed matches the app's mulberry32 call.
+    seed = (_fnv(agent_id) ^ _imul(1, 2654435769)) & 0xFFFFFFFF
+    t = (seed ^ _imul(1, 2654435769)) & 0xFFFFFFFF
+    t = (t + 1831565813) & 0xFFFFFFFF
+    e = _imul(t ^ (t >> 15), 1 | t)
+    e = ((e + _imul(e ^ (e >> 7), 61 | e)) & 0xFFFFFFFF) ^ e
+    r = ((e ^ (e >> 14)) & 0xFFFFFFFF) / 4294967296
+    return DEFAULT_COLORS[int(r * len(DEFAULT_COLORS))]
+
+
+def bot_avatar(bot):
+    """(shape, color) the way Grok Bot draws it, defaults included.
+
+    The hash input is `id`. `gbot bots list` sets that from the gateway
+    agent id (`agent.id`, else `agentId`). `agentId` is only a fallback
+    for a row that did not go through that list.
+    """
+    agent_id = str(bot.get("id") or bot.get("agentId") or "")
+    shape = str(bot.get("avatarShape") or bot.get("avatar_shape") or "")
+    color = str(bot.get("avatarColor") or bot.get("avatar_color") or "").lower()
+    if shape not in AVATAR_SHAPES:
+        shape = default_shape(agent_id)
+    if color not in AVATAR_COLORS:
+        color = default_color(agent_id)
+    return shape, color
+
+
 def avatar_color(name):
     return AVATAR_COLORS.get((name or "").lower(), "#777777")
 
@@ -762,8 +832,7 @@ def install_avatars(bots, root=None, src=None):
     for bot in bots:
         keys = program_ids(bot.get("id") or "")
         key = keys[0] if keys else ""
-        shape = "".join(ch for ch in str(bot.get("avatarShape") or bot.get("avatar_shape") or "") if ch.isalnum())
-        color_name = "".join(ch for ch in str(bot.get("avatarColor") or bot.get("avatar_color") or "") if ch.isalnum())
+        shape, color_name = bot_avatar(bot)
         if not key or not shape:
             continue
         mask = os.path.join(src, f"bot-{shape}.png")

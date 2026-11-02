@@ -297,6 +297,78 @@ class AvatarTests(unittest.TestCase):
                 builtins.__import__ = real_import
             self.assertEqual(made, {})
 
+    def test_unset_or_invalid_look_uses_the_app_default(self):
+        # These pairs are the app's id hash (FNV-1a, then the shape mix and one
+        # mulberry32 draw). The same steps under node produced these strings.
+        expected = {
+            "abc": ("hex", "cyan"),
+            "a1": ("tablet", "gray"),
+            "Outfitly": ("tablet", "orange"),
+            "ea566f99-aded-40c2-99fc-60e5477d2a61": ("pebble", "brown"),
+            "🤖": ("hex", "yellow"),
+            "agent-🤖": ("squircle", "orange"),
+        }
+        for agent_id, pair in expected.items():
+            self.assertEqual(gbot_tui.bot_avatar({"id": agent_id}), pair)
+            self.assertEqual(gbot_tui.bot_avatar({"agentId": agent_id}), pair)
+
+        self.assertEqual(
+            gbot_tui.bot_avatar({"id": "abc", "avatarShape": "heart", "avatarColor": "Red"}),
+            ("heart", "red"),
+        )
+        self.assertEqual(
+            gbot_tui.bot_avatar({"id": "abc", "avatar_shape": "heart", "avatar_color": "red"}),
+            ("heart", "red"),
+        )
+        self.assertEqual(gbot_tui.bot_avatar({"id": "abc", "avatarColor": "red"}), ("hex", "red"))
+        self.assertEqual(
+            gbot_tui.bot_avatar({"id": "abc", "avatarShape": "", "avatarColor": "red"}),
+            ("hex", "red"),
+        )
+        self.assertEqual(gbot_tui.bot_avatar({"id": "abc", "avatarShape": "heart"}), ("heart", "cyan"))
+        self.assertEqual(
+            gbot_tui.bot_avatar({"id": "a1", "avatarShape": "heart", "avatarColor": ""}),
+            ("heart", "gray"),
+        )
+        self.assertEqual(gbot_tui.bot_avatar({"id": "abc"}), ("hex", "cyan"))
+        self.assertEqual(
+            gbot_tui.bot_avatar({"id": "ea566f99-aded-40c2-99fc-60e5477d2a61", "avatarShape": "", "avatarColor": ""}),
+            ("pebble", "brown"),
+        )
+        self.assertEqual(
+            gbot_tui.bot_avatar({"id": "abc", "avatarShape": "nope", "avatarColor": "plaid"}),
+            ("hex", "cyan"),
+        )
+        self.assertEqual(
+            gbot_tui.bot_avatar({"id": "🤖", "avatarShape": "heart!", "avatarColor": "#ff0000"}),
+            ("hex", "yellow"),
+        )
+
+    def test_install_fills_an_icon_when_the_bot_never_picked_a_look(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for shape in ("hex", "heart"):
+                Image.new("RGBA", (18, 18), (0, 0, 0, 255)).save(root / f"bot-{shape}.png")
+                Image.new("RGBA", (18, 18), (0, 0, 0, 255)).save(root / f"bot-{shape}-face.png")
+
+            def installed(bot):
+                made = gbot_tui.install_avatars([bot], root=tmp, src=tmp)
+                self.assertIn("gbot-abc", made)
+                return made["gbot-abc"]["icon"]
+
+            bare = installed({"id": "abc", "name": "Outfitly"})
+            self.assertIn("gbot-abc-hex-cyan.png", bare)
+            self.assertEqual(Image.open(root / bare).getpixel((4, 4)), (0x00, 0xBC, 0xA6, 255))
+            self.assertIn("hex-red", installed({"id": "abc", "name": "Outfitly", "avatarColor": "red"}))
+            self.assertIn("heart-cyan", installed({"id": "abc", "name": "Outfitly", "avatarShape": "heart"}))
+            both = installed({"id": "abc", "name": "Outfitly", "avatarShape": "", "avatarColor": ""})
+            self.assertIn("gbot-abc-hex-cyan.png", both)
+            invalid = installed({"id": "abc", "name": "Outfitly", "avatarShape": "nope", "avatarColor": "plaid"})
+            self.assertIn("gbot-abc-hex-cyan.png", invalid)
+            self.assertFalse((root / "icons" / "gbot" / "gbot-abc-nope-plaid.png").exists())
+
 
 class LookTests(unittest.TestCase):
     def test_screen_uses_the_terminal_background(self):
