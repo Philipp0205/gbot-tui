@@ -15,7 +15,7 @@ Do not block the curses loop on `gbot`. Do not start a second worker that can re
 
 `compose_avatar` tints frame 0 of `bot-<shape>-face.png` and writes a straight-alpha PNG: RGB is the avatar color, alpha is the frame's alpha. The strip is 29 frames of 18×18. RGB in that file is black and must not be drawn. Eyes are transparent holes. Pasting the black frame onto the mask paints a silhouette, which is only a rim on the dark tile.
 
-`install_avatars` rewrites `~/.config/herdr-app/icons/gbot/*.png` when the bytes differ. `programs.json` may contain both the full `gbot-<uuid>` key and the 32-byte compact key from `program_key`; Herdr drops an OSC 7501 `app` longer than 32 bytes. One still icon. Do not add animation. Colors stay `AVATAR_COLORS`. `tint` stays false. Do not mount the AppImage in tests.
+`install_avatars` rewrites `~/.config/herdr-app/icons/gbot/*.png` when the bytes differ. `programs.json` may contain both the full `gbot-<uuid>` key and the 32-byte compact key from `program_key`. Herdr drops an OSC 7501 `app` longer than 32 bytes, and also drops one that contains whitespace (space, nbsp, en space), so `notice_name` turns whitespace into hyphens and `programs.json` `match` includes that hyphenated name. Herdr Desktop 0.1.11 is a Herdr session via `HC_TERMINAL_ID`, `HC_SCOPE`, or `HC_TERMINAL_SOCKET`, not `HERDR_ENV`. A first OSC 11 reply of `#282C34` is rechecked up to five times. One still icon. Do not add animation. Colors stay `AVATAR_COLORS`. `tint` stays false. Do not mount the AppImage in tests.
 
 ## Animations
 

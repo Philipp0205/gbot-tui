@@ -305,7 +305,7 @@ def report_command(herdr, pane, phase, label, session_id, seq, resume):
         "--source",
         SOURCE,
         "--agent",
-        display_name(label) or label,
+        notice_name(label) or label,
         "--state",
         herdr_state(phase),
         "--seq",
@@ -327,7 +327,7 @@ def release_command(herdr, pane, label, seq):
         "--source",
         SOURCE,
         "--agent",
-        display_name(label) or label,
+        notice_name(label) or label,
         "--seq",
         str(seq),
     ]
@@ -423,13 +423,16 @@ def display_name(name):
 def notice_name(name):
     """That name as an OSC 7501 app. Herdr shows this string in "Cloud needs you".
 
+    Herdr drops an app that contains whitespace (a space, a non-breaking space,
+    or an en space), and then the popup says "An agent needs you" and the icon
+    does not attach. Those become hyphens: "Cursor-Cloud-Session needs you".
     The app field is at most 32 bytes, and a colon would split the report.
     """
-    text = display_name(str(name or "").replace(":", " ").replace("=", " "))
+    text = "-".join(display_name(str(name or "").replace(":", " ").replace("=", " ")).split())
     raw = text.encode()
     if len(raw) <= APP_LIMIT:
         return text
-    return raw[:APP_LIMIT].decode("utf-8", "ignore").rstrip()
+    return raw[:APP_LIMIT].decode("utf-8", "ignore").rstrip().rstrip("-")
 
 
 def bind_app(name, bot_id=""):
@@ -782,6 +785,8 @@ def install_avatars(bots, root=None, src=None):
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with open(dest, "wb") as handle:
                 handle.write(png)
+        # Herdr matches this list against the OSC app. The app is the hyphenated
+        # name (`Cursor-Cloud-Session`), so that string has to be here.
         human = notice_name(bot.get("name") or "")
 
         def aliases(slot):
@@ -817,8 +822,8 @@ def install_avatars(bots, root=None, src=None):
 
 def show_avatar(bot, root=None, src=None):
     install_avatars([bot], root, src)
-    # The icon stays under the program key. Herdr's popup uses the app string
-    # itself ("gbot-b3-cloud needs you"), so the app is the bot's own name.
+    # The icon stays under the program key. The popup reads the app string
+    # ("Cursor-Cloud-Session needs you"), so the app is the hyphenated name.
     bind_app(bot.get("name"), bot.get("id"))
 
 
@@ -991,6 +996,7 @@ class TabTitle:
 
     One worker runs the jobs in order, so a restore never lands before the
     rename it undoes, and the curses loop never waits on herdr-app.
+    Finding the tab uses `hc`, not HERDR_ENV, so a Desktop pane is included.
     """
 
     def __init__(self, find=None, spaces=None, rename=None):
@@ -1091,9 +1097,8 @@ POP_TITLE = b"\033[23;0t"
 
 
 def tell_herdr(phase, label, session_id, resume):
-    herdr = os.environ.get("HERDR_BIN_PATH")
-    pane = os.environ.get("HERDR_PANE_ID")
-    if os.environ.get("HERDR_ENV") != "1" or not herdr or not pane:
+    herdr, pane = herdr_cli()
+    if not herdr or not pane:
         return
     seq = time.time_ns() // 1_000_000
     command = report_command(herdr, pane, phase, label, session_id, seq, resume)
@@ -1108,9 +1113,8 @@ def tell_herdr(phase, label, session_id, resume):
 
 
 def silence_herdr(label):
-    herdr = os.environ.get("HERDR_BIN_PATH")
-    pane = os.environ.get("HERDR_PANE_ID")
-    if os.environ.get("HERDR_ENV") != "1" or not herdr or not pane:
+    herdr, pane = herdr_cli()
+    if not herdr or not pane:
         return
     seq = time.time_ns() // 1_000_000
     subprocess.run(
@@ -1554,8 +1558,27 @@ THEME_GAP = 0.5
 THEME = {"watch": False, "tries": 0, "due": 0.0, "follow": False}
 
 
+# Herdr Desktop 0.1.11 panes set none of HERDR_ENV / HERDR_PANE_ID. They do set these.
+DESKTOP_MARKS = ("HC_TERMINAL_ID", "HC_SCOPE", "HC_TERMINAL_SOCKET")
+
+
 def herdr_session():
-    return os.environ.get("HERDR_ENV") == "1" or bool(os.environ.get("HERDR_PANE_ID"))
+    """True in a Herdr pane, including Desktop, which only publishes HC_* variables."""
+    if os.environ.get("HERDR_ENV") == "1" or os.environ.get("HERDR_PANE_ID"):
+        return True
+    return any(os.environ.get(name) for name in DESKTOP_MARKS)
+
+
+def herdr_cli():
+    """The `herdr` binary and pane id, or ("", "") when the CLI cannot be called.
+
+    OSC 7501 does not need either value, so Desktop still gets icons and popups.
+    The CLI report runs for any detected session that also has HERDR_BIN_PATH
+    and HERDR_PANE_ID, including when HERDR_ENV itself is unset.
+    """
+    if not herdr_session():
+        return "", ""
+    return os.environ.get("HERDR_BIN_PATH") or "", os.environ.get("HERDR_PANE_ID") or ""
 
 
 def theme_override():
@@ -1590,12 +1613,16 @@ def fold_sample(current, sample, attempt, limit=THEME_LIMIT, follow=False):
 
 
 def detect_theme():
-    """Probe once before curses. Herdr's default dark is checked again after the first paint."""
+    """Probe once before curses. A #282C34 sample is checked again after the first paint.
+
+    Herdr Desktop answers with its default dark for about two seconds. The same
+    color is rechecked outside Herdr too: five probes, half a second apart.
+    """
     if theme_override():
         THEME["watch"] = False
         return
     PROBED["bg"] = probe_background()
-    if herdr_session() and placeholder_background(PROBED["bg"]):
+    if placeholder_background(PROBED["bg"]):
         THEME.update(watch=True, tries=1, due=time.monotonic() + THEME_GAP, follow=False)
     else:
         THEME.update(watch=False, tries=0, due=0.0, follow=not placeholder_background(PROBED["bg"]))

@@ -17,9 +17,13 @@ def setUpModule():
     _HOME["old"] = os.environ.get("HOME")
     _HOME["dir"] = tempfile.TemporaryDirectory()
     os.environ["HOME"] = _HOME["dir"].name
+    # publish() writes OSC to the terminal. Keep that out of the test log.
+    _HOME["write_tty"] = gbot_tui.write_tty
+    gbot_tui.write_tty = lambda data: None
 
 
 def tearDownModule():
+    gbot_tui.write_tty = _HOME["write_tty"]
     if _HOME["old"] is None:
         os.environ.pop("HOME", None)
     else:
@@ -220,6 +224,16 @@ class AvatarTests(unittest.TestCase):
             self.assertEqual(programs["programs"]["gbot-abc"]["name"], "Outfitly")
             self.assertIn("Outfitly", programs["programs"]["gbot-abc"]["match"])
             self.assertIn("gbot-abc", programs["programs"]["gbot-abc"]["match"])
+            spaced = gbot_tui.install_avatars(
+                [{"id": "b3", "name": "Cursor Cloud Session", "avatarShape": "heart", "avatarColor": "red"}],
+                root=tmp,
+                src=tmp,
+            )
+            self.assertEqual(gbot_tui.notice_name("Cursor Cloud Session"), "Cursor-Cloud-Session")
+            self.assertEqual(spaced["gbot-b3"]["name"], "Cursor Cloud Session")
+            self.assertIn("Cursor-Cloud-Session", spaced["gbot-b3"]["match"])
+            self.assertIn("gbot-b3", spaced["gbot-b3"]["match"])
+            self.assertTrue(all(" " not in item and "\u00a0" not in item for item in spaced["gbot-b3"]["match"]))
             long_id = "ea566f99-aded-40c2-99fc-60e5477d2a61"
             long_made = gbot_tui.install_avatars(
                 [{"id": long_id, "name": "Researcher", "avatarShape": "heart", "avatarColor": "red"}],
@@ -1018,7 +1032,15 @@ class SpeedTests(unittest.TestCase):
 class ThemeTests(unittest.TestCase):
     def setUp(self):
         self.saved = {
-            key: os.environ.get(key) for key in ("COLORFGBG", gbot_tui.THEME_ENV, "HERDR_ENV", "HERDR_PANE_ID")
+            key: os.environ.get(key)
+            for key in (
+                "COLORFGBG",
+                gbot_tui.THEME_ENV,
+                "HERDR_ENV",
+                "HERDR_PANE_ID",
+                "HERDR_BIN_PATH",
+                *gbot_tui.DESKTOP_MARKS,
+            )
         }
         for key in self.saved:
             os.environ.pop(key, None)
@@ -1195,12 +1217,36 @@ class ThemeTests(unittest.TestCase):
         finally:
             gbot_tui.probe_background = original
 
-    def test_outside_herdr_a_dark_reply_is_final(self):
+    def test_placeholder_dark_is_rechecked_without_herdr_env(self):
+        self.assertFalse(gbot_tui.herdr_session())
         calls = []
 
         def fake(fd=None, timeout=0.2):
             calls.append(timeout)
-            return "#282C34"
+            return "#282C34" if len(calls) == 1 else "#FFFFFF"
+
+        original = gbot_tui.probe_background
+        gbot_tui.probe_background = fake
+        try:
+            gbot_tui.detect_theme()
+            self.assertEqual(calls, [0.2])
+            self.assertTrue(gbot_tui.THEME["watch"])
+            self.assertEqual(gbot_tui.THEME["tries"], 1)
+            self.assertEqual((gbot_tui.THEME_LIMIT, gbot_tui.THEME_GAP), (5, 0.5))
+            gbot_tui.THEME["due"] = 0
+            self.assertTrue(gbot_tui.maybe_retheme(lambda: None))
+            self.assertEqual(gbot_tui.PROBED["bg"], "#FFFFFF")
+            self.assertFalse(gbot_tui.dark_terminal())
+            self.assertFalse(gbot_tui.THEME["watch"])
+        finally:
+            gbot_tui.probe_background = original
+
+    def test_a_real_dark_reply_is_final(self):
+        calls = []
+
+        def fake(fd=None, timeout=0.2):
+            calls.append(timeout)
+            return "#1E1E2E"
 
         original = gbot_tui.probe_background
         gbot_tui.probe_background = fake
@@ -1213,6 +1259,28 @@ class ThemeTests(unittest.TestCase):
             self.assertTrue(gbot_tui.dark_terminal())
         finally:
             gbot_tui.probe_background = original
+
+    def test_desktop_hc_vars_count_as_herdr(self):
+        self.assertFalse(gbot_tui.herdr_session())
+        self.assertEqual(gbot_tui.herdr_cli(), ("", ""))
+        for key in gbot_tui.DESKTOP_MARKS:
+            os.environ[key] = "desktop"
+            self.assertTrue(gbot_tui.herdr_session(), key)
+            # No pane id, so the CLI stays quiet. OSC 7501 still reports.
+            self.assertEqual(gbot_tui.herdr_cli(), ("", ""))
+            gbot_tui.PROBED["bg"] = "#FFFFFF"
+            gbot_tui.THEME["watch"] = False
+            gbot_tui.note_appearance()
+            self.assertTrue(gbot_tui.THEME["watch"], key)
+            os.environ.pop(key, None)
+            gbot_tui.THEME["watch"] = False
+        self.assertFalse(gbot_tui.herdr_session())
+        gbot_tui.note_appearance()
+        self.assertFalse(gbot_tui.THEME["watch"])
+        os.environ["HERDR_BIN_PATH"] = "/usr/bin/herdr"
+        os.environ["HERDR_PANE_ID"] = "w1:p1"
+        self.assertTrue(gbot_tui.herdr_session())
+        self.assertEqual(gbot_tui.herdr_cli(), ("/usr/bin/herdr", "w1:p1"))
 
     def test_theme_override_wins_over_herdr_default_dark(self):
         os.environ["HERDR_ENV"] = "1"
@@ -1245,11 +1313,24 @@ class ThemeTests(unittest.TestCase):
 class NoticeTests(unittest.TestCase):
     def test_notifications_use_the_bots_name(self):
         self.assertEqual(gbot_tui.notice_name("Cloud"), "Cloud")
+        self.assertEqual(gbot_tui.notice_name("Chef"), "Chef")
         self.assertEqual(gbot_tui.display_name("  Cloud\nbot "), "Cloud bot")
+        self.assertEqual(gbot_tui.notice_name("Cursor Cloud Session"), "Cursor-Cloud-Session")
+        self.assertEqual(gbot_tui.notice_name("Travel Agent"), "Travel-Agent")
+        self.assertEqual(gbot_tui.notice_name("Cursor\u00a0Cloud\u00a0Session"), "Cursor-Cloud-Session")
+        self.assertEqual(gbot_tui.notice_name("Travel\u2002Agent"), "Travel-Agent")
+        self.assertEqual(gbot_tui.notice_name("Cursor_Cloud_Session"), "Cursor_Cloud_Session")
+        self.assertEqual(gbot_tui.notice_name("Cursor.Cloud"), "Cursor.Cloud")
+        self.assertNotIn(" ", gbot_tui.notice_name("Cursor Cloud Session"))
         self.assertNotIn(":", gbot_tui.notice_name("a:b"))
+        self.assertEqual(gbot_tui.notice_name("a:b"), "a-b")
         clipped = gbot_tui.notice_name("C" * 40)
         self.assertLessEqual(len(clipped.encode()), 32)
         self.assertTrue(clipped.startswith("C"))
+        wide = gbot_tui.notice_name("Cursor Cloud Session Extra Words " * 3)
+        self.assertLessEqual(len(wide.encode()), 32)
+        self.assertNotIn(" ", wide)
+        self.assertNotIn("\u00a0", wide)
         previous = gbot_tui.APP
         try:
             gbot_tui.bind_app("Cloud", "b3-cloud")
@@ -1264,6 +1345,20 @@ class NoticeTests(unittest.TestCase):
         self.assertEqual(command[command.index("--agent") + 1], "Cloud")
         release = gbot_tui.release_command("herdr", "p1", "Cloud", 2)
         self.assertEqual(release[release.index("--agent") + 1], "Cloud")
+        spaced = gbot_tui.report_command(
+            "herdr", "p1", "blocked", "Cursor Cloud Session", "s", 1, "Cursor Cloud Session"
+        )
+        self.assertEqual(spaced[spaced.index("--agent") + 1], "Cursor-Cloud-Session")
+        self.assertEqual(spaced[-2:], ["gbot-tui", "Cursor Cloud Session"])
+        previous = gbot_tui.APP
+        try:
+            gbot_tui.bind_app("Cursor Cloud Session", "b3")
+            self.assertEqual(gbot_tui.APP, "Cursor-Cloud-Session")
+            report = gbot_tui.osc_report("blocked", "Cursor Cloud Session", "permission")
+            app = report.split("app=", 1)[1].split(":", 1)[0]
+            self.assertEqual(app, "Cursor-Cloud-Session")
+        finally:
+            gbot_tui.APP = previous
 
     def test_a_late_icon_does_not_replace_another_bots_name(self):
         previous_app = gbot_tui.APP

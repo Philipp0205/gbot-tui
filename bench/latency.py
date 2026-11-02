@@ -121,7 +121,9 @@ def environment(home, state, args):
         LANG="C.UTF-8",
         LC_ALL="C.UTF-8",
     )
-    env.pop("HERDR_ENV", None)
+    # A bench run inside Herdr must not inherit the pane and start re-probing.
+    for key in ("HERDR_ENV", "HERDR_PANE_ID", "HERDR_BIN_PATH", "HC_TERMINAL_ID", "HC_SCOPE", "HC_TERMINAL_SOCKET"):
+        env.pop(key, None)
     return env
 
 
