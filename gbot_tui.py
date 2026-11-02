@@ -8,9 +8,11 @@ import json
 import locale
 import os
 import queue
+import re
 import select
 import subprocess
 import sys
+import termios
 import threading
 import time
 
@@ -1298,18 +1300,172 @@ class Chat:
         return text
 
 
-def dark_terminal():
+THEME_ENV = "GBOT_TUI_THEME"
+# The background the terminal reported to an OSC 11 query, as "#RRGGBB".
+PROBED = {"bg": None}
+
+
+def parse_osc11(data):
+    """The color in an OSC 11 reply ("rgb:RRRR/GGGG/BBBB" or "#RRGGBB"), or None."""
+    if isinstance(data, bytes):
+        data = data.decode("latin-1")
+    start = data.find("\033]11;")
+    if start < 0:
+        return None
+    body = data[start + 5 :]
+    end = min((i for i in (body.find("\007"), body.find("\033\\")) if i >= 0), default=-1)
+    if end < 0:
+        return None
+    value = body[:end].strip()
+    if value.startswith("#") and len(value) == 7:
+        channels = [value[1:3], value[3:5], value[5:7]]
+    elif value.startswith(("rgb:", "rgba:")):
+        channels = value.split(":", 1)[1].split("/")[:3]
+    else:
+        return None
+    if len(channels) != 3:
+        return None
+    out = []
+    for channel in channels:
+        if not channel or len(channel) > 4 or any(ch not in "0123456789abcdefABCDEF" for ch in channel):
+            return None
+        out.append(round(int(channel, 16) * 255 / (16 ** len(channel) - 1)))
+    return "#{:02X}{:02X}{:02X}".format(*out)
+
+
+def is_light(hex_color):
+    return contrast(hex_color, "#000000") > contrast(hex_color, "#FFFFFF")
+
+
+def theme_choice(override, probed, colorfgbg):
+    """("dark" | "light", where it came from). First of: GBOT_TUI_THEME, OSC 11, COLORFGBG."""
+    folded = (override or "").strip().lower()
+    if folded in {"dark", "light"}:
+        return folded, THEME_ENV
+    if probed:
+        return ("light" if is_light(probed) else "dark"), "osc11"
     # COLORFGBG is "fg;bg". 7 and 15 are the light backgrounds.
-    raw = os.environ.get("COLORFGBG", "")
-    bg = raw.split(";")[-1] if raw else ""
+    bg = (colorfgbg or "").split(";")[-1]
     if bg.isdigit():
-        return int(bg) not in {7, 15}
-    return True
+        return ("light" if int(bg) in {7, 15} else "dark"), "COLORFGBG"
+    return "dark", "default"
+
+
+def dark_terminal():
+    choice, _source = theme_choice(os.environ.get(THEME_ENV), PROBED["bg"], os.environ.get("COLORFGBG"))
+    return choice == "dark"
+
+
+DA1_REPLY = re.compile(rb"\033\[\?[0-9;]*c")
+
+
+def probe_background(fd=None, timeout=0.2):
+    """Ask the terminal for its background with OSC 11.
+
+    A device-attributes query (DA1) goes right after it. Terminals answer in
+    order and nearly all answer DA1, so its reply means OSC 11 is not coming
+    and the wait ends early. Runs before curses, so the replies are not read
+    as keys.
+    """
+    owned = fd is None
+    if owned:
+        try:
+            fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+        except OSError:
+            return None
+    try:
+        try:
+            saved = termios.tcgetattr(fd)
+        except termios.error:
+            return None
+        raw = termios.tcgetattr(fd)
+        raw[3] &= ~(termios.ICANON | termios.ECHO)
+        raw[6][termios.VMIN] = 0
+        raw[6][termios.VTIME] = 0
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, raw)
+            os.write(fd, b"\033]11;?\033\\\033[c")
+            data = b""
+            deadline = time.monotonic() + timeout
+            while not DA1_REPLY.search(data):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                ready, _w, _x = select.select([fd], [], [], left)
+                if not ready:
+                    break
+                chunk = os.read(fd, 1024)
+                if not chunk:
+                    break
+                data += chunk
+            return parse_osc11(data)
+        except OSError:
+            return None
+        finally:
+            try:
+                termios.tcsetattr(fd, termios.TCSANOW, saved)
+            except termios.error:
+                pass
+    finally:
+        if owned:
+            os.close(fd)
+
+
+def detect_theme():
+    """Probe once per run, unless GBOT_TUI_THEME already says light or dark."""
+    if (os.environ.get(THEME_ENV) or "").strip().lower() in {"dark", "light"}:
+        return
+    PROBED["bg"] = probe_background()
+
+
+def background_hex():
+    if PROBED["bg"]:
+        return PROBED["bg"]
+    return "#000000" if dark_terminal() else "#FFFFFF"
+
+
+XTERM_LEVELS = (0, 95, 135, 175, 215, 255)
+
+
+def xterm_hex(index):
+    """The RGB the 256-color palette shows for one index (16 and up)."""
+    if index >= 232:
+        level = 8 + 10 * (index - 232)
+        return f"#{level:02X}{level:02X}{level:02X}"
+    index -= 16
+    red, green, blue = index // 36, (index // 6) % 6, index % 6
+    return f"#{XTERM_LEVELS[red]:02X}{XTERM_LEVELS[green]:02X}{XTERM_LEVELS[blue]:02X}"
+
+
+def nearest_gray(level):
+    level = max(8, min(238, level))
+    return 232 + int(round((level - 8) / 10))
 
 
 def user_bubble():
-    # The desktop app's user bubble: ansi 235 on a dark terminal, 254 on a light one.
-    return 235 if dark_terminal() else 254
+    """The desktop app's user bubble: ansi 235 on a dark terminal, 254 on a light one.
+
+    With a probed background the bubble is a step off that exact color, so a
+    gray theme still shows it.
+    """
+    dark = dark_terminal()
+    probed = PROBED["bg"]
+    if not probed or (is_light(probed) == dark):
+        return 235 if dark else 254
+    gray = round(sum(int(probed[i : i + 2], 16) for i in (1, 3, 5)) / 3)
+    return nearest_gray(gray + 0x22 if dark else gray - 0x1C)
+
+
+def bubble_fg(bubble):
+    """Bubble text set outright, so a wrong theme guess cannot give dark on dark."""
+    return 234 if is_light(xterm_hex(bubble)) else 255
+
+
+def theme_palette(dark):
+    """256-color indices for the named styles. Yellow on white is unreadable."""
+    if dark:
+        return {"green": 108, "gray": 245}
+    return {"yellow": 130, "red": 124, "green": 28, "gray": 240}
 
 
 def xterm_color(hex_color):
@@ -1343,26 +1499,48 @@ def _luminance(red, green, blue):
     return 0.2126 * _srgb(red) + 0.7152 * _srgb(green) + 0.0722 * _srgb(blue)
 
 
+def _hex_luminance(hex_color):
+    return _luminance(int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16))
+
+
+def contrast(first, second):
+    a, b = _hex_luminance(first), _hex_luminance(second)
+    return (max(a, b) + 0.05) / (min(a, b) + 0.05)
+
+
 def contrast_on_black(hex_color):
+    return contrast(hex_color, "#000000")
+
+
+# Bot text on a dark background aims higher, as before. 4.5 is WCAG AA body text.
+DARK_TARGET = 7
+LIGHT_TARGET = 4.5
+
+
+def readable_hex(hex_color, dark=True, background=None):
+    """Move a bot color away from the background until it reads. Icons keep the original.
+
+    Lighten on a dark terminal, darken on a light one. The check uses the
+    256-color cell the terminal will actually draw.
+    """
+    background = background or ("#000000" if dark else "#FFFFFF")
+    target = DARK_TARGET if dark else LIGHT_TARGET
     red = int(hex_color[1:3], 16)
     green = int(hex_color[3:5], 16)
     blue = int(hex_color[5:7], 16)
-    return (_luminance(red, green, blue) + 0.05) / 0.05
-
-
-def readable_hex(hex_color, dark=True):
-    """Lighten a bot color that is hard to read on black. Icons keep the original."""
-    red = int(hex_color[1:3], 16)
-    green = int(hex_color[3:5], 16)
-    blue = int(hex_color[5:7], 16)
-    if not dark:
-        return f"#{red:02X}{green:02X}{blue:02X}"
-    for _ in range(8):
-        if contrast_on_black(f"#{red:02X}{green:02X}{blue:02X}") >= 7:
+    for _ in range(16):
+        exact = f"#{red:02X}{green:02X}{blue:02X}"
+        shown = xterm_hex(xterm_color(exact))
+        if min(contrast(exact, background), contrast(shown, background)) >= target:
             break
-        red = min(255, red + max(1, (255 - red) // 4))
-        green = min(255, green + max(1, (255 - green) // 4))
-        blue = min(255, blue + max(1, (255 - blue) // 4))
+        if dark:
+            red = min(255, red + max(1, (255 - red) // 4))
+            green = min(255, green + max(1, (255 - green) // 4))
+            blue = min(255, blue + max(1, (255 - blue) // 4))
+        else:
+            red = max(0, red - max(1, red // 5))
+            green = max(0, green - max(1, green // 5))
+            blue = max(0, blue - max(1, blue // 5))
     return f"#{red:02X}{green:02X}{blue:02X}"
 
 
@@ -1593,27 +1771,29 @@ def apply_theme(stdscr):
         ATTR["bold"] = base | curses.A_BOLD
         if curses.COLORS >= 256:
             bubble = user_bubble()
-            curses.init_pair(2, -1, bubble)
+            curses.init_pair(2, bubble_fg(bubble), bubble)
             ATTR["user"] = curses.color_pair(2)
             AVATAR_ATTR.clear()
             TEXT_ATTR.clear()
             dark = dark_terminal()
+            background = background_hex()
             for index, (name, hex_color) in enumerate(AVATAR_COLORS.items()):
                 curses.init_pair(10 + index, xterm_color(hex_color), -1)
                 AVATAR_ATTR[name] = curses.color_pair(10 + index)
-                curses.init_pair(30 + index, xterm_color(readable_hex(hex_color, dark)), -1)
+                curses.init_pair(30 + index, xterm_color(readable_hex(hex_color, dark, background)), -1)
                 TEXT_ATTR[name] = curses.color_pair(30 + index)
         else:
             ATTR["user"] = ATTR["bold"]
             AVATAR_ATTR.clear()
             TEXT_ATTR.clear()
-        curses.init_pair(3, curses.COLOR_YELLOW, -1)
-        curses.init_pair(4, curses.COLOR_RED, -1)
+        palette = theme_palette(dark_terminal()) if curses.COLORS >= 256 else {}
+        curses.init_pair(3, palette.get("yellow", curses.COLOR_YELLOW), -1)
+        curses.init_pair(4, palette.get("red", curses.COLOR_RED), -1)
         ATTR["yellow"] = curses.color_pair(3)
         ATTR["red"] = curses.color_pair(4)
         if curses.COLORS >= 256:
-            curses.init_pair(5, 108, -1)
-            curses.init_pair(6, 245, -1)
+            curses.init_pair(5, palette["green"], -1)
+            curses.init_pair(6, palette["gray"], -1)
             ATTR["green"] = curses.color_pair(5)
             ATTR["gray"] = curses.color_pair(6)
         else:
@@ -2345,6 +2525,7 @@ def main(argv):
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print("gbot-tui needs a terminal.", file=sys.stderr)
         return 1
+    detect_theme()
     if not target:
         try:
             return session("")

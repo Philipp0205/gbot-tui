@@ -608,7 +608,8 @@ class LookTests(unittest.TestCase):
         lifted = gbot_tui.readable_hex(original, dark=True)
         self.assertGreater(gbot_tui.contrast_on_black(lifted), gbot_tui.contrast_on_black(original))
         self.assertGreaterEqual(gbot_tui.contrast_on_black(lifted), 7)
-        self.assertEqual(gbot_tui.readable_hex(original, dark=False), original)
+        darkened = gbot_tui.readable_hex(original, dark=False)
+        self.assertGreaterEqual(gbot_tui.contrast(darkened, "#FFFFFF"), 4.5)
 
     def test_footer_states(self):
         self.assertEqual(gbot_tui.footer_spans("blocked", "")[0], ("Pending decision", "yellow"))
@@ -1003,6 +1004,145 @@ class SpeedTests(unittest.TestCase):
         self.assertEqual(" ".join(lines[:2]), chat.error)
         self.assertIn("enter send", lines[2])
         self.assertTrue(any("hello" in text for row in screen.rows.values() for text in row))
+
+
+class ThemeTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = {key: os.environ.get(key) for key in ("COLORFGBG", gbot_tui.THEME_ENV)}
+        for key in self.saved:
+            os.environ.pop(key, None)
+        self.probed = gbot_tui.PROBED["bg"]
+
+    def tearDown(self):
+        for key, value in self.saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        gbot_tui.PROBED["bg"] = self.probed
+
+    def test_osc11_replies(self):
+        parse = gbot_tui.parse_osc11
+        self.assertEqual(parse(b"\033]11;rgb:ffff/ffff/ffff\033\\"), "#FFFFFF")
+        self.assertEqual(parse("\033]11;rgb:1e1e/1e1e/2e2e\007"), "#1E1E2E")
+        self.assertEqual(parse("\033]11;rgb:fa/f9/f6\007\033[?62;22c"), "#FAF9F6")
+        self.assertEqual(parse("\033]11;rgb:f/0/8\007"), "#FF0088")
+        self.assertEqual(parse("\033]11;rgba:0000/0000/0000/ffff\033\\"), "#000000")
+        self.assertEqual(parse("\033]11;#fdf6e3\033\\"), "#FDF6E3")
+        self.assertIsNone(parse(b"\033[?62;22c"))
+        self.assertIsNone(parse("\033]11;rgb:zz/00/00\007"))
+        self.assertIsNone(parse("\033]11;rgb:ffff/ffff"))
+        self.assertIsNone(parse("\033]11;rgb:ffff/ffff/ffff"))
+        self.assertIsNone(parse(""))
+
+    def test_theme_comes_from_env_then_osc11_then_colorfgbg(self):
+        choice = gbot_tui.theme_choice
+        self.assertEqual(choice("light", "#000000", "15;0"), ("light", "GBOT_TUI_THEME"))
+        self.assertEqual(choice(" Dark ", "#FFFFFF", "0;15"), ("dark", "GBOT_TUI_THEME"))
+        self.assertEqual(choice("solarized", "#FFFFFF", "15;0"), ("light", "osc11"))
+        self.assertEqual(choice(None, "#FAFAFA", "15;0"), ("light", "osc11"))
+        self.assertEqual(choice(None, "#282C34", "0;15"), ("dark", "osc11"))
+        self.assertEqual(choice(None, None, "0;15"), ("light", "COLORFGBG"))
+        self.assertEqual(choice(None, None, "0;default;7"), ("light", "COLORFGBG"))
+        self.assertEqual(choice(None, None, "15;0"), ("dark", "COLORFGBG"))
+        self.assertEqual(choice(None, None, None), ("dark", "default"))
+        self.assertEqual(choice("", None, "garbage"), ("dark", "default"))
+
+    def test_herdr_light_theme_without_colorfgbg(self):
+        gbot_tui.PROBED["bg"] = "#FFFFFF"
+        self.assertFalse(gbot_tui.dark_terminal())
+        bubble = gbot_tui.user_bubble()
+        self.assertTrue(gbot_tui.is_light(gbot_tui.xterm_hex(bubble)))
+        self.assertNotEqual(gbot_tui.xterm_hex(bubble), "#FFFFFF")
+        self.assertGreaterEqual(
+            gbot_tui.contrast(gbot_tui.xterm_hex(gbot_tui.bubble_fg(bubble)), gbot_tui.xterm_hex(bubble)), 7
+        )
+        os.environ[gbot_tui.THEME_ENV] = "dark"
+        self.assertTrue(gbot_tui.dark_terminal())
+        self.assertEqual(gbot_tui.user_bubble(), 235)
+
+    def test_bubble_on_a_probed_dark_background(self):
+        gbot_tui.PROBED["bg"] = "#1E1E2E"
+        bubble = gbot_tui.user_bubble()
+        self.assertFalse(gbot_tui.is_light(gbot_tui.xterm_hex(bubble)))
+        self.assertGreater(
+            gbot_tui._hex_luminance(gbot_tui.xterm_hex(bubble)), gbot_tui._hex_luminance("#1E1E2E")
+        )
+        self.assertEqual(gbot_tui.bubble_fg(bubble), 255)
+        self.assertEqual(gbot_tui.bubble_fg(235), 255)
+        self.assertEqual(gbot_tui.bubble_fg(254), 234)
+
+    def test_every_bot_color_reads_on_white_and_on_black(self):
+        for name, hex_color in gbot_tui.AVATAR_COLORS.items():
+            for dark, background, target in ((True, "#000000", 7), (False, "#FFFFFF", 4.5)):
+                shown = gbot_tui.xterm_hex(gbot_tui.xterm_color(gbot_tui.readable_hex(hex_color, dark, background)))
+                if name == "black" and dark:
+                    continue
+                self.assertGreaterEqual(gbot_tui.contrast(shown, background), target, (name, dark))
+
+    def test_named_styles_read_on_a_light_background(self):
+        for name, index in gbot_tui.theme_palette(False).items():
+            self.assertGreaterEqual(gbot_tui.contrast(gbot_tui.xterm_hex(index), "#FFFFFF"), 4.5, name)
+        for name, index in gbot_tui.theme_palette(True).items():
+            self.assertGreaterEqual(gbot_tui.contrast(gbot_tui.xterm_hex(index), "#000000"), 4.5, name)
+
+    def answer(self, reply):
+        import threading
+        import time
+
+        master, slave = os.openpty()
+        asked = []
+
+        def terminal():
+            data = b""
+            end = time.monotonic() + 2
+            while b"\033[c" not in data and time.monotonic() < end:
+                try:
+                    data += os.read(master, 1024)
+                except OSError:
+                    break
+            asked.append(data)
+            if reply:
+                os.write(master, reply)
+
+        thread = threading.Thread(target=terminal, daemon=True)
+        thread.start()
+        start = time.monotonic()
+        try:
+            got = gbot_tui.probe_background(slave, timeout=0.3)
+        finally:
+            elapsed = time.monotonic() - start
+            thread.join(1)
+            os.close(slave)
+            os.close(master)
+        return got, elapsed, asked
+
+    def test_probe_reads_the_osc11_answer(self):
+        got, elapsed, asked = self.answer(b"\033]11;rgb:ffff/ffff/ffff\033\\\033[?62;22c")
+        self.assertEqual(got, "#FFFFFF")
+        self.assertIn(b"\033]11;?", asked[0])
+        self.assertLess(elapsed, 0.3)
+
+    def test_probe_stops_at_the_da1_answer(self):
+        got, elapsed, _asked = self.answer(b"\033[?1;2c")
+        self.assertIsNone(got)
+        self.assertLess(elapsed, 0.3)
+
+    def test_probe_gives_up_on_a_silent_terminal(self):
+        got, elapsed, _asked = self.answer(b"")
+        self.assertIsNone(got)
+        self.assertLess(elapsed, 0.6)
+
+    def test_env_override_skips_the_probe(self):
+        os.environ[gbot_tui.THEME_ENV] = "light"
+        gbot_tui.PROBED["bg"] = None
+        original = gbot_tui.probe_background
+        gbot_tui.probe_background = lambda *a, **k: self.fail("probed")
+        try:
+            gbot_tui.detect_theme()
+        finally:
+            gbot_tui.probe_background = original
+        self.assertFalse(gbot_tui.dark_terminal())
 
 
 class HerdrTests(unittest.TestCase):

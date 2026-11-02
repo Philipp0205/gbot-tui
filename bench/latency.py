@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Time gbot-tui in a pseudo-terminal against bench/mock_gbot.py.
 
-    python3 bench/latency.py [--delay 0.4] [--reply 1.5] [--runs 3] [--app path/to/gbot_tui.py]
+    python3 bench/latency.py [--delay 0.4] [--reply 1.5] [--runs 3] [--bg '#FFFFFF'] [--app path/to/gbot_tui.py]
 
 Needs `pyte` (pip install pyte). Each run uses a fresh HOME, so "cold" has no
 cache and "warm" is the second launch in that HOME.
@@ -25,6 +25,8 @@ import pyte
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 ROWS, COLS = 24, 58
+# The background the fake terminal reports: "#RRGGBB", "none" (DA1 only) or "mute".
+BG = "#000000"
 
 
 class Term:
@@ -47,8 +49,22 @@ class Term:
                 break
             if not data:
                 break
+            self._answer(data)
             with self.lock:
                 self.stream.feed(data)
+
+    def _answer(self, data):
+        """Reply to the background query like a real terminal. --bg mute answers nothing."""
+        if BG == "mute":
+            return
+        reply = b""
+        if b"\033]11;?" in data and BG.startswith("#"):
+            channels = "/".join(BG[i : i + 2] * 2 for i in (1, 3, 5))
+            reply += f"\033]11;rgb:{channels}\033\\".encode()
+        if b"\033[c" in data:
+            reply += b"\033[?62;22c"
+        if reply:
+            os.write(self.fd, reply)
 
     def text(self):
         with self.lock:
@@ -211,8 +227,10 @@ def main():
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--idle", type=float, default=30.0)
     parser.add_argument("--app", default=APP, help="gbot_tui.py to time, e.g. from an older checkout")
+    parser.add_argument("--bg", default="#000000", help='background to answer OSC 11 with, "none" or "mute"')
     args = parser.parse_args()
     globals()["APP"] = os.path.abspath(args.app)
+    globals()["BG"] = args.bg
     runs = [run_once(args) for _ in range(args.runs)]
     print(f"mock gbot call {args.delay:.2f}s, {args.runs} runs, median ms (worst)")
     for key in runs[0]:

@@ -42,7 +42,7 @@ The picker and the chat share one curses session, so Enter and Esc do not drop b
 
 ## Speed
 
-`bench/latency.py` times the TUI in a pseudo-terminal against `bench/mock_gbot.py` (needs `pyte`). Each `gbot` call costs a process start plus the gateway, so the work is in not waiting on one:
+`bench/latency.py` times the TUI in a pseudo-terminal against `bench/mock_gbot.py` (needs `pyte`). Its terminal answers the background probe; `--bg '#FFFFFF'`, `--bg none` (DA1 only), and `--bg mute` change that answer. Each `gbot` call costs a process start plus the gateway, so the work is in not waiting on one:
 
 - The bot list paints from `roster.json`, and a chat paints its last 80 entries from `~/.cache/gbot-tui/threads/<sha1>.json` (mode 0600) while the first `gbot thread` runs. That read replaces the cached rows. Cached cards cannot be answered: y/n are live only after the first read.
 - Keys are read without waiting. Every key curses already has is applied before one redraw, so a paste is one frame. No key calls `gbot`.
@@ -102,7 +102,14 @@ The two-poll window is about four seconds, because once a reply stops growing, r
 - Page Up / Page Down scroll. Scrolling up turns off follow-tail. Scrolling back to the bottom turns it on
 - Ctrl-C or Ctrl-D exits
 
-The layout follows the desktop chat. The header is the bot's name, a color mark for its avatar, and its tagline when the bot list has one. A blank line sits between that header and the first message. Opening by name loads that list first, so the tagline is there too. Your lines are a gray bubble on the right (ANSI 235 on a dark terminal, 254 on a light one, from `COLORFGBG`). The bot's lines sit on the left, next to that same mark, in its avatar color, lightened when that color would be hard to read on black. The list mark and the chat mark use that same lightened color. Text wraps on words. A wrapped "- " line keeps a hanging indent. A pending approval shows the action's details in the warning color and, when gbot has the card ids, `y` / `n` in the footer. A finished card is green or gray. Under that is a full-width box composer and a one-line footer. The empty composer leaves a space between the arrow and the cursor. The footer says `enter send`, `Generating`, `Pending decision`, or the last `gbot` error. A failed approval shows the error and the y/n hint together. After a reply, two quiet polls mark the turn done and the footer returns to the idle hint.
+The layout follows the desktop chat. The header is the bot's name, a color mark for its avatar, and its tagline when the bot list has one. A blank line sits between that header and the first message. Opening by name loads that list first, so the tagline is there too. Your lines are a gray bubble on the right, a step off the terminal background (ANSI 235 on black, 254 on white), with its text color set outright so it reads even if the theme guess is wrong. The bot's lines sit on the left, next to that same mark, in its avatar color, lightened on a dark terminal until it reaches 7:1 contrast and darkened on a light one until it reaches 4.5:1, measured on the 256-color cell actually drawn. The list mark and the chat mark use that same color. On a light terminal the warning, error, green, and gray styles switch to darker indices. Text wraps on words. A wrapped "- " line keeps a hanging indent. A pending approval shows the action's details in the warning color and, when gbot has the card ids, `y` / `n` in the footer. A finished card is green or gray. Under that is a full-width box composer and a one-line footer. The empty composer leaves a space between the arrow and the cursor. The footer says `enter send`, `Generating`, `Pending decision`, or the last `gbot` error. A failed approval shows the error and the y/n hint together. After a reply, two quiet polls mark the turn done and the footer returns to the idle hint.
+
+Light or dark is decided once, before curses starts, from the first of:
+
+1. `GBOT_TUI_THEME=light|dark`. Any other value is ignored, and a set value skips the probe.
+2. An OSC 11 query (`ESC ] 11 ; ? ST`) on `/dev/tty`, followed by a DA1 query. Terminals answer in order, so the DA1 reply ends the wait as soon as it arrives. The wait is at most 0.2s, which only a terminal that answers neither query pays. Either `rgb:` (1 to 4 hex digits per channel) or `#RRGGBB` is accepted. The background is light when black text has more contrast on it than white text.
+3. `COLORFGBG`, whose background 7 or 15 is light. Herdr does not set it.
+4. Dark.
 
 On exit the TUI emits an OSC clear and, inside Herdr, `herdr pane release-agent`.
 
