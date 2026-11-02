@@ -1765,6 +1765,8 @@ class WidgetTests(unittest.TestCase):
         chat.fail_choice()
         self.assertIn("1  Badge bug and polish", gbot_tui.entry_text(chat.messages[0]))
         self.assertEqual(chat.phase, "idle")
+        self.assertIsNone(gbot_tui.chat_key(chat, "0", None))
+        self.assertEqual(chat.typed, "")
 
     def test_a_number_is_text_when_nothing_is_open(self):
         chat = gbot_tui.Chat("Researcher")
@@ -1815,16 +1817,22 @@ class WidgetTests(unittest.TestCase):
         self.assertEqual(hint, "1-2 answer")
         footer = gbot_tui.footer_spans("idle", "", choice=hint)[0][0]
         self.assertIn("1-2 answer", footer)
-        self.assertIn("space then key types", footer)
+        self.assertIn("space then digit types", footer)
+        self.assertEqual(footer.count("enter"), 1)
 
     def test_a_widget_behind_your_reply_does_not_take_digits(self):
-        entry = _widget("Send these fixes?", [{"label": "Yes", "value": "yes"}])
+        entry = _widget("Send these fixes?", [{"label": "Yes", "value": "yes"}, {"label": "No", "value": "no"}])
         chat = self._chat(entry)
         chat.messages.append({"id": "u", "role": "user", "text": "later"})
         self.assertIsNone(gbot_tui.latest_widget(chat.messages))
         self.assertIsNone(gbot_tui.chat_key(chat, "1", None))
         self.assertEqual(chat.typed, "1")
         self.assertEqual(chat.phase, "idle")
+        shown = [line for kind, line in gbot_tui.transcript_rows(chat.messages, 80) if kind == "text"]
+        self.assertIn("   Yes", shown)
+        self.assertIn("   No", shown)
+        self.assertNotIn("1  Yes", shown)
+        self.assertNotIn("2  No", shown)
 
     def test_a_space_then_a_digit_types_it(self):
         entry = _widget("Send these fixes?", [{"label": "Yes", "value": "yes"}, {"label": "No", "value": "no"}])
@@ -1835,28 +1843,49 @@ class WidgetTests(unittest.TestCase):
         self.assertEqual(chat.phase, "idle")
         self.assertFalse(gbot_tui.widget_answered(entry))
 
-    def test_options_past_nine_use_letters_and_zero_does_not_type(self):
+    def test_options_past_nine_take_two_digits_and_letters_type(self):
         options = [{"label": f"L{i}", "value": f"v{i}"} for i in range(1, 12)]
         entry = _widget("Which?", options)
         text = gbot_tui.entry_text(entry)
-        self.assertIn("9  L9", text)
-        self.assertIn("a  L10", text)
-        self.assertIn("b  L11", text)
-        self.assertEqual(gbot_tui.choice_hint(entry), "1-9,a-b answer")
+        self.assertIn("09  L9", text)
+        self.assertIn("10  L10", text)
+        self.assertIn("11  L11", text)
+        self.assertNotIn("a  L10", text)
+        self.assertEqual(gbot_tui.choice_hint(entry), "01-11 two digits answer")
         chat = self._chat(entry)
+        self.assertIsNone(gbot_tui.chat_key(chat, "a", None))
+        self.assertEqual(chat.typed, "a")
+        self.assertEqual(chat.phase, "idle")
+        self.assertFalse(gbot_tui.widget_answered(entry))
+        chat.typed = ""
         self.assertIsNone(gbot_tui.chat_key(chat, "0", None))
         self.assertEqual(chat.typed, "")
-        self.assertEqual(chat.phase, "idle")
-        job = gbot_tui.chat_key(chat, "a", None)
+        self.assertIsNone(gbot_tui.chat_key(chat, "\x7f", None))
+        self.assertIsNone(gbot_tui.chat_key(chat, "1", None))
+        self.assertEqual(chat.typed, "")
+        job = gbot_tui.chat_key(chat, "0", None)
         self.assertEqual(job, ("choice", ("Researcher", "agent", "w1", "v10")))
         self.assertEqual(chat.messages[0].get("respondedValue"), "v10")
         chat.fail_choice()
-        self.assertIn("a  L10", gbot_tui.entry_text(chat.messages[0]))
-        self.assertEqual(chat.phase, "idle")
-        many = _widget("More?", [{"label": str(i), "value": str(i)} for i in range(1, 37)])
-        shown = gbot_tui.entry_text(many)
-        self.assertIn("z  35", shown)
-        self.assertIn("answer the rest in the app", shown)
+        self.assertIn("10  L10", gbot_tui.entry_text(chat.messages[0]))
+        # A letter cancels a half-typed number and is typed, not answered.
+        self.assertIsNone(gbot_tui.chat_key(chat, "1", None))
+        self.assertIsNone(gbot_tui.chat_key(chat, "b", None))
+        self.assertEqual(chat.typed, "b")
+        self.assertFalse(gbot_tui.widget_answered(chat.messages[0]))
+        chat.typed = ""
+        # After the window, a lone digit selects that option.
+        times = {"now": 20.0}
+        original = gbot_tui.clock
+        gbot_tui.clock = lambda: times["now"]
+        try:
+            self.assertIsNone(gbot_tui.chat_key(chat, "2", None))
+            self.assertIsNone(gbot_tui.flush_choice_digit(chat))
+            times["now"] = 20.0 + gbot_tui.DIGIT_WINDOW + 0.01
+            flushed = gbot_tui.flush_choice_digit(chat)
+            self.assertEqual(flushed, ("choice", ("Researcher", "agent", "w1", "v2")))
+        finally:
+            gbot_tui.clock = original
 
     def test_steps_are_answered_one_at_a_time(self):
         entry = {
@@ -1943,6 +1972,64 @@ class WidgetTests(unittest.TestCase):
         sent = gbot_tui.chat_key(other, "\r", None)
         self.assertEqual(sent, ("send", ("Researcher", "Bea")))
         self.assertFalse(gbot_tui.widget_answered(plain))
+
+    def test_inserting_the_reply_clears_the_physical_screen(self):
+        class Screen(FakeScreen):
+            def __init__(self):
+                super().__init__(24, 80)
+                self.full = 0
+
+            def clearok(self, flag):
+                if flag:
+                    self.full += 1
+
+        entry = _widget(
+            "Send these?",
+            [{"label": "Emil", "value": "Emil"}, {"label": "Mario", "value": "Mario"}],
+        )
+        entry["message"]["widget"]["multiSelect"] = True
+        chat = self._chat(entry)
+        screen = Screen()
+        gbot_tui.draw(screen, chat)
+        self.assertEqual(screen.full, 1)
+        self.assertIsNone(gbot_tui.chat_key(chat, "1", None))
+        gbot_tui.draw(screen, chat)
+        self.assertEqual(screen.full, 1)
+        job = gbot_tui.chat_key(chat, "\r", None)
+        self.assertEqual(job[0], "choice")
+        gbot_tui.draw(screen, chat)
+        self.assertGreater(screen.full, 1)
+        self.assertTrue(any("Emil" in text for row in screen.rows.values() for text in row))
+
+    def test_the_footer_says_enter_once(self):
+        entry = _widget(
+            "Send these?",
+            [{"label": "Emil", "value": "Emil"}, {"label": "Mario", "value": "Mario"}],
+        )
+        entry["message"]["widget"]["multiSelect"] = True
+        footer = gbot_tui.footer_spans("idle", "", choice=gbot_tui.choice_hint(entry))[0][0]
+        self.assertIn("enter sends", footer)
+        self.assertNotIn("enter send ·", footer)
+        self.assertEqual(footer.count("enter"), 1)
+        steps = {
+            "kind": "send-message",
+            "id": "w9",
+            "message": {
+                "type": "widget",
+                "widget": {
+                    "steps": [
+                        {
+                            "prompt": "Days?",
+                            "multiSelect": True,
+                            "options": [{"label": "One", "value": "1"}, {"label": "Two", "value": "2"}],
+                        }
+                    ]
+                },
+            },
+        }
+        step_footer = gbot_tui.footer_spans("idle", "", choice=gbot_tui.choice_hint(steps))[0][0]
+        self.assertIn("enter sends", step_footer)
+        self.assertEqual(step_footer.count("enter"), 1)
 
     def test_widget_error_rejects_a_non_json_body(self):
         self.assertEqual(gbot_tui.widget_error({"ok": True, "text": "OK", "confirmed": False}), "choice was not confirmed")
@@ -2536,6 +2623,16 @@ class OverviewTests(unittest.TestCase):
         )
         self.assertIn("needs you", text)
         self.assertIn("Ship it?", text)
+        running = gbot_tui.format_overview(
+            [{"name": "Chef", "activity": {"state": "working", "unread": 0, "preview": "go"}}]
+        )
+        self.assertIn("1 running", running)
+        self.assertIn("running", running.splitlines()[-1])
+        self.assertNotIn("working", running)
+        self.assertEqual(gbot_tui.status_label("working"), "working")
+        self.assertEqual(gbot_tui.overview_summary(
+            [{"name": "Chef", "activity": {"state": "working", "unread": 0}}]
+        ), "1 working")
         stale = [widget, {"id": "u2", "role": "user", "text": "yes"}]
         later = gbot_tui.judge_activity(stale, "u2", "w")
         self.assertNotEqual(later["state"], "blocked")

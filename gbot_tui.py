@@ -185,43 +185,40 @@ def latest_widget(entries):
     return found
 
 
-# 1-9 stay digits. 10 and on are a, b, c, so a tenth option has a key.
+# Up to 9 options, one digit selects. Past that, two digits (`10`, or `02`)
+# within DIGIT_WINDOW. A letter is never a choice: a message may start with one.
 OPTION_DIGITS = 9
-OPTION_LETTERS = 26
+OPTION_PAIR = 99
+DIGIT_WINDOW = 0.8
 
 
-def option_key(index):
+def option_key(index, wide=False):
     """1-based position as a key. Empty when this option has no key."""
     if index < 1:
         return ""
+    if wide:
+        if index > OPTION_PAIR:
+            return ""
+        return f"{index:02d}"
     if index <= OPTION_DIGITS:
         return str(index)
-    letter = index - OPTION_DIGITS - 1
-    if letter < OPTION_LETTERS:
-        return chr(ord("a") + letter)
     return ""
 
 
 def key_to_index(key, count):
-    """0-based option, "ignore", or None when the key is ordinary text.
+    """0-based option for one digit, "ignore", or None when the key is text.
 
-    A digit that does not select an open option is ignored, including 0, so
-    it does not fall into the composer. A letter past the last option is text.
+    Only used when there are at most 9 options. `0` does not fall into the
+    composer. A letter is never an option.
     """
-    if not isinstance(key, str) or len(key) != 1 or count <= 0:
+    if not isinstance(key, str) or len(key) != 1 or count <= 0 or count > OPTION_DIGITS:
         return None
-    if key.isdigit():
-        if key == "0":
-            return "ignore"
-        index = int(key) - 1
-        if index < OPTION_DIGITS and index < count:
-            return index
-        return "ignore"
-    if "a" <= key <= "z":
-        index = OPTION_DIGITS + ord(key) - ord("a")
-        if index < count:
-            return index
-    return None
+    if not key.isdigit() or key == "0":
+        return "ignore" if key.isdigit() else None
+    index = int(key) - 1
+    if index < count:
+        return index
+    return "ignore"
 
 
 def _key_span(keys):
@@ -255,10 +252,11 @@ def _option_lines(options, open_, multi, chosen, picked):
     lines = []
     matched = False
     uncovered = False
+    wide = len(options) > OPTION_DIGITS
     for index, (label, value) in enumerate(options, 1):
         marked = value in chosen or value in picked
         matched = matched or value in chosen
-        key = option_key(index) if open_ else ""
+        key = option_key(index, wide) if open_ else ""
         if open_ and not key:
             uncovered = True
         if open_ and key and multi:
@@ -353,11 +351,14 @@ def choice_hint(entry, step_at=0):
         if entry and widget_open(entry) and custom:
             return "type an answer"
         return ""
-    keys = [option_key(index) for index in range(1, len(options) + 1)]
+    wide = len(options) > OPTION_DIGITS
+    keys = [option_key(index, wide) for index in range(1, len(options) + 1)]
     keys = [key for key in keys if key]
     if not keys:
         return "answer in the app"
     span = _key_span(keys)
+    if wide:
+        span = f"{span} two digits"
     if multi:
         return f"{span} choose · enter sends"
     return f"{span} answer"
@@ -1259,7 +1260,8 @@ def judge_activity(entries, cursor, seen, previous=None):
     }
 
 
-def status_label(state, unread=0):
+def status_label(state, unread=0, printed=False):
+    """The list says `working`. Printed `--overview` keeps the old word `running`."""
     if state == "blocked":
         return "needs you"
     if state == "unread":
@@ -1268,7 +1270,7 @@ def status_label(state, unread=0):
             return f"{count} new"
         return "new"
     if state == "working":
-        return "working"
+        return "running" if printed else "working"
     if state == "idle":
         return "idle"
     return ""
@@ -1313,15 +1315,19 @@ def _count_phrase(count, one, many):
     return ""
 
 
-def overview_summary(bots, checked=None, total=None):
-    """One line: `1 needs you · 2 new · 1 working`, plus a scan hint while reading."""
+def overview_summary(bots, checked=None, total=None, printed=False):
+    """One line: `1 needs you · 2 new · 1 working`, plus a scan hint while reading.
+
+    `printed` is `--overview` on stdout. That line still says `running`.
+    """
     counts = attention_counts(bots)
+    working = "running" if printed else "working"
     parts = [
         phrase
         for phrase in (
             _count_phrase(counts["blocked"], "1 needs you", "need you"),
             _count_phrase(counts["unread"], "1 new", "new"),
-            _count_phrase(counts["working"], "1 working", "working"),
+            _count_phrase(counts["working"], f"1 {working}", working),
         )
         if phrase
     ]
@@ -1341,13 +1347,14 @@ def overview_summary(bots, checked=None, total=None):
 
 
 def format_overview(bots):
+    """Stdout for `--overview`. `running` stays the printed word for `working`."""
     ordered = order_bots(bots)
-    summary = overview_summary(ordered)
+    summary = overview_summary(ordered, printed=True)
     name_width = min(max((len(bot["name"]) for bot in ordered), default=0), 24)
     lines = [summary, ""] if summary else []
     for bot in ordered:
         activity = bot.get("activity") or {}
-        label = status_label(activity.get("state") or "", activity.get("unread") or 0)
+        label = status_label(activity.get("state") or "", activity.get("unread") or 0, printed=True)
         preview = activity.get("preview") or bot.get("title") or bot.get("tagline") or ""
         preview = " ".join(str(preview).split())
         line = f"{label:<9}  {bot['name']:<{name_width}}"
@@ -2330,6 +2337,8 @@ class Chat:
         self.choice_wait = False
         self.content_token = ""
         self.content_at = None
+        self.digit_buf = ""
+        self.digit_at = None
         self.full_reload = False
         self.replacing = False
         self.rows_rev = 0
@@ -3274,7 +3283,9 @@ def transcript_rows(entries, width, picks=None, progress=None):
     for entry in entries:
         lines = card_lines(entry, width)
         chosen = picks.get(entry.get("id")) if isinstance(entry, dict) else None
-        numbered = not current_id or (isinstance(entry, dict) and entry.get("id") == current_id)
+        # No open widget means nothing is numbered, including a stale one
+        # that still has options because a later user message closed it.
+        numbered = bool(current_id) and isinstance(entry, dict) and entry.get("id") == current_id
         state = progress.get(entry.get("id")) if isinstance(entry, dict) else None
         step_at = (state or {}).get("at", 0) if isinstance(state, dict) else 0
         step_answers = (state or {}).get("answers") or () if isinstance(state, dict) else ()
@@ -3349,10 +3360,13 @@ def footer_spans(phase, error, decide=False, width=0, choice=""):
         return [(clip(error, room) if room else error, "red")]
     if phase == "working":
         return [("Generating", "bold"), ("  —  pgup scroll", "dim")]
-    hint = "enter send · esc bots · ctrl-c quit · pgup scroll"
+    rest = "esc bots · ctrl-c quit · pgup scroll"
     if choice:
-        # A space, then the digit or letter, types it instead of answering.
-        hint = f"{choice} · space then key types · {hint}"
+        # One "enter". A multi-select hint already says "enter sends".
+        enter = "" if "enter" in choice.lower() else "enter send · "
+        hint = f"{choice} · space then digit types · {enter}{rest}"
+    else:
+        hint = f"enter send · {rest}"
     return [(hint, "dim")]
 
 
@@ -3492,7 +3506,21 @@ def paint_composer(stdscr, y, width, lines, placeholder=False):
 
 def draw(stdscr, chat):
     height, width = stdscr.getmaxyx()
-    stdscr.erase()
+    # erase() only diffs against the last frame. Inserting the local reply
+    # shifts every line; Herdr can leave a ghost of the old ones unless the
+    # next refresh clears the physical screen first.
+    rows_now = visible_rows(chat, width)
+    stamp = (len(rows_now), width, height)
+    if stamp != getattr(chat, "_drawn_stamp", None):
+        try:
+            stdscr.clearok(True)
+        except (AttributeError, curses.error):
+            pass
+        chat._drawn_stamp = stamp
+    try:
+        stdscr.erase()
+    except (AttributeError, curses.error):
+        pass
     lines = draft_lines(chat.typed, width)
     header, body_h, composer_h, footer_h = layout(height, len(lines) or 1)
     footer = []
@@ -3640,45 +3668,114 @@ def picked_lines(entry, picks, step_at=0):
     return "\n".join(value for _label, value in options if value in chosen)
 
 
-def choice_key(chat, key):
-    """What a digit or a letter does while a widget is open.
+def clear_choice_digit(chat):
+    chat.digit_buf = ""
+    chat.digit_at = None
 
-    A tuple is the send job. "toggle", "step", and "ignore" consume the key.
-    None means the key is ordinary text. Text already in the composer wins,
-    so a space and then a digit types the digit.
+
+def _digit_fresh(chat):
+    if not getattr(chat, "digit_buf", "") or chat.digit_at is None:
+        return False
+    return clock() - chat.digit_at <= DIGIT_WINDOW
+
+
+def _activate_option(chat, number):
+    """1-based option. A tuple is the send job. "toggle", "step", or "ignore"."""
+    entry = latest_widget(chat.messages)
+    if entry is None or not chat.loaded or not (chat.agent_id or chat.session_id):
+        return "ignore"
+    _prompt, options, multi, _custom = current_question(entry, chat.step_at(entry))
+    if number < 1 or number > len(options):
+        return "ignore"
+    index = number - 1
+    if multi:
+        chat.toggle_choice(index)
+        return "toggle"
+    result = chat.commit_choice(options[index][1])
+    if result == "step":
+        chat.error = ""
+        return "step"
+    if not result:
+        return "ignore"
+    chat.error = ""
+    return ("choice", result)
+
+
+def flush_choice_digit(chat):
+    """Once the window passes, a lone 1–9 selects. `0` is dropped.
+
+    Returns the same kinds of value as `choice_key`, or None if still waiting.
     """
-    if not isinstance(key, str) or len(key) != 1 or chat.typed:
+    if not getattr(chat, "digit_buf", "") or chat.digit_at is None:
+        return None
+    if clock() - chat.digit_at <= DIGIT_WINDOW:
+        return None
+    buf = chat.digit_buf
+    clear_choice_digit(chat)
+    if len(buf) != 1 or buf == "0":
+        return None
+    entry = latest_widget(chat.messages)
+    if entry is None:
+        return None
+    _prompt, options, _multi, _custom = current_question(entry, chat.step_at(entry))
+    if len(options) <= OPTION_DIGITS:
+        return None
+    return _activate_option(chat, int(buf))
+
+
+def choice_pause(chat):
+    """Seconds left on a two-digit entry, or None."""
+    if not _digit_fresh(chat):
+        return None
+    return max(DIGIT_WINDOW - (clock() - chat.digit_at), 0)
+
+
+def choice_key(chat, key):
+    """What a digit does while a widget is open.
+
+    A tuple is the send job. "toggle", "step", "wait", and "ignore" consume
+    the key. None means the key is ordinary text. A letter is always text, so
+    a message can start with one. With more than 9 options the choice is two
+    digits inside DIGIT_WINDOW (`10`, or `02`). Text already in the composer
+    wins, so a space and then a digit types the digit.
+    """
+    if not isinstance(key, str) or len(key) != 1:
+        return None
+    if chat.typed or key.isalpha():
+        clear_choice_digit(chat)
         return None
     if chat.widget_busy:
-        if key.isdigit() or ("a" <= key <= "z"):
+        if key.isdigit():
             return "ignore"
         return None
     entry = latest_widget(chat.messages)
     if entry is None:
+        clear_choice_digit(chat)
         return None
     if not chat.loaded or not (chat.agent_id or chat.session_id):
         if key.isdigit():
             return "ignore"
         return None
-    _prompt, options, multi, _custom = current_question(entry, chat.step_at(entry))
-    if not options:
+    _prompt, options, _multi, _custom = current_question(entry, chat.step_at(entry))
+    if not options or not key.isdigit():
         return None
-    picked = key_to_index(key, len(options))
-    if picked is None:
-        return None
-    if picked == "ignore":
-        return "ignore"
-    if multi:
-        chat.toggle_choice(picked)
-        return "toggle"
-    result = chat.commit_choice(options[picked][1])
-    if result == "step":
-        chat.error = ""
-        return "step"
-    if not result:
-        return None
-    chat.error = ""
-    return ("choice", result)
+    if len(options) <= OPTION_DIGITS:
+        clear_choice_digit(chat)
+        picked = key_to_index(key, len(options))
+        if picked is None:
+            return None
+        if picked == "ignore":
+            return "ignore"
+        return _activate_option(chat, picked + 1)
+    if _digit_fresh(chat) and chat.digit_buf:
+        number = int(chat.digit_buf + key)
+        clear_choice_digit(chat)
+        if number < 1 or number > len(options):
+            return "ignore"
+        return _activate_option(chat, number)
+    chat.digit_buf = key
+    chat.digit_at = clock()
+    return "wait"
 
 
 def chat_key(chat, key, stdscr):
@@ -3753,10 +3850,13 @@ def chat_key(chat, key, stdscr):
         chat.typed += value
         return None
     if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+        if getattr(chat, "digit_buf", "") and not chat.typed:
+            clear_choice_digit(chat)
+            return None
         chat.typed = chat.typed[:-1]
         return None
     picked = choice_key(chat, key)
-    if picked in {"ignore", "toggle", "step"}:
+    if picked in {"ignore", "toggle", "step", "wait"}:
         return None
     if isinstance(picked, tuple):
         return picked
@@ -3885,6 +3985,15 @@ def chat_loop(stdscr, chat):
                     dirty = True
             if chat.expire_working():
                 dirty = True
+            flushed = flush_choice_digit(chat)
+            if isinstance(flushed, tuple):
+                draw(stdscr, chat)
+                dirty = False
+                jobs.put(flushed)
+                waiting += 1
+                next_poll = min(next_poll, time.monotonic() + chat.poll_delay())
+            elif flushed is not None:
+                dirty = True
             now = time.monotonic()
             if waiting == 0 and now >= next_poll and (chat.loaded or chat.error):
                 jobs.put(("read", chat.take_read()))
@@ -3898,6 +4007,9 @@ def chat_loop(stdscr, chat):
                 wait = WAKE_CAP
                 if waiting == 0 and (chat.loaded or chat.error):
                     wait = min(WAKE_CAP, max(next_poll - time.monotonic(), 0))
+                pause = choice_pause(chat)
+                if pause is not None:
+                    wait = min(wait, pause)
                 watch = [wake_r] + ([tty] if tty is not None else [])
                 try:
                     select.select(watch, [], [], wait)
