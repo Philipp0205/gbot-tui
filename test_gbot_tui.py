@@ -871,6 +871,155 @@ class LookTests(unittest.TestCase):
             gbot_tui.ROSTER.clear()
 
 
+class MarkdownTests(unittest.TestCase):
+    def _plain(self, text, width=40):
+        rows = gbot_tui.transcript_rows([{"role": "assistant", "text": text}], width)
+        return [gbot_tui.line_plain(line) for kind, line in rows if kind == "text"]
+
+    def _styles(self, text, width=40):
+        rows = gbot_tui.transcript_rows([{"role": "assistant", "text": text}], width)
+        found = []
+        for _kind, line in rows:
+            if isinstance(line, list):
+                found.extend(style for _text, style in line)
+        return found
+
+    def test_plain_text_stays_a_string(self):
+        rows = gbot_tui.transcript_rows([{"role": "assistant", "text": "earlier"}], 40)
+        self.assertIn(("text", "earlier"), rows)
+        self.assertEqual(gbot_tui.render_markdown("2 * 3 = 6", 40), ["2 * 3 = 6"])
+        self.assertEqual(gbot_tui.render_markdown("snake_case stays", 40), ["snake_case stays"])
+        self.assertEqual(gbot_tui.render_markdown("**hello", 40), ["**hello"])
+
+    def test_a_plain_bullet_still_hangs(self):
+        self.assertEqual(
+            [gbot_tui.line_plain(line) for line in gbot_tui.render_markdown("- hello world", 10)],
+            gbot_tui.wrap("- hello world", 10),
+        )
+        self.assertEqual(
+            [gbot_tui.line_plain(line) for line in gbot_tui.render_markdown("**abcdefghijklmnopqrstuvwxyz**", 10)],
+            gbot_tui.wrap("abcdefghijklmnopqrstuvwxyz", 10),
+        )
+
+    def test_emphasis_code_and_links_drop_the_markers(self):
+        text = "A **bold** and *lean* word, plus `code` and [Grok](https://x.ai)."
+        plain = " ".join(self._plain(text, 80))
+        self.assertEqual(plain, "A bold and lean word, plus code and Grok (https://x.ai).")
+        self.assertNotIn("**", plain)
+        self.assertNotIn("`", plain)
+        styles = self._styles(text, 80)
+        self.assertIn("bold", styles)
+        self.assertIn("em", styles)
+        self.assertIn("code", styles)
+        self.assertIn("link", styles)
+        self.assertIn("dim", styles)
+
+    def test_bold_wraps_without_losing_the_style(self):
+        lines = gbot_tui.render_markdown("**hello world**", 8)
+        self.assertEqual([gbot_tui.line_plain(line) for line in lines], ["hello", "world"])
+        self.assertTrue(all(isinstance(line, list) for line in lines))
+        self.assertTrue(all(style == "bold" for line in lines for _text, style in line))
+
+    def test_headings_lists_quotes_code_and_tables(self):
+        text = "\n".join(
+            [
+                "# Title",
+                "",
+                "- one",
+                "- two words here",
+                "",
+                "1. first",
+                "",
+                "> quoted **bit**",
+                "",
+                "```python",
+                "print(1)",
+                "```",
+                "",
+                "| name | role |",
+                "| --- | --- |",
+                "| Ada | cook |",
+                "",
+                "---",
+            ]
+        )
+        plain = self._plain(text, 40)
+        blob = "\n".join(plain)
+        self.assertNotIn("# Title", blob)
+        self.assertNotIn("**", blob)
+        self.assertNotIn("```", blob)
+        self.assertNotIn("| --- |", blob)
+        self.assertIn("Title", plain)
+        self.assertIn("- one", plain)
+        self.assertIn("1. first", plain)
+        self.assertTrue(any(line.endswith("quoted bit") for line in plain))
+        self.assertIn("python", plain)
+        self.assertTrue(any("print(1)" in line for line in plain))
+        self.assertTrue(any("Ada" in line and "cook" in line for line in plain))
+        self.assertTrue(any(set(line) == {"─"} for line in plain))
+        text_w = 36
+        self.assertTrue(all(len(line) <= text_w for line in plain))
+        styles = self._styles(text, 40)
+        self.assertIn("bold", styles)
+        self.assertIn("code", styles)
+
+    def test_a_narrow_table_stays_inside_the_line(self):
+        text = "| name | role |\n| --- | --- |\n| Adelaide | cook |"
+        plain = self._plain(text, 20)
+        self.assertTrue(plain)
+        self.assertTrue(all(len(line) <= 16 for line in plain))
+        self.assertTrue(any("Adel" in line or "…" in line for line in plain))
+        squeezed = gbot_tui.render_markdown(
+            "| a | b | c |\n| --- | --- | --- |\n| 1 | 2 | 3 |",
+            4,
+        )
+        self.assertTrue(squeezed)
+        self.assertTrue(all(len(gbot_tui.line_plain(line)) <= 4 for line in squeezed))
+
+    def test_a_user_bubble_renders_markdown_and_stays_rectangular(self):
+        rows = gbot_tui.transcript_rows([{"role": "user", "text": "say **hi** now"}], 40)
+        lines = [line for kind, line in rows if kind == "user"]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("hi", gbot_tui.line_plain(lines[0]))
+        self.assertNotIn("*", gbot_tui.line_plain(lines[0]))
+        wide = gbot_tui.transcript_rows(
+            [{"role": "user", "text": "**hello**\nworld"}],
+            40,
+        )
+        bubbles = [gbot_tui.line_plain(line) for kind, line in wide if kind == "user"]
+        self.assertGreater(len(bubbles), 1)
+        self.assertEqual(len(set(map(len, bubbles))), 1)
+
+    def test_the_preview_drops_markers(self):
+        entries = [{"role": "assistant", "text": "**lunch** is ready"}]
+        self.assertEqual(gbot_tui.activity_preview(entries, "idle"), "lunch is ready")
+
+    def test_styles_keep_the_bot_color_except_code(self):
+        base = 7
+        bold = gbot_tui.transcript_attr("bold", base)
+        self.assertEqual(bold & gbot_tui.curses.A_BOLD, gbot_tui.curses.A_BOLD)
+        self.assertEqual(bold & ~gbot_tui.curses.A_BOLD, base)
+        self.assertEqual(gbot_tui.transcript_attr("code", base), gbot_tui.ATTR["gray"])
+        self.assertEqual(gbot_tui.transcript_attr("dim", base), gbot_tui.ATTR["gray"])
+        link = gbot_tui.transcript_attr("link", base)
+        self.assertEqual(link & gbot_tui.curses.A_UNDERLINE, gbot_tui.curses.A_UNDERLINE)
+        bubble = gbot_tui.user_attr("code", base)
+        self.assertEqual(bubble & base, base)
+        self.assertEqual(bubble & gbot_tui.curses.A_DIM, gbot_tui.curses.A_DIM)
+
+    def test_a_markdown_reply_draws_without_the_markers(self):
+        chat = gbot_tui.Chat("Researcher")
+        chat.messages = [{"role": "assistant", "text": "Say **hello** and `go`."}]
+        screen = FakeScreen(24, 58)
+        gbot_tui.draw(screen, chat)
+        shown = " ".join(" ".join(row) for row in screen.rows.values())
+        self.assertIn("hello", shown)
+        self.assertIn("go", shown)
+        self.assertNotIn("**", shown)
+        self.assertNotIn("`", shown)
+        self.assertIn("●", shown)
+
+
 class SendTests(unittest.TestCase):
     def test_enter_shows_the_line_and_the_poll_replaces_it(self):
         chat = gbot_tui.Chat("Researcher")
