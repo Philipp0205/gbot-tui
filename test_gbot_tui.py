@@ -1333,6 +1333,40 @@ class SpeedTests(unittest.TestCase):
         self.assertTrue(chat.messages[-1].get("local"))
         self.assertEqual(gbot_tui.chat_key(chat, "\x1b", None), "back")
 
+    def test_alt_page_scrolls_half_of_a_page(self):
+        self.assertEqual(gbot_tui.page_step(40, False), 36)
+        self.assertEqual(gbot_tui.page_step(40, True), 18)
+        self.assertEqual(gbot_tui.page_step(5, True), 1)
+        self.assertEqual(gbot_tui.page_motion(gbot_tui.curses.KEY_PPAGE), (-1, False))
+        self.assertEqual(gbot_tui.page_motion(gbot_tui.curses.KEY_NPAGE), (1, False))
+        original = gbot_tui.curses.keyname
+
+        def keyname(key):
+            return {7: b"kPRV3", 8: b"kNXT3"}.get(key, b"KEY_OTHER")
+
+        gbot_tui.curses.keyname = keyname
+        gbot_tui.curses.LINES = 40
+        try:
+            self.assertEqual(gbot_tui.page_motion(7), (-1, True))
+            self.assertEqual(gbot_tui.page_motion(8), (1, True))
+            self.assertIsNone(gbot_tui.page_motion(9))
+            chat = gbot_tui.Chat("Researcher")
+            chat.scroll = 100
+            chat.follow = True
+            self.assertIsNone(gbot_tui.chat_key(chat, gbot_tui.curses.KEY_PPAGE, None))
+            self.assertEqual(chat.scroll, 64)
+            self.assertFalse(chat.follow)
+            self.assertIsNone(gbot_tui.chat_key(chat, 7, None))
+            self.assertEqual(chat.scroll, 46)
+            screen = FakeScreen(24, 80)
+            chat.follow = False
+            chat.scroll = 0
+            self.assertIsNone(gbot_tui.chat_key(chat, 8, screen))
+            self.assertEqual(chat.scroll, 18)
+            self.assertTrue(chat.follow)
+        finally:
+            gbot_tui.curses.keyname = original
+
     def test_a_long_error_gets_its_own_rows_on_screen(self):
         chat = gbot_tui.Chat("Researcher")
         chat.messages = [{"role": "assistant", "text": "hello"}]
@@ -1706,7 +1740,7 @@ class QuitTests(unittest.TestCase):
         gbot_tui.TITLE.update(pushed=False, popped=False)
 
     def test_ctrl_c_quits_like_ctrl_d_and_sigint_is_restored(self):
-        chat = gbot_tui.Chat("Cloud")
+        chat = gbot_tui.Chat("Researcher")
         self.assertEqual(gbot_tui.chat_key(chat, "\x03", None), "quit")
         self.assertEqual(gbot_tui.chat_key(chat, "\x04", None), "quit")
         signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -1875,6 +1909,133 @@ def _reset_overview():
             pass
 
 
+def _widget(prompt, options, **extra):
+    entry = {
+        "kind": "send-message",
+        "id": extra.pop("id", "w1"),
+        "message": {
+            "type": "widget",
+            "widget": {"prompt": prompt, "options": options},
+        },
+    }
+    entry.update(extra)
+    return entry
+
+
+class WidgetTests(unittest.TestCase):
+    def _chat(self, entry):
+        chat = gbot_tui.Chat("Researcher")
+        chat.loaded = True
+        chat.session_id = "agent"
+        chat.messages = [entry]
+        return chat
+
+    def test_an_open_widget_shows_the_prompt_and_numbered_options(self):
+        entry = _widget(
+            "How should I get into your Vivino?",
+            [
+                {"label": "Sign in and request the export", "value": "Sign in and export", "style": "primary"},
+                {"label": "Just sign in and browse", "value": "Just browse"},
+            ],
+        )
+        text = gbot_tui.entry_text(entry)
+        self.assertIn("How should I get into your Vivino?", text)
+        self.assertIn("1  Sign in and request the export", text)
+        self.assertIn("2  Just sign in and browse", text)
+        rows = [line for kind, line in gbot_tui.transcript_rows([entry], 80) if kind == "text"]
+        self.assertIn("1  Sign in and request the export", rows)
+        older = _widget("Older?", [{"label": "Old", "value": "old"}], id="old")
+        both = [line for _kind, line in gbot_tui.transcript_rows([older, entry], 80)]
+        self.assertIn("   Old", both)
+        self.assertNotIn("1  Old", both)
+        self.assertIn("1  Sign in and request the export", both)
+
+    def test_an_answered_widget_marks_the_chosen_option(self):
+        entry = _widget(
+            "How should I get into your Vivino?",
+            [
+                {"label": "Sign in and request the export", "value": "Sign in and export"},
+                {"label": "Just sign in and browse", "value": "Just browse"},
+            ],
+            respondedValue="Just browse",
+        )
+        text = gbot_tui.entry_text(entry)
+        self.assertIn("●  Just sign in and browse", text)
+        self.assertNotIn("\n1  ", text)
+        self.assertNotIn("\n2  ", text)
+
+    def test_a_skipped_widget_says_so(self):
+        entry = _widget("Install it?", [{"label": "pstack", "value": "install pstack"}], widgetSkipped=True)
+        self.assertIn("Install it?  · skipped", gbot_tui.entry_text(entry))
+        self.assertNotIn("\n1  ", gbot_tui.entry_text(entry))
+
+    def test_a_number_sends_that_option(self):
+        entry = _widget(
+            "Send these fixes?",
+            [
+                {"label": "Badge bug and polish", "value": "Send the badge bug"},
+                {"label": "Leave it", "value": "Leave it for now"},
+            ],
+        )
+        chat = self._chat(entry)
+        job = gbot_tui.chat_key(chat, "1", None)
+        self.assertEqual(job, ("choice", ("Researcher", "agent", "w1", "Send the badge bug")))
+        self.assertIn("●  Badge bug and polish", gbot_tui.entry_text(chat.messages[0]))
+        self.assertEqual(chat.phase, "working")
+        chat.fail_choice()
+        self.assertIn("1  Badge bug and polish", gbot_tui.entry_text(chat.messages[0]))
+        self.assertEqual(chat.phase, "idle")
+
+    def test_a_number_is_text_when_nothing_is_open(self):
+        chat = gbot_tui.Chat("Researcher")
+        chat.loaded = True
+        chat.session_id = "agent"
+        self.assertIsNone(gbot_tui.chat_key(chat, "1", None))
+        self.assertEqual(chat.typed, "1")
+
+    def test_a_number_waits_until_the_thread_is_live(self):
+        entry = _widget("Send these fixes?", [{"label": "Yes", "value": "Yes, send them"}])
+        chat = self._chat(entry)
+        chat.loaded = False
+        self.assertIsNone(gbot_tui.chat_key(chat, "1", None))
+        self.assertEqual(chat.typed, "")
+        self.assertIsNone(gbot_tui.latest_decision(chat.messages))
+
+    def test_multi_select_toggles_and_enter_sends_each_line(self):
+        entry = _widget(
+            "Was soll raus?",
+            [
+                {"label": "Emil", "value": "Send Emil"},
+                {"label": "Mario", "value": "Send Mario"},
+            ],
+        )
+        entry["message"]["widget"]["multiSelect"] = True
+        chat = self._chat(entry)
+        self.assertIsNone(gbot_tui.chat_key(chat, "2", None))
+        self.assertIsNone(gbot_tui.chat_key(chat, "1", None))
+        shown = gbot_tui.entry_text(entry, chat.widget_picks["w1"])
+        self.assertIn("● 1  Emil", shown)
+        self.assertIn("● 2  Mario", shown)
+        job = gbot_tui.chat_key(chat, "\r", None)
+        self.assertEqual(job[0], "choice")
+        self.assertEqual(job[1][-1], "Send Emil\nSend Mario")
+
+    def test_widget_error_reads_a_refusal(self):
+        self.assertEqual(gbot_tui.widget_error({"ok": True, "text": ""}), "")
+        self.assertEqual(gbot_tui.widget_error({"ok": True, "text": '{"accepted": true}'}), "")
+        self.assertEqual(
+            gbot_tui.widget_error({"ok": True, "text": '{"accepted": false, "refusal": "gone"}'}),
+            "gone",
+        )
+        self.assertEqual(gbot_tui.widget_error({"ok": False, "text": "nope"}), "nope")
+
+    def test_the_footer_names_the_keys(self):
+        entry = _widget("Send these fixes?", [{"label": "Yes", "value": "yes"}, {"label": "No", "value": "no"}])
+        hint = gbot_tui.choice_hint(entry)
+        self.assertEqual(hint, "1-2 answer")
+        self.assertIn("1-2 answer", gbot_tui.footer_spans("idle", "", choice=hint)[0][0])
+
+
 class OverviewTests(unittest.TestCase):
     def setUp(self):
         _reset_overview()
@@ -2012,7 +2173,7 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(gbot_tui.overview_summary([], checked=0, total=4), "checking threads")
         self.assertEqual(
             gbot_tui.overview_summary(bots[:2], checked=1, total=4),
-            "1 running · checking 1 of 4",
+            "1 working · checking 1 of 4",
         )
         self.assertEqual(gbot_tui.overview_summary(bots[:1]), "1 idle")
 
@@ -2285,6 +2446,60 @@ class OverviewTests(unittest.TestCase):
         chat.typed = "more"
         chat.arm_send()
         self.assertEqual(gbot_tui.lookup_activity({"name": "Chef"})["state"], "working")
+
+    def test_opening_an_unanswered_thread_shows_working(self):
+        page = gbot_tui.parse_thread(
+            {
+                "target": {"id": "a2", "name": "Chef"},
+                "transcript": {
+                    "entries": [
+                        {"id": "m1", "role": "assistant", "text": "hi"},
+                        {"id": "m2", "role": "user", "text": "go", "isStreaming": False},
+                    ]
+                },
+                "cursor": "m2",
+            }
+        )
+        chat = gbot_tui.Chat("Chef")
+        chat.ingest(page, first=True)
+        self.assertEqual(chat.phase, "working")
+        quiet = gbot_tui.parse_thread({"transcript": {"entries": []}, "cursor": "m2"})
+        chat.ingest(quiet)
+        chat.ingest(quiet)
+        self.assertEqual(chat.phase, "working")
+        self.assertEqual(gbot_tui.lookup_activity({"name": "Chef", "id": "a2"})["state"], "working")
+        screen = FakeScreen(24, 80)
+        gbot_tui.draw(screen, chat)
+        header = "".join(screen.rows.get(0, []))
+        self.assertIn("working", header)
+        spans = gbot_tui.picker_spans(
+            {"name": "Chef", "activity": {"state": "working", "unread": 0, "preview": "go"}},
+            False,
+            60,
+        )
+        self.assertIn(("working   ", "yellow"), spans)
+
+    def test_a_streaming_reply_stays_working_through_quiet_polls(self):
+        page = gbot_tui.parse_thread(
+            {
+                "target": {"id": "a2", "name": "Chef"},
+                "transcript": {
+                    "entries": [
+                        {"id": "m1", "role": "user", "text": "go"},
+                        {"id": "m2", "role": "assistant", "text": "partial", "isStreaming": True},
+                    ]
+                },
+                "cursor": "m2",
+            }
+        )
+        chat = gbot_tui.Chat("Chef")
+        chat.phase = "working"
+        chat.cursor = "old"
+        chat.ingest(page)
+        quiet = gbot_tui.parse_thread({"transcript": {"entries": []}, "cursor": "m2"})
+        chat.ingest(quiet)
+        chat.ingest(quiet)
+        self.assertEqual(chat.phase, "working")
 
     def test_the_scan_publishes_each_bot_and_keeps_a_total_failure(self):
         bots = [{"name": "A", "id": "1"}, {"name": "B", "id": "2"}]
