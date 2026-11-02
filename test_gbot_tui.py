@@ -1635,7 +1635,13 @@ def _reset_overview():
     gbot_tui.SEEN.clear()
     gbot_tui.ACTIVITY_LOADED["done"] = False
     gbot_tui.SEEN_LOADED["done"] = False
-    paths = [gbot_tui.activity_path(), gbot_tui.seen_path(), gbot_tui.thread_cache_path("Chef")]
+    paths = [
+        gbot_tui.activity_path(),
+        gbot_tui.seen_path(),
+        gbot_tui.thread_cache_path("Chef"),
+        gbot_tui.thread_cache_path("Researcher"),
+        gbot_tui.thread_cache_path("Night"),
+    ]
     for path in paths:
         try:
             os.remove(path)
@@ -1687,7 +1693,8 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(snap["state"], "unread")
         self.assertEqual(snap["unread"], 2)
         self.assertEqual(snap["preview"], "and more")
-        self.assertEqual(gbot_tui.status_label("unread", 2), "2 new")
+        self.assertEqual(gbot_tui.status_label("unread", 2), "2 unread")
+        self.assertEqual(gbot_tui.status_label("unread", 1), "unread")
 
     def test_a_seen_reply_is_idle_and_a_first_look_is_not_all_new(self):
         entries = [{"id": "m2", "role": "assistant", "text": "done"}]
@@ -1724,7 +1731,7 @@ class OverviewTests(unittest.TestCase):
         )
         self.assertEqual(
             gbot_tui.overview_summary(bots[:4]),
-            "1 needs you · 1 new · 1 running",
+            "1 needs you · 1 unread · 1 running",
         )
         self.assertEqual(gbot_tui.overview_summary([], checked=0, total=4), "checking threads")
         self.assertEqual(
@@ -1743,11 +1750,100 @@ class OverviewTests(unittest.TestCase):
         spans = gbot_tui.picker_spans(bot, True, 60)
         self.assertEqual(spans[0], ("→ ", "bold"))
         self.assertEqual(spans[1], ("● ", "bot:violet"))
-        self.assertEqual(spans[2], ("Outfitly", "bold"))
-        self.assertEqual(spans[4], ("needs you ", "yellow"))
+        self.assertEqual(spans[2], ("needs you  ", "yellow"))
+        self.assertEqual(spans[3], ("Outfitly", "bold"))
+        self.assertEqual(spans[4], (" · ", "dim"))
         self.assertEqual(spans[5], ("npm publish", "dim"))
+        self.assertLess(
+            "".join(text for text, _style in spans).index("needs you"),
+            "".join(text for text, _style in spans).index("Outfitly"),
+        )
         narrow = "".join(text for text, _style in gbot_tui.picker_spans(bot, False, 16))
         self.assertIn("Outfitly", narrow)
+
+    def test_the_selection_shows_every_state_in_one_column(self):
+        bots = [
+            {
+                "name": "Ask",
+                "title": "",
+                "avatarColor": "violet",
+                "activity": {"state": "blocked", "unread": 0, "preview": "npm publish", "cursor": "c"},
+            },
+            {
+                "name": "Fresh",
+                "title": "",
+                "avatarColor": "blue",
+                "activity": {"state": "unread", "unread": 3, "preview": "and more", "cursor": "c"},
+            },
+            {
+                "name": "Runner",
+                "title": "",
+                "avatarColor": "orange",
+                "activity": {"state": "working", "unread": 0, "preview": "go", "cursor": "c"},
+            },
+            {
+                "name": "Quiet",
+                "title": "",
+                "avatarColor": "gray",
+                "activity": {"state": "idle", "unread": 0, "preview": "night", "cursor": "c"},
+            },
+            {"name": "Scout", "title": "looks around", "avatarColor": "green"},
+        ]
+        columns = gbot_tui.list_columns(bots, 80)
+        self.assertIsNotNone(columns)
+        words = ["needs you", "3 unread", "running", "idle", "-"]
+        starts = []
+        for bot, word in zip(bots, words):
+            spans = gbot_tui.picker_spans(bot, False, 80, columns)
+            row = "".join(text for text, _style in spans)
+            self.assertIn(word, spans[2][0])
+            self.assertLess(row.index(word), row.index(bot["name"]))
+            self.assertEqual(spans[-1][1], "dim")
+            starts.append(sum(len(text) for text, _style in spans[:-1]))
+        self.assertEqual(len(set(starts)), 1)
+        styles = [
+            gbot_tui.picker_spans(bot, False, 80, columns)[2][1]
+            for bot in bots
+        ]
+        self.assertEqual(styles, ["yellow", "green", "bold", "dim", "dim"])
+
+    def test_a_saved_thread_shows_its_state_before_the_scan(self):
+        gbot_tui.write_thread_cache("Chef", [{"id": "m1", "role": "user", "text": "cook"}])
+        gbot_tui.write_thread_cache(
+            "Researcher",
+            [
+                {"id": "m1", "role": "user", "text": "go"},
+                {"id": "m2", "role": "assistant", "text": "the paper is out"},
+            ],
+        )
+        gbot_tui.remember_seen("Researcher", "a1", "m1")
+        gbot_tui.store_activity(
+            {"name": "Night", "id": "a9"},
+            {"state": "unread", "unread": 1, "cursor": "m9", "preview": "done"},
+        )
+        gbot_tui.write_thread_cache("Night", [{"id": "m1", "role": "assistant", "text": "old"}])
+        views = gbot_tui.with_activity(
+            [
+                {"name": "Chef", "id": "a2", "title": "what to cook"},
+                {"name": "Researcher", "id": "a1"},
+                {"name": "Night", "id": "a9"},
+                {"name": "Scout", "id": "a3", "title": "looks"},
+            ]
+        )
+        by_name = {bot["name"]: bot for bot in views}
+        self.assertEqual(by_name["Chef"]["activity"]["state"], "working")
+        self.assertEqual(by_name["Researcher"]["activity"]["state"], "unread")
+        self.assertEqual(by_name["Researcher"]["activity"]["preview"], "the paper is out")
+        # A live state already on disk wins over the older saved thread.
+        self.assertEqual(by_name["Night"]["activity"]["state"], "unread")
+        self.assertEqual(by_name["Night"]["activity"]["preview"], "done")
+        self.assertNotIn("activity", by_name["Scout"])
+        running = "".join(text for text, _style in gbot_tui.picker_spans(by_name["Chef"], False, 70))
+        self.assertIn("running", running)
+        self.assertLess(running.index("running"), running.index("Chef"))
+        unread = "".join(text for text, _style in gbot_tui.picker_spans(by_name["Researcher"], False, 70))
+        self.assertIn("unread", unread)
+        self.assertLess(unread.index("unread"), unread.index("Researcher"))
 
     def test_search_matches_the_latest_line(self):
         bots = [
@@ -1792,7 +1888,7 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(views[0]["activity"]["state"], "unread")
         self.assertEqual(views[0]["activity"]["preview"], "lunch is ready")
         text = gbot_tui.format_overview(views)
-        self.assertIn("1 new", text)
+        self.assertIn("1 unread", text)
         self.assertIn("Chef", text)
         self.assertIn("lunch is ready", text)
         self.assertEqual(gbot_tui.lookup_seen(bots[0]), "m1")
