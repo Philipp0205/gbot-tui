@@ -614,6 +614,23 @@ class LookTests(unittest.TestCase):
         )
         self.assertEqual(yellow[1], ("● ", "bot:yellow"))
 
+    def test_a_black_dot_uses_the_lifted_color(self):
+        shown = gbot_tui.xterm_hex(gbot_tui.xterm_color(gbot_tui.readable_hex("#000000", True, "#000000")))
+        self.assertNotEqual(shown.upper(), "#000000")
+        self.assertGreaterEqual(gbot_tui.contrast(shown, "#000000"), 7)
+        sentinel = object()
+        saved = dict(gbot_tui.TEXT_ATTR)
+        try:
+            gbot_tui.TEXT_ATTR["black"] = sentinel
+            self.assertIs(gbot_tui.dot_attr("black"), sentinel)
+            self.assertIs(gbot_tui.bot_text_attr("black"), sentinel)
+            self.assertIs(gbot_tui.span_attr("bot:black"), sentinel)
+        finally:
+            gbot_tui.TEXT_ATTR.clear()
+            gbot_tui.TEXT_ATTR.update(saved)
+        spans = gbot_tui.picker_spans({"name": "Ink", "title": "", "avatarColor": "black"}, True, 40)
+        self.assertEqual(spans[1], ("● ", "bot:black"))
+
     def test_wrap_keeps_words_together(self):
         self.assertEqual(gbot_tui.wrap("right now", 7), ["right", "now"])
         self.assertEqual(gbot_tui.wrap("your turn", 4), ["your", "turn"])
@@ -1114,8 +1131,6 @@ class ThemeTests(unittest.TestCase):
         for name, hex_color in gbot_tui.AVATAR_COLORS.items():
             for dark, background, target in ((True, "#000000", 7), (False, "#FFFFFF", 4.5)):
                 shown = gbot_tui.xterm_hex(gbot_tui.xterm_color(gbot_tui.readable_hex(hex_color, dark, background)))
-                if name == "black" and dark:
-                    continue
                 self.assertGreaterEqual(gbot_tui.contrast(shown, background), target, (name, dark))
 
     def test_named_styles_read_on_a_light_background(self):
@@ -1499,7 +1514,8 @@ class TabTests(unittest.TestCase):
         saved = gbot_tui.TAB, gbot_tui.emit, gbot_tui.window_title, gbot_tui.silence_herdr, gbot_tui.APP
         title, renames = self.tab("t2")
         gbot_tui.TAB = title
-        gbot_tui.emit = lambda state, name, kind=None: calls.append(("emit", state))
+        gbot_tui.APP = "Outfitly"
+        gbot_tui.emit = lambda state, name, kind=None: calls.append(("emit", state, gbot_tui.APP, name))
         gbot_tui.window_title = lambda text: calls.append(("title", text))
         gbot_tui.silence_herdr = lambda label: None
         try:
@@ -1510,6 +1526,8 @@ class TabTests(unittest.TestCase):
         finally:
             gbot_tui.TAB, gbot_tui.emit, gbot_tui.window_title, gbot_tui.silence_herdr, gbot_tui.APP = saved
         self.assertEqual(renames, ["Outfitly", "Work"])
+        self.assertEqual(calls[0], ("emit", "clear", "Outfitly", "Outfitly"))
+        self.assertIn(("emit", "idle", "gbot-tui", "gbot"), calls)
         self.assertIn(("title", "gbot"), calls)
 
 
@@ -1678,7 +1696,9 @@ class OverviewTests(unittest.TestCase):
             {"name": "Nomad", "id": "a9"},
             {"state": "idle", "unread": 0, "cursor": "m1", "preview": ""},
         )
-        self.assertEqual(gbot_tui.seen_mark({"name": "Nomad", "id": "a9"}), "m1")
+        # A scan stores this cursor in the activity file. It is not a seen mark:
+        # the next pass would otherwise treat it as already read.
+        self.assertEqual(gbot_tui.seen_mark({"name": "Nomad", "id": "a9"}), "")
         gbot_tui.remember_seen("Nomad", "a9", "m9")
         self.assertEqual(gbot_tui.seen_mark({"name": "Nomad", "id": "a9"}), "m9")
         self.assertEqual(os.stat(gbot_tui.activity_path()).st_mode & 0o777, 0o600)
@@ -1703,6 +1723,106 @@ class OverviewTests(unittest.TestCase):
         self.assertIn("1 new", text)
         self.assertIn("Chef", text)
         self.assertIn("lunch is ready", text)
+        self.assertEqual(gbot_tui.lookup_seen(bots[0]), "m1")
+
+    def test_a_never_opened_bot_stays_new_across_scans(self):
+        bots = [{"id": "a1", "name": "Researcher"}]
+
+        def page(*rows):
+            entries = [{"id": mid, "role": "assistant", "text": text} for mid, text in rows]
+            return {"entries": entries, "cursor": rows[-1][0]}
+
+        first = page(("m1", "hello"))
+        views, error = gbot_tui.build_overview(bots, lambda bot: first)
+        self.assertIsNone(error)
+        self.assertEqual(views[0]["activity"]["state"], "idle")
+        self.assertEqual(gbot_tui.lookup_seen(bots[0]), "m1")
+
+        second = page(("m1", "hello"), ("m2", "done"))
+        views, error = gbot_tui.build_overview(bots, lambda bot: second)
+        self.assertEqual(views[0]["activity"]["state"], "unread")
+        self.assertEqual(views[0]["activity"]["preview"], "done")
+        self.assertEqual(gbot_tui.lookup_seen(bots[0]), "m1")
+
+        third = page(("m1", "hello"), ("m2", "done"), ("m3", "still here"))
+        views, error = gbot_tui.build_overview(bots, lambda bot: third)
+        self.assertEqual(views[0]["activity"]["state"], "unread")
+        self.assertEqual(views[0]["activity"]["unread"], 2)
+        self.assertEqual(views[0]["activity"]["preview"], "still here")
+        self.assertEqual(gbot_tui.lookup_seen(bots[0]), "m1")
+
+        # A fresh process reads the pinned cursor. Another scan does not move it.
+        gbot_tui.SEEN.clear()
+        gbot_tui.SEEN_LOADED["done"] = False
+        gbot_tui.ACTIVITY.clear()
+        gbot_tui.ACTIVITY_LOADED["done"] = False
+        views, error = gbot_tui.build_overview(bots, lambda bot: third)
+        self.assertEqual(views[0]["activity"]["state"], "unread")
+        self.assertEqual(gbot_tui.lookup_seen(bots[0]), "m1")
+
+        gbot_tui.remember_seen("Researcher", "a1", "m3")
+        gbot_tui.remember_seen("Researcher", "a1", "m1", only_if_absent=True)
+        self.assertEqual(gbot_tui.lookup_seen(bots[0]), "m3")
+        views, error = gbot_tui.build_overview(bots, lambda bot: third)
+        self.assertEqual(views[0]["activity"]["state"], "idle")
+        self.assertEqual(gbot_tui.lookup_seen(bots[0]), "m3")
+
+    def test_list_previews_share_a_column(self):
+        def bot(name, preview):
+            return {
+                "name": name,
+                "title": "",
+                "activity": {"state": "idle", "unread": 0, "preview": preview, "cursor": "c"},
+            }
+
+        bots = [bot("A", "one"), bot("Researcher", "two replies waiting")]
+        for width in (80, 58):
+            columns = gbot_tui.list_columns(bots, width)
+            self.assertIsNotNone(columns, width)
+            starts = []
+            for item in bots:
+                spans = gbot_tui.picker_spans(item, False, width, columns)
+                self.assertEqual(spans[-1][1], "dim")
+                self.assertTrue(spans[-1][0].startswith(item["activity"]["preview"][:4]))
+                starts.append(sum(len(text) for text, _style in spans[:-1]))
+            self.assertEqual(starts[0], starts[1], width)
+        self.assertIsNone(gbot_tui.list_columns(bots, 20))
+        shown = "".join(text for text, _style in gbot_tui.picker_spans(bots[1], False, 18))
+        self.assertIn("Researcher", shown)
+        clipped = "".join(text for text, _style in gbot_tui.picker_spans(bots[1], False, 16))
+        self.assertIn("Research…", clipped)
+
+    def test_preview_search_needs_the_letters_together(self):
+        bots = [
+            {
+                "name": "Night",
+                "title": "",
+                "activity": {"preview": "our task follows the plan today", "state": "idle"},
+            },
+            {
+                "name": "Chef",
+                "title": "",
+                "activity": {"preview": "the outfit is ready", "state": "idle"},
+            },
+            {
+                "name": "Outfitly",
+                "title": "clothes",
+                "activity": {"preview": "hang the coat", "state": "idle"},
+            },
+        ]
+        names = [bot["name"] for bot in gbot_tui.fuzzy_bots("outf", bots)]
+        self.assertEqual(names[0], "Outfitly")
+        self.assertIn("Chef", names)
+        self.assertNotIn("Night", names)
+        self.assertIsNone(gbot_tui.preview_score("outf", "our task follows the plan today"))
+        self.assertGreater(
+            gbot_tui.preview_score("outf", "outfit"),
+            gbot_tui.preview_score("outf", "theoutfit"),
+        )
+        self.assertGreater(
+            gbot_tui.fuzzy_score("outf", "Outfitly"),
+            gbot_tui.preview_score("outf", "the outfit is ready"),
+        )
 
     def test_opening_the_thread_clears_new(self):
         page = gbot_tui.parse_thread(

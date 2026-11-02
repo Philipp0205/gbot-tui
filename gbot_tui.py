@@ -658,16 +658,25 @@ def lookup_activity(bot):
     return None
 
 
-def remember_seen(name, bot_id, cursor):
-    """The latest entry this chat had on screen. A later reply is then `new`."""
+def remember_seen(name, bot_id, cursor, only_if_absent=False):
+    """The latest entry this chat had on screen. A later reply is then `new`.
+
+    `only_if_absent` is the first scan of a bot nobody has opened. It must not
+    move a cursor the chat, or an earlier scan, already stored.
+    """
     if not isinstance(cursor, str) or not cursor:
         return
     load_seen()
     with STATE_LOCK:
+        keys = []
         if bot_id:
-            SEEN["id:" + str(bot_id)] = cursor
+            keys.append("id:" + str(bot_id))
         if name:
-            SEEN["name:" + name] = cursor
+            keys.append("name:" + name)
+        if only_if_absent and any(SEEN.get(key) for key in keys):
+            return
+        for key in keys:
+            SEEN[key] = cursor
         _save_locked(seen_path(), dict(SEEN))
 
 
@@ -682,22 +691,28 @@ def lookup_seen(bot):
 
 
 def seen_mark(bot):
-    """The cursor to diff against. A bot never opened is not all `new` on first sight.
+    """The cursor to diff against. A scan never moves this.
 
-    Order: the chat's seen file, then the cached thread (the last time it was
-    on screen), then the previous scan. That last one is only a baseline, so
-    the next pass can see replies that arrived after it.
+    The seen file wins. The first look writes it once, and the chat advances
+    it when the thread is on screen. A cached thread counts when that file has
+    no row, because the thread was on screen. The activity cursor does not:
+    it advances every pass, which cleared `new` on the pass after it appeared.
     """
     seen = lookup_seen(bot)
     if seen:
         return seen
-    cached = last_id(read_thread_cache(bot.get("name") or ""))
-    if cached:
-        return cached
-    previous = lookup_activity(bot)
-    if previous and previous.get("cursor"):
-        return previous["cursor"]
-    return ""
+    return last_id(read_thread_cache(bot.get("name") or ""))
+
+
+def baseline_seen(bot, cursor):
+    """Record the first cursor a scan saw. Later scans leave it where it is."""
+    if not isinstance(cursor, str) or not cursor:
+        return
+    if lookup_seen(bot):
+        return
+    if last_id(read_thread_cache(bot.get("name") or "")):
+        return
+    remember_seen(bot.get("name") or "", bot.get("id") or "", cursor, only_if_absent=True)
 
 
 def one_line(text, limit=160):
@@ -897,6 +912,27 @@ def format_overview(bots):
     return "\n".join(lines)
 
 
+def page_entries(page):
+    entries = page.get("entries") if isinstance(page, dict) else []
+    if not isinstance(entries, list):
+        entries = []
+    cursor = page.get("cursor") if isinstance(page, dict) else ""
+    if not isinstance(cursor, str):
+        cursor = ""
+    return entries, cursor
+
+
+def record_page(bot, page):
+    """Judge one thread. The first look pins the seen cursor; a scan does not move it."""
+    entries, cursor = page_entries(page)
+    mark = seen_mark(bot)
+    snap = judge_activity(entries, cursor, mark)
+    if not mark:
+        baseline_seen(bot, snap.get("cursor") or cursor)
+    store_activity(bot, snap)
+    return snap
+
+
 def build_overview(bots, read):
     """Read each bot once. The first look baselines; a later look marks new replies.
 
@@ -913,14 +949,7 @@ def build_overview(bots, read):
             views.append(dict(bot))
             continue
         saw = True
-        entries = page.get("entries") if isinstance(page, dict) else []
-        if not isinstance(entries, list):
-            entries = []
-        cursor = page.get("cursor") if isinstance(page, dict) else ""
-        if not isinstance(cursor, str):
-            cursor = ""
-        snap = judge_activity(entries, cursor, seen_mark(bot))
-        store_activity(bot, snap)
+        snap = record_page(bot, page)
         view = dict(bot)
         view["activity"] = snap
         views.append(view)
@@ -1003,14 +1032,7 @@ class Survey:
                         self._checked += 1
                         self.generation += 1
                     continue
-                entries = page.get("entries") if isinstance(page, dict) else []
-                cursor = page.get("cursor") if isinstance(page, dict) else ""
-                if not isinstance(entries, list):
-                    entries = []
-                if not isinstance(cursor, str):
-                    cursor = ""
-                snap = judge_activity(entries, cursor, seen_mark(bot))
-                store_activity(bot, snap)
+                record_page(bot, page)
                 with self._lock:
                     self._checked += 1
                     self.generation += 1
@@ -2303,10 +2325,12 @@ TEXT_ATTR = {}
 
 
 def bot_text_attr(name):
-    # Desktop 1:1 messages use the bot's color. Black would vanish on a dark terminal.
+    """The bot's color, lightened or darkened until it reads on this background.
+
+    Black is #000000. On a dark terminal that raw color is the background, so
+    the list dot and the chat mark use the same lifted gray as the other colors.
+    """
     folded = (name or "").lower()
-    if folded == "black" and dark_terminal():
-        return ATTR["default"]
     if folded in TEXT_ATTR:
         return TEXT_ATTR[folded]
     return avatar_attr(name)
@@ -2959,10 +2983,63 @@ def fuzzy_score(query, name):
     return score
 
 
-def _status_spans(lead, lead_style, mark, name, name_style, activity, title, room):
+STATE_COLUMN = 10
+
+
+def list_columns(bots, width):
+    """Shared name and status widths so every preview starts at the same column.
+
+    A narrow window gives the name less room before it gives up the grid.
+    """
+    room = max(width - 7, 1)
+    overhead = 1 + STATE_COLUMN
+    if room <= overhead + 4:
+        return None
+    names = []
+    for bot in bots:
+        activity = bot.get("activity") if isinstance(bot.get("activity"), dict) else None
+        if activity and activity.get("state") in OVERVIEW_STATES and bot.get("name"):
+            names.append(bot["name"])
+    if not names:
+        return None
+    rest = room - overhead
+    # 58 columns still keeps a short preview. Below that, keep a few characters.
+    preview_floor = 12 if width >= 58 else 4
+    name_w = min(max(len(name) for name in names), max(rest - preview_floor, 1))
+    if name_w > rest:
+        name_w = rest
+    if name_w < 1:
+        return None
+    return {"name": name_w, "state": STATE_COLUMN}
+
+
+def _pad(text, width):
+    if len(text) >= width:
+        return text
+    return text + (" " * (width - len(text)))
+
+
+def _status_spans(lead, lead_style, mark, name, name_style, activity, title, room, columns=None):
     label = status_label(activity.get("state"), activity.get("unread") or 0)
     preview = " ".join((activity.get("preview") or title or "").split())
-    field = f"{label:<10}"
+    state_w = columns["state"] if columns else STATE_COLUMN
+    field = _pad(label, state_w)[: max(state_w, len(label))]
+    if columns:
+        name_w = columns["name"]
+        if name_w + 1 + state_w > room:
+            name_w = max(room - 1 - state_w, 1)
+        shown = _pad(clip(name, name_w), name_w)
+        preview_room = room - name_w - 1 - len(field)
+        spans = [
+            (lead, lead_style),
+            mark,
+            (shown, name_style),
+            (" ", "dim"),
+            (field, STATUS_STYLE.get(activity.get("state"), "dim")),
+        ]
+        if preview and preview_room > 0:
+            spans.append((clip(preview, preview_room), "dim"))
+        return spans
     overhead = 1 + len(field)
     if room <= overhead:
         return [(lead, lead_style), mark, (clip(name, room), name_style)]
@@ -2985,7 +3062,7 @@ def _status_spans(lead, lead_style, mark, name, name_style, activity, title, roo
     return spans
 
 
-def picker_spans(bot, selected, width):
+def picker_spans(bot, selected, width, columns=None):
     """One sidebar row: selection mark, avatar, name, status, and a preview.
 
     A row with no activity yet keeps the tagline, the same as before a scan.
@@ -3003,7 +3080,7 @@ def picker_spans(bot, selected, width):
     mark = ("● ", mark_style)
     activity = bot.get("activity") if isinstance(bot.get("activity"), dict) else None
     if activity and activity.get("state") in OVERVIEW_STATES:
-        return _status_spans(lead, lead_style, mark, name, name_style, activity, title, room)
+        return _status_spans(lead, lead_style, mark, name, name_style, activity, title, room, columns)
     if not title:
         return [(lead, lead_style), mark, (clip(name, room), name_style)]
     name_room = min(len(name), max(room // 2, 1))
@@ -3037,6 +3114,24 @@ def list_banner(query, summary, width):
     return []
 
 
+def preview_score(query, text):
+    """A preview matches only as a contiguous substring, not scattered letters.
+
+    A long reply is full of letters. Fuzzy order through it pulled in most of
+    the list for a short query. A word start ranks above a match mid-word, and
+    both stay under a real name match.
+    """
+    query = query.casefold()
+    if not query:
+        return 0
+    hay = str(text).casefold()
+    found = hay.find(query)
+    if found < 0:
+        return None
+    word = found == 0 or not hay[found - 1].isalnum()
+    return 800 - min(found, 700) + (40 if word else 0)
+
+
 def fuzzy_bots(query, bots):
     if not query:
         return list(bots)
@@ -3048,7 +3143,7 @@ def fuzzy_bots(query, bots):
             scores.append(fuzzy_score(query, title))
         preview = ((bot.get("activity") or {}).get("preview")) or ""
         if preview:
-            scores.append(fuzzy_score(query, preview))
+            scores.append(preview_score(query, preview))
         best = max((score for score in scores if score is not None), default=None)
         if best is not None:
             ranked.append((-best, index, bot))
@@ -3161,9 +3256,10 @@ def pick(stdscr, bots, refresh=None):
             if not shown and body_h:
                 empty = "  loading bots…" if loader and not bots else "  no match"
                 put(stdscr, 2, 1, clip(empty, max(width - 2, 0)), ATTR["dim"])
+            columns = list_columns(shown, width)
             for index, bot in enumerate(shown[top : top + body_h]):
                 actual = top + index
-                paint_spans(stdscr, 2 + index, 1, picker_spans(bot, actual == selected, width))
+                paint_spans(stdscr, 2 + index, 1, picker_spans(bot, actual == selected, width, columns))
             if footer:
                 if note:
                     spans = [(clip(note, max(width - 2, 0)), "red")]
@@ -3243,11 +3339,14 @@ def start_chat(target):
 
 
 def leave_chat(chat, final):
+    # Clear the bot under its own app name, then report the list as gbot-tui.
+    # Herdr keeps the last app until a new report arrives.
     emit("clear", chat.title)
     global APP
     APP = "gbot-tui"
     TAB.restore()
     if not final:
+        emit("idle", LIST_TITLE)
         window_title(LIST_TITLE)
 
     def release():
