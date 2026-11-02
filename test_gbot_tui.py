@@ -1861,6 +1861,35 @@ class OverviewTests(unittest.TestCase):
         # The same partial, not yet on screen, is a new message.
         self.assertEqual(gbot_tui.judge_activity(entries, "m2", "m1")["state"], "unread")
 
+    def test_is_streaming_on_the_latest_entry_is_running(self):
+        entries = [
+            {"id": "m1", "role": "user", "text": "go"},
+            {"id": "m2", "role": "assistant", "text": "partial", "isStreaming": True},
+        ]
+        snap = gbot_tui.judge_activity(entries, "m2", "m2")
+        self.assertEqual(snap["state"], "working")
+        self.assertEqual(snap["unread"], 0)
+        self.assertEqual(gbot_tui.status_label(snap["state"], snap["unread"]), "running")
+        # A partial you have not opened is still unread, not a second running row.
+        self.assertEqual(gbot_tui.judge_activity(entries, "m2", "m1")["state"], "unread")
+        finished = [
+            {"id": "m1", "role": "user", "text": "go"},
+            {"id": "m2", "role": "assistant", "text": "partial", "isStreaming": False},
+        ]
+        idle = gbot_tui.judge_activity(finished, "m2", "m2")
+        self.assertEqual(idle["state"], "idle")
+        text = gbot_tui.format_overview(
+            [
+                {"name": "Kit", "activity": snap},
+                {"name": "Quiet", "activity": idle},
+            ]
+        )
+        kit = next(line for line in text.splitlines() if "Kit" in line)
+        quiet = next(line for line in text.splitlines() if "Quiet" in line)
+        self.assertTrue(kit.startswith("running"))
+        self.assertTrue(quiet.startswith("idle"))
+        self.assertIn("1 running", text.splitlines()[0])
+
     def test_a_seen_id_older_than_this_tail_counts_the_tail(self):
         entries = [{"id": "m9", "role": "assistant", "text": "later"}]
         snap = gbot_tui.judge_activity(entries, "m9", "m1")

@@ -816,12 +816,21 @@ def awaiting_reply(entries):
 
 
 def entry_in_progress(entries):
+    """True when the latest entry is still being written.
+
+    The gateway sets `isStreaming` on that entry. `streaming` and `inProgress`
+    are older names for the same flag.
+    """
     if not entries:
         return False
     last = entries[-1]
     if last.get("local"):
         return False
-    if last.get("streaming") is True or last.get("inProgress") is True:
+    if (
+        last.get("isStreaming") is True
+        or last.get("streaming") is True
+        or last.get("inProgress") is True
+    ):
         return True
     status = last.get("status")
     if isinstance(status, str) and status.lower() in PROGRESS_STATES:
