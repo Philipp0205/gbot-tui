@@ -323,7 +323,7 @@ class LookTests(unittest.TestCase):
             40,
         )
         self.assertEqual(spans[0], ("→ ", "bold"))
-        self.assertEqual(spans[1], ("● ", "violet"))
+        self.assertEqual(spans[1], ("● ", "bot:violet"))
         self.assertEqual(spans[2], ("Outfitly", "bold"))
         self.assertEqual(spans[3], ("  ·  ", "dim"))
         self.assertEqual(spans[4], ("wardrobe", "dim"))
@@ -396,7 +396,7 @@ class LookTests(unittest.TestCase):
         ]
         first = chat.begin_decision("accept")
         self.assertEqual(first, ("Researcher", "card", "ask", "accept"))
-        texts = [text for kind, text in gbot_tui.transcript_rows(chat.messages, 40) if kind == "card"]
+        texts = [text for kind, text in gbot_tui.transcript_rows(chat.messages, 40) if kind == "card-ok"]
         self.assertEqual(texts[0], "Approved")
         self.assertIn("npm publish", texts)
         self.assertIsNone(gbot_tui.latest_decision(chat.messages, chat.answered))
@@ -417,7 +417,7 @@ class LookTests(unittest.TestCase):
         ]
         declined.begin_decision("decline")
         rows = gbot_tui.transcript_rows(declined.messages, 40)
-        self.assertEqual(rows, [("card", "Declined")])
+        self.assertEqual(rows, [("card-no", "Declined")])
 
     def test_a_failed_decision_can_be_retried(self):
         chat = gbot_tui.Chat("Researcher")
@@ -490,7 +490,7 @@ class LookTests(unittest.TestCase):
         )
         chat.ingest(stale)
         self.assertEqual(len(chat.messages), 1)
-        texts = [text for kind, text in gbot_tui.transcript_rows(chat.messages, 40) if kind == "card"]
+        texts = [text for kind, text in gbot_tui.transcript_rows(chat.messages, 40) if kind == "card-ok"]
         self.assertEqual(texts[0], "Approved")
         self.assertIsNone(chat.begin_decision("decline"))
         fresh = gbot_tui.parse_thread(
@@ -517,7 +517,7 @@ class LookTests(unittest.TestCase):
         chat.replacing = True
         chat.ingest(fresh)
         self.assertEqual(len(chat.messages), 1)
-        texts = [text for kind, text in gbot_tui.transcript_rows(chat.messages, 40) if kind == "card"]
+        texts = [text for kind, text in gbot_tui.transcript_rows(chat.messages, 40) if kind == "card-ok"]
         self.assertEqual(texts[0], "Approved")
 
     def test_an_updated_entry_replaces_the_same_id(self):
@@ -558,6 +558,9 @@ class LookTests(unittest.TestCase):
             self.assertIs(gbot_tui.span_attr("bot:yellow"), sentinel)
             self.assertIs(gbot_tui.span_attr("red"), warn)
             self.assertIs(gbot_tui.span_attr("bold"), gbot_tui.ATTR["bold"])
+            self.assertIs(gbot_tui.dot_attr("red"), gbot_tui.span_attr("bot:red"))
+            self.assertIs(gbot_tui.dot_attr("red"), sentinel)
+            self.assertIsNot(gbot_tui.dot_attr("red"), gbot_tui.avatar_attr("red"))
         finally:
             gbot_tui.TEXT_ATTR.clear()
             gbot_tui.TEXT_ATTR.update(saved_text)
@@ -599,6 +602,99 @@ class LookTests(unittest.TestCase):
         self.assertEqual(blocked[0], ("Pending decision", "yellow"))
         self.assertIn("approve", blocked[1][0])
         self.assertIn("decline", blocked[1][0])
+        failed = gbot_tui.footer_spans("blocked", "gateway down", decide=True)
+        self.assertEqual(failed[0], ("gateway down", "red"))
+        self.assertIn("approve", failed[1][0])
+        self.assertIn("decline", failed[1][0])
+        narrow = gbot_tui.footer_spans(
+            "blocked",
+            "the approval gateway rejected this decision because the card changed",
+            decide=True,
+            width=58,
+        )
+        self.assertIn("approve", narrow[-1][0])
+        self.assertLessEqual(sum(len(text) for text, _style in narrow), 56)
+
+    def test_decided_cards_leave_the_warning_color(self):
+        pending = {
+            "kind": "send-message",
+            "message": {"type": "auto-review-approval", "approval": {"status": "pending"}},
+        }
+        approved = {
+            "kind": "send-message",
+            "message": {"type": "auto-review-approval", "approval": {"status": "approved"}},
+        }
+        declined = {
+            "kind": "send-message",
+            "message": {"type": "local-tool-permission", "ask": {"status": "declined"}},
+        }
+        self.assertEqual(gbot_tui.card_row_kind(pending), "card")
+        self.assertEqual(gbot_tui.card_row_kind(approved), "card-ok")
+        self.assertEqual(gbot_tui.card_row_kind(declined), "card-no")
+        self.assertEqual(gbot_tui.CARD_STYLE["card"], "yellow")
+        self.assertEqual(gbot_tui.CARD_STYLE["card-ok"], "green")
+        self.assertEqual(gbot_tui.CARD_STYLE["card-no"], "gray")
+        self.assertNotEqual(gbot_tui.ATTR["green"], gbot_tui.ATTR["yellow"])
+
+    def test_y_types_unless_the_card_can_be_answered(self):
+        chat = gbot_tui.Chat("Researcher")
+        chat.phase = "blocked"
+        chat.messages = [
+            {
+                "kind": "send-message",
+                "message": {
+                    "type": "auto-review-approval",
+                    "approval": {"status": "pending"},
+                },
+            }
+        ]
+        self.assertEqual(gbot_tui.composer_key(chat, "y"), ("type", "y"))
+        self.assertEqual(gbot_tui.composer_key(chat, "n"), ("type", "n"))
+        chat.messages[0]["id"] = "card"
+        chat.messages[0]["message"]["approval"]["requestId"] = "ask"
+        self.assertEqual(gbot_tui.composer_key(chat, "y"), ("decide", "accept"))
+        self.assertEqual(gbot_tui.composer_key(chat, "n"), ("decide", "decline"))
+        self.assertEqual(gbot_tui.composer_key(chat, "Y"), ("type", "Y"))
+        self.assertEqual(gbot_tui.composer_key(chat, "N"), ("type", "N"))
+        self.assertEqual(gbot_tui.composer_key(chat, "\x19"), ("type", "y"))
+        self.assertEqual(gbot_tui.composer_key(chat, "\x0e"), ("type", "n"))
+        chat.typed = "a"
+        self.assertEqual(gbot_tui.composer_key(chat, "y"), ("type", "y"))
+        chat.typed = ""
+        chat.deciding = True
+        self.assertEqual(gbot_tui.composer_key(chat, "n"), ("ignore", ""))
+
+    def test_a_blank_line_sits_under_the_header(self):
+        class Screen:
+            def __init__(self):
+                self.rows = {}
+
+            def getmaxyx(self):
+                return (24, 58)
+
+            def erase(self):
+                self.rows.clear()
+
+            def addnstr(self, y, x, text, n, attr=0):
+                self.rows.setdefault(y, []).append(text[:n])
+
+            def move(self, y, x):
+                pass
+
+            def refresh(self):
+                pass
+
+        chat = gbot_tui.Chat("Chef")
+        chat.label = "what to cook"
+        chat.messages = [{"role": "user", "text": "hi"}]
+        screen = Screen()
+        gbot_tui.draw(screen, chat)
+        self.assertTrue(any("what to cook" in text for text in screen.rows.get(1, [])))
+        self.assertNotIn(2, screen.rows)
+        self.assertTrue(any("hi" in text for text in screen.rows.get(3, [])))
+        self.assertEqual(gbot_tui.header_gap(2, "what to cook", 10), 1)
+        self.assertEqual(gbot_tui.header_gap(2, "", 10), 0)
+        self.assertEqual(gbot_tui.header_gap(0, "tag", 10), 0)
 
     def test_pick_restores_blocking_input(self):
         class Screen:

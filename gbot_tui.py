@@ -173,6 +173,18 @@ def card_heading(status):
     return folded.replace("-", " ").capitalize()
 
 
+def card_row_kind(entry):
+    """Pending stays a warning. A finished card uses a calmer row kind."""
+    heading = card_heading((message_card(entry) or {}).get("status"))
+    if heading == "Approved":
+        return "card-ok"
+    if heading == "Needs approval":
+        return "card"
+    if heading:
+        return "card-no"
+    return "card"
+
+
 def set_card_status(entry, status):
     card = message_card(entry)
     if card is None:
@@ -1211,6 +1223,11 @@ def bot_text_attr(name):
     return avatar_attr(name)
 
 
+def dot_attr(name):
+    """The bot mark in the list and in the chat. One lightened color for both."""
+    return bot_text_attr(name)
+
+
 def bubble_column(width, text):
     """Right edge of a user bubble, inset one column, as in the desktop chat."""
     shown = " " + text + " "
@@ -1254,6 +1271,19 @@ def layout(height, text_lines=1):
         composer, footer = 0, 0
     body = max(height - header - composer - footer, 0)
     return header, body, composer, footer
+
+
+def header_gap(header, label, body_h):
+    """Blank row between the header text and the first message.
+
+    A two-line header with no tagline already leaves that second row empty.
+    A one-row body keeps the message instead of spending its only line on the gap.
+    """
+    if header <= 0 or body_h <= 1:
+        return 0
+    if header > 1 and not label:
+        return 0
+    return 1
 
 
 def visible_rows(chat, width):
@@ -1312,8 +1342,9 @@ def transcript_rows(entries, width):
         if lines:
             if text:
                 rows.append(("gap", ""))
+            kind = card_row_kind(entry)
             for line in lines:
-                rows.append(("card", line))
+                rows.append((kind, line))
     return rows
 
 
@@ -1331,17 +1362,35 @@ def composer_lines(width, typed):
     return "┌" + rule + "┐", "│" + body + "│", "└" + rule + "┘"
 
 
-def footer_spans(phase, error, decide=False):
+DECIDE_HINT = "  y approve · n decline · ctrl-y/n types"
+
+
+def footer_spans(phase, error, decide=False, width=0):
+    if phase == "blocked":
+        # The error used to replace this line, so a failed respond hid y/n
+        # while the card was pending again.
+        spans = [(error, "red")] if error else [("Pending decision", "yellow")]
+        if decide:
+            spans.append((DECIDE_HINT, "dim"))
+        return fit_spans(spans, max(width - 2, 0) if width else 0)
     if error:
         return [(error, "red")]
-    if phase == "blocked":
-        spans = [("Pending decision", "yellow")]
-        if decide:
-            spans.append(("  y approve · n decline", "dim"))
-        return spans
     if phase == "working":
         return [("Generating", "bold"), ("  —  pgup scroll", "dim")]
     return [("enter send · esc bots · ctrl-c quit · pgup scroll", "dim")]
+
+
+def fit_spans(spans, room):
+    """Keep the last span, and clip the first, when the footer is one short line."""
+    if room <= 0 or sum(len(text) for text, _style in spans) <= room:
+        return spans
+    if len(spans) == 1:
+        return [(clip(spans[0][0], room), spans[0][1])]
+    tail = spans[-1]
+    head_room = room - len(tail[0])
+    if head_room < 4:
+        return [(clip(tail[0], room), tail[1])]
+    return [(clip(spans[0][0], head_room), spans[0][1]), tail]
 
 
 # -1 keeps the terminal background. A filled curses color is the block this CLI does not use.
@@ -1352,7 +1401,12 @@ ATTR = {
     "user": curses.A_BOLD,
     "yellow": curses.A_BOLD,
     "red": curses.A_BOLD,
+    # Calmer than the pending warning. Theme replaces these with real colors.
+    "green": curses.A_DIM,
+    "gray": curses.A_DIM,
 }
+
+CARD_STYLE = {"card": "yellow", "card-ok": "green", "card-no": "gray"}
 
 
 def apply_theme(stdscr):
@@ -1387,6 +1441,16 @@ def apply_theme(stdscr):
         curses.init_pair(4, curses.COLOR_RED, -1)
         ATTR["yellow"] = curses.color_pair(3)
         ATTR["red"] = curses.color_pair(4)
+        if curses.COLORS >= 256:
+            curses.init_pair(5, 108, -1)
+            curses.init_pair(6, 245, -1)
+            ATTR["green"] = curses.color_pair(5)
+            ATTR["gray"] = curses.color_pair(6)
+        else:
+            curses.init_pair(5, curses.COLOR_GREEN, -1)
+            curses.init_pair(6, curses.COLOR_WHITE, -1)
+            ATTR["green"] = curses.color_pair(5)
+            ATTR["gray"] = curses.color_pair(6) | curses.A_DIM
     except curses.error:
         return
 
@@ -1446,32 +1510,34 @@ def draw(stdscr, chat):
     lines = draft_lines(chat.typed, width)
     header, body_h, composer_h, footer_h = layout(height, len(lines) or 1)
     color = getattr(chat, "avatar_color", "")
+    label = getattr(chat, "label", "")
     if header:
-        put(stdscr, 0, 1, "●", avatar_attr(color))
+        put(stdscr, 0, 1, "●", dot_attr(color))
         put(stdscr, 0, 3, clip(chat.title, max(width - 4, 0)), ATTR["bold"])
-        label = getattr(chat, "label", "")
         if header > 1 and label:
             put(stdscr, 1, 3, clip(label, max(width - 4, 0)), ATTR["dim"])
+    gap = header_gap(header, label, body_h)
+    room = max(body_h - gap, 0)
     rows = visible_rows(chat, width)
     if chat.follow:
-        chat.scroll = max(len(rows) - body_h, 0)
-    start = min(chat.scroll, max(len(rows) - body_h, 0))
-    for row in range(body_h):
+        chat.scroll = max(len(rows) - room, 0)
+    start = min(chat.scroll, max(len(rows) - room, 0))
+    for row in range(room):
         index = start + row
         if index >= len(rows):
             continue
         kind, text = rows[index]
-        y = header + row
+        y = header + gap + row
         previous = rows[index - 1][0] if index else ""
         if kind == "user":
             shown = " " + text + " "
             put(stdscr, y, bubble_column(width, text), shown, ATTR["user"])
         elif kind == "text":
             if previous != "text":
-                put(stdscr, y, 1, "●", avatar_attr(color))
+                put(stdscr, y, 1, "●", dot_attr(color))
             put(stdscr, y, 3, text, bot_text_attr(color))
-        elif kind == "card":
-            put(stdscr, y, 1, clip(text, max(width - 2, 0)), ATTR["yellow"])
+        elif kind in CARD_STYLE:
+            put(stdscr, y, 1, clip(text, max(width - 2, 0)), ATTR[CARD_STYLE[kind]])
     composer_at = header + body_h
     cursor = None
     if composer_h >= 3:
@@ -1497,7 +1563,12 @@ def draw(stdscr, chat):
         cursor = (composer_at, min(column, max(width - 2, 0)))
     if footer_h:
         decide = bool(latest_decision(chat.messages, chat.answered)) and not chat.deciding
-        paint_spans(stdscr, height - 1, 1, footer_spans(chat.phase, chat.error, decide=decide))
+        paint_spans(
+            stdscr,
+            height - 1,
+            1,
+            footer_spans(chat.phase, chat.error, decide=decide, width=width),
+        )
     # The footer write leaves the cursor on "scroll". Put it back in the box.
     if cursor:
         try:
@@ -1512,6 +1583,33 @@ def place_cursor(visible):
         curses.curs_set(1 if visible else 0)
     except curses.error:
         pass
+
+
+def composer_key(chat, key):
+    """What y or n does in the composer.
+
+    Lowercase y and n answer a card only when it has both ids and the box is
+    empty. Shift-Y and Shift-N are text, and ctrl-y / ctrl-n insert the
+    lowercase letter, so a message can still start with y or n. A card that
+    cannot be answered does not swallow the key.
+    """
+    if key == "\x19":
+        return ("type", "y")
+    if key == "\x0e":
+        return ("type", "n")
+    if key not in ("y", "Y", "n", "N"):
+        return None
+    if (
+        not chat.typed
+        and not chat.deciding
+        and chat.phase == "blocked"
+        and key in ("y", "n")
+        and latest_decision(chat.messages, chat.answered)
+    ):
+        return ("decide", "accept" if key == "y" else "decline")
+    if chat.deciding and not chat.typed and key in ("y", "n"):
+        return ("ignore", "")
+    return ("type", key)
 
 
 def fast_escape():
@@ -1612,9 +1710,10 @@ def chat_loop(stdscr, chat):
             if key == curses.KEY_NPAGE:
                 chat.scroll += max(curses.LINES - 4, 1)
                 height, width = stdscr.getmaxyx()
-                _header, body_h, _composer, _footer = layout(height, len(draft_lines(chat.typed, width)) or 1)
+                page_header, body_h, _composer, _footer = layout(height, len(draft_lines(chat.typed, width)) or 1)
+                room = max(body_h - header_gap(page_header, chat.label, body_h), 0)
                 rows = visible_rows(chat, width)
-                if chat.scroll >= max(len(rows) - body_h, 0):
+                if chat.scroll >= max(len(rows) - room, 0):
                     chat.follow = True
                 continue
             if key in ("\n", "\r", curses.KEY_ENTER):
@@ -1627,18 +1726,21 @@ def chat_loop(stdscr, chat):
                 jobs.put(("send", (chat.target, text)))
                 waiting += 1
                 continue
-            if key in ("y", "Y", "n", "N") and not chat.typed and (
-                chat.phase == "blocked" or chat.deciding
-            ):
-                if chat.deciding:
+            handled = composer_key(chat, key)
+            if handled is not None:
+                action, value = handled
+                if action == "ignore":
                     continue
-                decision = "accept" if key in ("y", "Y") else "decline"
-                args = chat.begin_decision(decision)
-                if not args:
+                if action == "decide":
+                    args = chat.begin_decision(value)
+                    if not args:
+                        chat.typed += "y" if value == "accept" else "n"
+                        continue
+                    chat.error = ""
+                    jobs.put(("decide", args))
+                    waiting += 1
                     continue
-                chat.error = ""
-                jobs.put(("decide", args))
-                waiting += 1
+                chat.typed += value
                 continue
             if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
                 chat.typed = chat.typed[:-1]
@@ -1686,8 +1788,9 @@ def picker_spans(bot, selected, width):
     lead_style = "bold" if selected else "dim"
     color = (bot.get("avatarColor") or bot.get("avatar_color") or "").lower()
     room = max(width - 7, 1)
-    # red and yellow are also warning styles. Ask for the avatar color by name.
-    mark_style = "bot:" + color if color in AVATAR_COLORS and color in ATTR else (color or "default")
+    # The same lightened color the chat mark uses, including red and yellow,
+    # which are also the names of the warning styles.
+    mark_style = "bot:" + color if color in AVATAR_COLORS else (color or "default")
     mark = ("● ", mark_style)
     if not title:
         return [(lead, lead_style), mark, (clip(name, room), name_style)]
