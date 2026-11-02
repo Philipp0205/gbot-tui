@@ -1,6 +1,9 @@
 import base64
 import os
+import signal
 import tempfile
+import termios
+import time
 import unittest
 from pathlib import Path
 
@@ -205,13 +208,18 @@ class AvatarTests(unittest.TestCase):
                     root=tmp,
                     src=tmp,
                 )
-                self.assertEqual(gbot_tui.APP, "gbot-abc")
+                self.assertEqual(gbot_tui.APP, "Outfitly")
                 report = gbot_tui.osc_report("idle", "Outfitly")
-                self.assertIn("app=gbot-abc", report)
+                self.assertIn("app=Outfitly", report)
+                self.assertNotIn("app=gbot-abc", report)
+                self.assertLessEqual(len(gbot_tui.APP.encode()), 32)
             finally:
                 gbot_tui.APP = previous
             programs = __import__("json").loads((root / "programs.json").read_text())
             self.assertEqual(programs["programs"]["gbot-abc"]["icon"], made["gbot-abc"]["icon"])
+            self.assertEqual(programs["programs"]["gbot-abc"]["name"], "Outfitly")
+            self.assertIn("Outfitly", programs["programs"]["gbot-abc"]["match"])
+            self.assertIn("gbot-abc", programs["programs"]["gbot-abc"]["match"])
             long_id = "ea566f99-aded-40c2-99fc-60e5477d2a61"
             long_made = gbot_tui.install_avatars(
                 [{"id": long_id, "name": "Researcher", "avatarShape": "heart", "avatarColor": "red"}],
@@ -240,10 +248,11 @@ class AvatarTests(unittest.TestCase):
                     root=tmp,
                     src=tmp,
                 )
-                self.assertEqual(gbot_tui.APP, compact)
+                self.assertEqual(gbot_tui.APP, "Researcher")
                 report = gbot_tui.osc_report("working", "Researcher")
-                self.assertIn(f"app={compact}", report)
-                self.assertLessEqual(len(compact), 32)
+                self.assertIn("app=Researcher", report)
+                self.assertLessEqual(len(gbot_tui.APP.encode()), 32)
+                self.assertIn("Researcher", programs["programs"][compact]["match"])
             finally:
                 gbot_tui.APP = previous
 
@@ -1008,10 +1017,13 @@ class SpeedTests(unittest.TestCase):
 
 class ThemeTests(unittest.TestCase):
     def setUp(self):
-        self.saved = {key: os.environ.get(key) for key in ("COLORFGBG", gbot_tui.THEME_ENV)}
+        self.saved = {
+            key: os.environ.get(key) for key in ("COLORFGBG", gbot_tui.THEME_ENV, "HERDR_ENV", "HERDR_PANE_ID")
+        }
         for key in self.saved:
             os.environ.pop(key, None)
         self.probed = gbot_tui.PROBED["bg"]
+        self.theme = dict(gbot_tui.THEME)
 
     def tearDown(self):
         for key, value in self.saved.items():
@@ -1020,6 +1032,8 @@ class ThemeTests(unittest.TestCase):
             else:
                 os.environ[key] = value
         gbot_tui.PROBED["bg"] = self.probed
+        gbot_tui.THEME.clear()
+        gbot_tui.THEME.update(self.theme)
 
     def test_osc11_replies(self):
         parse = gbot_tui.parse_osc11
@@ -1133,6 +1147,89 @@ class ThemeTests(unittest.TestCase):
         self.assertIsNone(got)
         self.assertLess(elapsed, 0.6)
 
+    def test_herdr_default_dark_is_replaced_when_the_real_background_arrives(self):
+        fold = gbot_tui.fold_sample
+        color, settled = fold(None, "#282C34", 1)
+        self.assertEqual((color, settled), ("#282C34", False))
+        color, settled = fold(color, "#282C34", 4)
+        self.assertFalse(settled)
+        color, settled = fold(color, "#FFFFFF", 5)
+        self.assertEqual((color, settled), ("#FFFFFF", True))
+        # Five default-dark samples, and it keeps that dark.
+        color, settled = "#282C34", False
+        for attempt in range(1, 6):
+            color, settled = fold(color, "#282C34", attempt)
+        self.assertEqual((color, settled), ("#282C34", True))
+        # A resize keeps the real light color through one stale default-dark reply.
+        held, settled = fold("#FFFFFF", "#282C34", 1, follow=True)
+        self.assertEqual((held, settled), ("#FFFFFF", False))
+        held, settled = fold("#FFFFFF", "#111111", 1, follow=True)
+        self.assertEqual((held, settled), ("#111111", True))
+        # No answer does not invent the default dark.
+        self.assertEqual(fold("#FFFFFF", None, 1, follow=True), ("#FFFFFF", False))
+
+    def test_herdr_reprobes_after_the_first_paint(self):
+        os.environ["HERDR_ENV"] = "1"
+        calls = []
+
+        def fake(fd=None, timeout=0.2):
+            calls.append(timeout)
+            return "#282C34" if len(calls) == 1 else "#FFFFFF"
+
+        original = gbot_tui.probe_background
+        gbot_tui.probe_background = fake
+        try:
+            started = time.monotonic()
+            gbot_tui.detect_theme()
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(calls, [0.2])
+            self.assertTrue(gbot_tui.dark_terminal())
+            self.assertTrue(gbot_tui.THEME["watch"])
+            gbot_tui.THEME["due"] = 0
+            applied = []
+            self.assertTrue(gbot_tui.maybe_retheme(lambda: applied.append("theme")))
+            self.assertEqual(applied, ["theme"])
+            self.assertEqual(gbot_tui.PROBED["bg"], "#FFFFFF")
+            self.assertFalse(gbot_tui.dark_terminal())
+            self.assertFalse(gbot_tui.THEME["watch"])
+        finally:
+            gbot_tui.probe_background = original
+
+    def test_outside_herdr_a_dark_reply_is_final(self):
+        calls = []
+
+        def fake(fd=None, timeout=0.2):
+            calls.append(timeout)
+            return "#282C34"
+
+        original = gbot_tui.probe_background
+        gbot_tui.probe_background = fake
+        try:
+            gbot_tui.detect_theme()
+            self.assertEqual(calls, [0.2])
+            self.assertFalse(gbot_tui.THEME["watch"])
+            self.assertFalse(gbot_tui.maybe_retheme(lambda: self.fail("rethemed")))
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(gbot_tui.dark_terminal())
+        finally:
+            gbot_tui.probe_background = original
+
+    def test_theme_override_wins_over_herdr_default_dark(self):
+        os.environ["HERDR_ENV"] = "1"
+        os.environ[gbot_tui.THEME_ENV] = "light"
+        gbot_tui.PROBED["bg"] = "#282C34"
+        gbot_tui.THEME.update(watch=True, tries=1, due=0, follow=False)
+        original = gbot_tui.probe_background
+        gbot_tui.probe_background = lambda *a, **k: self.fail("probed")
+        try:
+            gbot_tui.detect_theme()
+            self.assertFalse(gbot_tui.THEME["watch"])
+            self.assertFalse(gbot_tui.maybe_retheme(lambda: self.fail("rethemed")))
+            gbot_tui.note_appearance()
+            self.assertFalse(gbot_tui.dark_terminal())
+        finally:
+            gbot_tui.probe_background = original
+
     def test_env_override_skips_the_probe(self):
         os.environ[gbot_tui.THEME_ENV] = "light"
         gbot_tui.PROBED["bg"] = None
@@ -1143,6 +1240,108 @@ class ThemeTests(unittest.TestCase):
         finally:
             gbot_tui.probe_background = original
         self.assertFalse(gbot_tui.dark_terminal())
+
+
+class NoticeTests(unittest.TestCase):
+    def test_notifications_use_the_bots_name(self):
+        self.assertEqual(gbot_tui.notice_name("Cloud"), "Cloud")
+        self.assertEqual(gbot_tui.display_name("  Cloud\nbot "), "Cloud bot")
+        self.assertNotIn(":", gbot_tui.notice_name("a:b"))
+        clipped = gbot_tui.notice_name("C" * 40)
+        self.assertLessEqual(len(clipped.encode()), 32)
+        self.assertTrue(clipped.startswith("C"))
+        previous = gbot_tui.APP
+        try:
+            gbot_tui.bind_app("Cloud", "b3-cloud")
+            self.assertEqual(gbot_tui.APP, "Cloud")
+            report = gbot_tui.osc_report("blocked", "Cloud", "permission")
+            self.assertIn("app=Cloud", report)
+            self.assertNotIn("gbot-b3-cloud", report)
+            self.assertLessEqual(len(gbot_tui.APP.encode()), 32)
+        finally:
+            gbot_tui.APP = previous
+        command = gbot_tui.report_command("herdr", "p1", "blocked", "Cloud", "s", 1, "Cloud")
+        self.assertEqual(command[command.index("--agent") + 1], "Cloud")
+        release = gbot_tui.release_command("herdr", "p1", "Cloud", 2)
+        self.assertEqual(release[release.index("--agent") + 1], "Cloud")
+
+    def test_a_late_icon_does_not_replace_another_bots_name(self):
+        previous_app = gbot_tui.APP
+        previous_install = gbot_tui.install_avatars_later
+
+        def immediate(bots, done=None):
+            if done:
+                done({"gbot-b4-outfitly": {}})
+            return None
+
+        gbot_tui.install_avatars_later = immediate
+        gbot_tui.APP = "Chef"
+        try:
+            gbot_tui.show_avatar_later({"id": "b4-outfitly", "name": "Outfitly"})
+            self.assertEqual(gbot_tui.APP, "Chef")
+            gbot_tui.APP = "gbot-tui"
+            gbot_tui.show_avatar_later({"id": "b4-outfitly", "name": "Outfitly"})
+            self.assertEqual(gbot_tui.APP, "Outfitly")
+        finally:
+            gbot_tui.APP = previous_app
+            gbot_tui.install_avatars_later = previous_install
+
+
+class QuitTests(unittest.TestCase):
+    def tearDown(self):
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.signal(signal.SIGHUP, signal.SIG_DFL)
+        gbot_tui.EXITED["done"] = False
+        gbot_tui.TITLE.update(pushed=False, popped=False)
+
+    def test_ctrl_c_quits_like_ctrl_d_and_sigint_is_restored(self):
+        chat = gbot_tui.Chat("Cloud")
+        self.assertEqual(gbot_tui.chat_key(chat, "\x03", None), "quit")
+        self.assertEqual(gbot_tui.chat_key(chat, "\x04", None), "quit")
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        gbot_tui.enable_ctrl_c()
+        self.assertIs(signal.getsignal(signal.SIGINT), signal.default_int_handler)
+        self.assertIs(signal.getsignal(signal.SIGTERM), gbot_tui._stop)
+        master, slave = os.openpty()
+        try:
+            attr = termios.tcgetattr(slave)
+            attr[3] |= termios.ISIG
+            termios.tcsetattr(slave, termios.TCSANOW, attr)
+            self.assertTrue(gbot_tui.accept_ctrl_c(slave))
+            self.assertFalse(termios.tcgetattr(slave)[3] & termios.ISIG)
+        finally:
+            os.close(slave)
+            os.close(master)
+
+    def test_shutdown_restores_the_tab_and_pops_the_title_once(self):
+        renames = []
+        pops = []
+        clears = []
+        title = gbot_tui.TabTitle(
+            find=lambda: ({"labels": {"herdr.tab": "t2"}}, True),
+            spaces=lambda: TabTests.SPACES,
+            rename=lambda _info, name: renames.append(name),
+        )
+        saved = gbot_tui.TAB, gbot_tui.write_tty, gbot_tui.emit, gbot_tui.APP
+        gbot_tui.TAB = title
+        gbot_tui.write_tty = lambda data: pops.append(data)
+        gbot_tui.emit = lambda state, name, kind=None: clears.append(state)
+        gbot_tui.EXITED["done"] = False
+        gbot_tui.TITLE.update(pushed=True, popped=False)
+        try:
+            title.show("Chef")
+            self.assertTrue(title.flush(2))
+            gbot_tui.shutdown()
+            gbot_tui.shutdown()
+            self.assertEqual(gbot_tui.APP, "gbot-tui")
+        finally:
+            gbot_tui.TAB, gbot_tui.write_tty, gbot_tui.emit, gbot_tui.APP = saved
+            gbot_tui.EXITED["done"] = False
+            gbot_tui.TITLE.update(pushed=False, popped=False)
+        self.assertEqual(renames, ["Chef", "Work"])
+        self.assertEqual(clears, ["clear"])
+        self.assertEqual(pops, [gbot_tui.POP_TITLE])
 
 
 class TabTests(unittest.TestCase):
@@ -1200,7 +1399,7 @@ class TabTests(unittest.TestCase):
 
     def test_leaving_a_chat_restores_the_tab_and_the_list_title(self):
         calls = []
-        saved = gbot_tui.TAB, gbot_tui.emit, gbot_tui.window_title, gbot_tui.silence_herdr
+        saved = gbot_tui.TAB, gbot_tui.emit, gbot_tui.window_title, gbot_tui.silence_herdr, gbot_tui.APP
         title, renames = self.tab("t2")
         gbot_tui.TAB = title
         gbot_tui.emit = lambda state, name, kind=None: calls.append(("emit", state))
@@ -1212,7 +1411,7 @@ class TabTests(unittest.TestCase):
             gbot_tui.leave_chat(chat, final=False)
             self.assertTrue(title.flush(2))
         finally:
-            gbot_tui.TAB, gbot_tui.emit, gbot_tui.window_title, gbot_tui.silence_herdr = saved
+            gbot_tui.TAB, gbot_tui.emit, gbot_tui.window_title, gbot_tui.silence_herdr, gbot_tui.APP = saved
         self.assertEqual(renames, ["Outfitly", "Work"])
         self.assertIn(("title", "gbot"), calls)
 

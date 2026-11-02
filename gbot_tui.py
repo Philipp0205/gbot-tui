@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Chat with one Grok Bot. Inside Herdr, the pane shows up in the agents list."""
 
+import atexit
 import base64
 import curses
 import hashlib
@@ -10,6 +11,7 @@ import os
 import queue
 import re
 import select
+import signal
 import subprocess
 import sys
 import termios
@@ -303,7 +305,7 @@ def report_command(herdr, pane, phase, label, session_id, seq, resume):
         "--source",
         SOURCE,
         "--agent",
-        label,
+        display_name(label) or label,
         "--state",
         herdr_state(phase),
         "--seq",
@@ -325,7 +327,7 @@ def release_command(herdr, pane, label, seq):
         "--source",
         SOURCE,
         "--agent",
-        label,
+        display_name(label) or label,
         "--seq",
         str(seq),
     ]
@@ -408,6 +410,34 @@ def program_key(bot_id):
         return key
     compact = "".join(ch for ch in safe if ch != "-")
     return ("gbot-" + compact)[:32]
+
+
+APP_LIMIT = 32
+
+
+def display_name(name):
+    """The bot's name as a person reads it, with control characters removed."""
+    return " ".join(str(name or "").replace("\x1b", " ").replace("\r", " ").replace("\n", " ").split())
+
+
+def notice_name(name):
+    """That name as an OSC 7501 app. Herdr shows this string in "Cloud needs you".
+
+    The app field is at most 32 bytes, and a colon would split the report.
+    """
+    text = display_name(str(name or "").replace(":", " ").replace("=", " "))
+    raw = text.encode()
+    if len(raw) <= APP_LIMIT:
+        return text
+    return raw[:APP_LIMIT].decode("utf-8", "ignore").rstrip()
+
+
+def bind_app(name, bot_id=""):
+    """Point Herdr's program report at the bot's name. The icon key is the fallback."""
+    global APP
+    label = notice_name(name) or program_key(bot_id) or ""
+    if label:
+        APP = label
 
 
 def program_ids(bot_id):
@@ -538,13 +568,14 @@ def install_avatars_later(bots, done=None):
 
 
 def show_avatar_later(bot):
-    """Set APP once the icon exists. The UI loop re-reports the pane when APP changes."""
+    """Keep the app name on the bot once its icon is on disk. The loop re-reports."""
+    name = bot.get("name") or ""
 
     def done(made):
-        global APP
         key = program_key(bot.get("id") or "")
-        if key in made:
-            APP = key
+        # A later chat, or the list after Esc, owns APP now. Leave it alone.
+        if key in made and APP in {"gbot-tui", key, notice_name(name)}:
+            bind_app(name, bot.get("id"))
 
     return install_avatars_later([bot], done)
 
@@ -751,17 +782,26 @@ def install_avatars(bots, root=None, src=None):
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with open(dest, "wb") as handle:
                 handle.write(png)
+        human = notice_name(bot.get("name") or "")
+
+        def aliases(slot):
+            found = []
+            for item in (human, slot):
+                if item and item not in found:
+                    found.append(item)
+            return found
+
         entry = {
-            "name": bot.get("name") or key,
+            "name": bot.get("name") or human or key,
             "icon": rel,
             "tint": False,
             "tile": "#111111",
             "color": avatar_color(color_name),
-            "match": [key],
+            "match": aliases(key),
         }
         made[key] = entry
         for slot in keys:
-            slot_entry = dict(entry, match=[slot])
+            slot_entry = dict(entry, match=aliases(slot))
             made[slot] = slot_entry
             if programs.get(slot) != slot_entry:
                 programs[slot] = slot_entry
@@ -776,11 +816,10 @@ def install_avatars(bots, root=None, src=None):
 
 
 def show_avatar(bot, root=None, src=None):
-    global APP
-    made = install_avatars([bot], root, src)
-    key = program_key(bot.get("id") or "")
-    if key in made:
-        APP = key
+    install_avatars([bot], root, src)
+    # The icon stays under the program key. Herdr's popup uses the app string
+    # itself ("gbot-b3-cloud needs you"), so the app is the bot's own name.
+    bind_app(bot.get("name"), bot.get("id"))
 
 
 def match_bot(query, names):
@@ -1210,6 +1249,7 @@ class Chat:
         if page["name"]:
             self.title = page["name"]
             self.resume = resume_arg(page["name"]) or resume_arg(page["id"]) or self.resume
+            bind_app(self.title)
         if page["id"]:
             self.session_id = page["id"]
         if page.get("avatar_shape"):
@@ -1506,11 +1546,97 @@ def probe_background(fd=None, timeout=0.2):
             os.close(fd)
 
 
+# Herdr paints #282C34 for about two seconds after a tab opens, then reports
+# the real background. A fresh light tab otherwise looks dark.
+HERDR_DEFAULT_BG = "#282C34"
+THEME_LIMIT = 5
+THEME_GAP = 0.5
+THEME = {"watch": False, "tries": 0, "due": 0.0, "follow": False}
+
+
+def herdr_session():
+    return os.environ.get("HERDR_ENV") == "1" or bool(os.environ.get("HERDR_PANE_ID"))
+
+
+def theme_override():
+    folded = (os.environ.get(THEME_ENV) or "").strip().lower()
+    return folded if folded in {"dark", "light"} else ""
+
+
+def placeholder_background(color):
+    return (color or "").upper() == HERDR_DEFAULT_BG
+
+
+def fold_sample(current, sample, attempt, limit=THEME_LIMIT, follow=False):
+    """One OSC 11 sample. (color, settled).
+
+    A Herdr default-dark sample is not the answer while attempts remain.
+    `follow` keeps a real color already seen, through a later default-dark
+    sample, so a resize does not flash the theme back to black.
+    """
+    got = (sample or "").upper() or None
+    held = (current or "").upper() or None
+    if got and got != HERDR_DEFAULT_BG:
+        return got, True
+    if got == HERDR_DEFAULT_BG:
+        if follow and held and held != HERDR_DEFAULT_BG:
+            return held, attempt >= limit
+        if attempt >= limit:
+            return HERDR_DEFAULT_BG, True
+        return held or HERDR_DEFAULT_BG, False
+    if attempt >= limit:
+        return held, True
+    return held, False
+
+
 def detect_theme():
-    """Probe once per run, unless GBOT_TUI_THEME already says light or dark."""
-    if (os.environ.get(THEME_ENV) or "").strip().lower() in {"dark", "light"}:
+    """Probe once before curses. Herdr's default dark is checked again after the first paint."""
+    if theme_override():
+        THEME["watch"] = False
         return
     PROBED["bg"] = probe_background()
+    if herdr_session() and placeholder_background(PROBED["bg"]):
+        THEME.update(watch=True, tries=1, due=time.monotonic() + THEME_GAP, follow=False)
+    else:
+        THEME.update(watch=False, tries=0, due=0.0, follow=not placeholder_background(PROBED["bg"]))
+
+
+def note_appearance():
+    """The window changed. Look again, unless GBOT_TUI_THEME already decided."""
+    if theme_override() or not herdr_session():
+        return
+    THEME["watch"] = True
+    THEME["due"] = 0
+    THEME["follow"] = not placeholder_background(PROBED["bg"])
+    THEME["tries"] = 0
+
+
+def theme_due_ms():
+    """How long the list may block before the next background check, or None."""
+    if theme_override() or not THEME["watch"]:
+        return None
+    return max(int((THEME["due"] - time.monotonic()) * 1000), 30)
+
+
+def maybe_retheme(apply=None):
+    """Take the next background sample when it is due. True when the theme changed."""
+    if theme_override() or not THEME["watch"] or time.monotonic() < THEME["due"]:
+        return False
+    THEME["tries"] += 1
+    sample = probe_background(timeout=0.15)
+    color, settled = fold_sample(PROBED["bg"], sample, THEME["tries"], follow=THEME["follow"])
+    before = (PROBED["bg"] or "").upper()
+    changed = bool(color) and color != before
+    if color:
+        PROBED["bg"] = color
+    THEME["watch"] = not settled
+    if settled:
+        THEME["follow"] = not placeholder_background(PROBED["bg"])
+    else:
+        THEME["due"] = time.monotonic() + THEME_GAP
+    if changed and apply:
+        apply()
+    return changed
 
 
 def background_hex():
@@ -2213,6 +2339,8 @@ def chat_loop(stdscr, chat):
                 else:
                     chat.ingest(payload, first=False)
                     next_poll = min(next_poll, time.monotonic() + chat.poll_delay())
+            if maybe_retheme(lambda: apply_theme(stdscr)):
+                dirty = True
             if chat.app_seen != APP:
                 chat.app_seen = APP
                 publish(chat.phase, chat.title, chat.session_id, chat.resume)
@@ -2245,6 +2373,10 @@ def chat_loop(stdscr, chat):
                 keys = read_keys(stdscr)
             for key in keys:
                 dirty = True
+                if key == curses.KEY_RESIZE:
+                    note_appearance()
+                    if maybe_retheme(lambda: apply_theme(stdscr)):
+                        dirty = True
                 result = chat_key(chat, key, stdscr)
                 if result == "quit":
                     return None
@@ -2425,9 +2557,24 @@ def pick(stdscr, bots, refresh=None):
                 spans = [("type to search · enter open · ctrl-c quit", "dim")]
             paint_spans(stdscr, height - 1, 1, spans)
         stdscr.refresh()
+        due = theme_due_ms()
+        if loader and due is not None:
+            stdscr.timeout(min(30, due))
+        elif loader:
+            stdscr.timeout(30)
+        elif due is not None:
+            stdscr.timeout(due)
+        else:
+            stdscr.timeout(-1)
         try:
             key = stdscr.get_wch()
         except curses.error:
+            if maybe_retheme(lambda: apply_theme(stdscr)):
+                pass
+            continue
+        if key == curses.KEY_RESIZE:
+            note_appearance()
+            maybe_retheme(lambda: apply_theme(stdscr))
             continue
         if key in ("\x03", "\x04"):
             return None
@@ -2458,7 +2605,10 @@ def start_chat(target):
     """A chat with the last thread already on screen. The real read is the loop's first job."""
     bot = ROSTER.get(target)
     if bot:
+        bind_app(bot.get("name") or target, bot.get("id"))
         show_avatar_later(bot)
+    else:
+        bind_app(target)
     chat = Chat(target)
     chat.show_cached(read_thread_cache(target))
     publish("idle", target, "", chat.resume)
@@ -2467,6 +2617,8 @@ def start_chat(target):
 
 def leave_chat(chat, final):
     emit("clear", chat.title)
+    global APP
+    APP = "gbot-tui"
     TAB.restore()
     if not final:
         window_title(LIST_TITLE)
@@ -2496,6 +2648,7 @@ def open_chat(target):
 
 def screens(stdscr, target):
     """The list and the chat share one curses session, so Esc and Enter do not flash the shell."""
+    accept_ctrl_c()
     first = True
     while True:
         if not target:
@@ -2554,8 +2707,79 @@ def complete_names():
     return 0 if names else 1
 
 
-def session(target):
+TITLE = {"pushed": False, "popped": False}
+EXITED = {"done": False}
+
+
+def push_session_title():
+    if TITLE["pushed"]:
+        return
     write_tty(PUSH_TITLE)
+    TITLE["pushed"] = True
+    TITLE["popped"] = False
+
+
+def pop_session_title():
+    if not TITLE["pushed"] or TITLE["popped"]:
+        return
+    TITLE["popped"] = True
+    write_tty(POP_TITLE)
+
+
+def shutdown():
+    """Clear the agent report, give the tab its name back, and pop the window title.
+
+    Quit, Ctrl-C, and a signal all come through here. A second call does nothing,
+    so the title stack is popped once.
+    """
+    if EXITED["done"]:
+        return
+    EXITED["done"] = True
+    global APP
+    try:
+        emit("clear", "")
+    except (OSError, ValueError):
+        pass
+    APP = "gbot-tui"
+    try:
+        TAB.restore()
+        # A rename still talking to herdr-app has to finish before this restore.
+        TAB.flush(10)
+    except (OSError, RuntimeError):
+        pass
+    pop_session_title()
+
+
+def _stop(signum, _frame):
+    shutdown()
+    raise SystemExit(128 + signum)
+
+
+def enable_ctrl_c():
+    """Herdr launches programs with SIGINT ignored, so Ctrl-C does not quit."""
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _stop)
+        except (OSError, ValueError):
+            pass
+
+
+def accept_ctrl_c(fd=None):
+    """Also deliver Ctrl-C as a key, the same quit as Ctrl-D."""
+    enable_ctrl_c()
+    try:
+        fd = sys.stdin.fileno() if fd is None else fd
+        attr = termios.tcgetattr(fd)
+        attr[3] &= ~termios.ISIG
+        termios.tcsetattr(fd, termios.TCSANOW, attr)
+    except (termios.error, OSError, ValueError, AttributeError):
+        return False
+    return True
+
+
+def session(target):
+    push_session_title()
     if not target:
         window_title(LIST_TITLE)
     try:
@@ -2566,9 +2790,7 @@ def session(target):
     except KeyboardInterrupt:
         return 130
     finally:
-        TAB.restore()
-        TAB.flush()
-        write_tty(POP_TITLE)
+        shutdown()
 
 
 def refresh_roster_later():
@@ -2630,6 +2852,8 @@ def main(argv):
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print("gbot-tui needs a terminal.", file=sys.stderr)
         return 1
+    enable_ctrl_c()
+    atexit.register(shutdown)
     detect_theme()
     if not target:
         try:
