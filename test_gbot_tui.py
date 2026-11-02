@@ -1,10 +1,13 @@
 import base64
+import json
 import os
 import signal
 import tempfile
 import termios
+import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import gbot_tui
@@ -1119,6 +1122,7 @@ class SpeedTests(unittest.TestCase):
             return {7: b"kPRV3", 8: b"kNXT3"}.get(key, b"KEY_OTHER")
 
         gbot_tui.curses.keyname = keyname
+        saved_lines = getattr(gbot_tui.curses, "LINES", None)
         gbot_tui.curses.LINES = 40
         try:
             self.assertEqual(gbot_tui.page_motion(7), (-1, True))
@@ -1140,6 +1144,14 @@ class SpeedTests(unittest.TestCase):
             self.assertTrue(chat.follow)
         finally:
             gbot_tui.curses.keyname = original
+            if saved_lines is None:
+                try:
+                    del gbot_tui.curses.LINES
+                except AttributeError:
+                    pass
+            else:
+                gbot_tui.curses.LINES = saved_lines
+        self.assertIs(getattr(gbot_tui.curses, "LINES", None), saved_lines)
 
     def test_a_long_error_gets_its_own_rows_on_screen(self):
         chat = gbot_tui.Chat("Researcher")
@@ -1801,7 +1813,332 @@ class WidgetTests(unittest.TestCase):
         entry = _widget("Send these fixes?", [{"label": "Yes", "value": "yes"}, {"label": "No", "value": "no"}])
         hint = gbot_tui.choice_hint(entry)
         self.assertEqual(hint, "1-2 answer")
-        self.assertIn("1-2 answer", gbot_tui.footer_spans("idle", "", choice=hint)[0][0])
+        footer = gbot_tui.footer_spans("idle", "", choice=hint)[0][0]
+        self.assertIn("1-2 answer", footer)
+        self.assertIn("space then key types", footer)
+
+    def test_a_widget_behind_your_reply_does_not_take_digits(self):
+        entry = _widget("Send these fixes?", [{"label": "Yes", "value": "yes"}])
+        chat = self._chat(entry)
+        chat.messages.append({"id": "u", "role": "user", "text": "later"})
+        self.assertIsNone(gbot_tui.latest_widget(chat.messages))
+        self.assertIsNone(gbot_tui.chat_key(chat, "1", None))
+        self.assertEqual(chat.typed, "1")
+        self.assertEqual(chat.phase, "idle")
+
+    def test_a_space_then_a_digit_types_it(self):
+        entry = _widget("Send these fixes?", [{"label": "Yes", "value": "yes"}, {"label": "No", "value": "no"}])
+        chat = self._chat(entry)
+        self.assertIsNone(gbot_tui.chat_key(chat, " ", None))
+        self.assertIsNone(gbot_tui.chat_key(chat, "1", None))
+        self.assertEqual(chat.typed, " 1")
+        self.assertEqual(chat.phase, "idle")
+        self.assertFalse(gbot_tui.widget_answered(entry))
+
+    def test_options_past_nine_use_letters_and_zero_does_not_type(self):
+        options = [{"label": f"L{i}", "value": f"v{i}"} for i in range(1, 12)]
+        entry = _widget("Which?", options)
+        text = gbot_tui.entry_text(entry)
+        self.assertIn("9  L9", text)
+        self.assertIn("a  L10", text)
+        self.assertIn("b  L11", text)
+        self.assertEqual(gbot_tui.choice_hint(entry), "1-9,a-b answer")
+        chat = self._chat(entry)
+        self.assertIsNone(gbot_tui.chat_key(chat, "0", None))
+        self.assertEqual(chat.typed, "")
+        self.assertEqual(chat.phase, "idle")
+        job = gbot_tui.chat_key(chat, "a", None)
+        self.assertEqual(job, ("choice", ("Researcher", "agent", "w1", "v10")))
+        self.assertEqual(chat.messages[0].get("respondedValue"), "v10")
+        chat.fail_choice()
+        self.assertIn("a  L10", gbot_tui.entry_text(chat.messages[0]))
+        self.assertEqual(chat.phase, "idle")
+        many = _widget("More?", [{"label": str(i), "value": str(i)} for i in range(1, 37)])
+        shown = gbot_tui.entry_text(many)
+        self.assertIn("z  35", shown)
+        self.assertIn("answer the rest in the app", shown)
+
+    def test_steps_are_answered_one_at_a_time(self):
+        entry = {
+            "kind": "send-message",
+            "id": "w1",
+            "message": {
+                "type": "widget",
+                "widget": {
+                    "steps": [
+                        {
+                            "prompt": "City?",
+                            "options": [
+                                {"label": "Berlin", "value": "Berlin"},
+                                {"label": "Paris", "value": "Paris"},
+                            ],
+                        },
+                        {
+                            "prompt": "Days?",
+                            "multiSelect": True,
+                            "options": [
+                                {"label": "One", "value": "1"},
+                                {"label": "Two", "value": "2"},
+                            ],
+                        },
+                    ]
+                },
+            },
+        }
+        text = gbot_tui.entry_text(entry)
+        self.assertIn("City?", text)
+        self.assertIn("1  Berlin", text)
+        self.assertIn("Days?", text)
+        self.assertNotIn("1  One", text)
+        chat = self._chat(entry)
+        self.assertIsNone(gbot_tui.chat_key(chat, "1", None))
+        self.assertEqual(chat.phase, "idle")
+        shown = [
+            line
+            for kind, line in gbot_tui.transcript_rows(chat.messages, 80, chat.widget_picks, chat.widget_steps)
+            if kind == "text"
+        ]
+        self.assertIn("●  Berlin", shown)
+        self.assertIn("1  One", "\n".join(shown))
+        self.assertIsNone(gbot_tui.chat_key(chat, "2", None))
+        job = gbot_tui.chat_key(chat, "\r", None)
+        self.assertEqual(job[0], "choice")
+        self.assertEqual(job[1][-1], "Berlin\n\n2")
+        self.assertEqual(chat.messages[0].get("respondedValue"), "Berlin\n\n2")
+        chat.fail_choice()
+        self.assertFalse(gbot_tui.widget_answered(chat.messages[0]))
+        self.assertEqual(chat.phase, "idle")
+        restored = gbot_tui.entry_text(
+            chat.messages[0],
+            step_at=chat.step_at(chat.messages[0]),
+            step_answers=chat.widget_steps["w1"]["answers"],
+        )
+        self.assertIn("●  Berlin", restored)
+        self.assertIn("1  One", restored)
+
+    def test_a_step_without_a_way_to_answer_says_so(self):
+        entry = {
+            "kind": "send-message",
+            "id": "w1",
+            "message": {"type": "widget", "widget": {"steps": [{"prompt": "Use the app"}]}},
+        }
+        self.assertIn("answer in the app", gbot_tui.entry_text(entry))
+        self.assertFalse(gbot_tui.widget_open(entry))
+        chat = self._chat(entry)
+        self.assertIsNone(gbot_tui.chat_key(chat, "1", None))
+        self.assertEqual(chat.typed, "1")
+
+    def test_custom_text_answers_the_open_widget(self):
+        entry = _widget("Name?", [{"label": "Ann", "value": "Ann"}])
+        entry["message"]["widget"]["allowCustom"] = True
+        chat = self._chat(entry)
+        chat.typed = "Bea"
+        job = gbot_tui.chat_key(chat, "\r", None)
+        self.assertEqual(job, ("choice", ("Researcher", "agent", "w1", "Bea")))
+        self.assertEqual(chat.messages[0].get("respondedValue"), "Bea")
+        self.assertEqual(chat.typed, "")
+        plain = _widget("Name?", [{"label": "Ann", "value": "Ann"}], id="w2")
+        other = self._chat(plain)
+        other.typed = "Bea"
+        sent = gbot_tui.chat_key(other, "\r", None)
+        self.assertEqual(sent, ("send", ("Researcher", "Bea")))
+        self.assertFalse(gbot_tui.widget_answered(plain))
+
+    def test_widget_error_rejects_a_non_json_body(self):
+        self.assertEqual(gbot_tui.widget_error({"ok": True, "text": "OK", "confirmed": False}), "choice was not confirmed")
+        self.assertEqual(gbot_tui.widget_error({"ok": True, "text": "OK"}), "choice was not confirmed")
+
+    def test_a_session_id_is_not_the_agent_id(self):
+        self.assertEqual(gbot_tui.gateway_agent_id({"id": "agent-real"}), "agent-real")
+        self.assertEqual(
+            gbot_tui.gateway_agent_id({"id": "agent-real", "sessionId": "sess-9"}),
+            "agent-real",
+        )
+        self.assertEqual(
+            gbot_tui.gateway_agent_id({"id": "sess-9", "agentId": "agent-real", "sessionId": "sess-9"}),
+            "agent-real",
+        )
+        self.assertEqual(gbot_tui.gateway_agent_id({"id": "sess-9", "sessionId": "sess-9"}), "")
+        self.assertEqual(gbot_tui.gateway_agent_id({"agentId": "sess-9", "sessionId": "sess-9"}), "")
+        page = gbot_tui.parse_thread(
+            {
+                "target": {"id": "sess-9", "sessionId": "sess-9", "name": "Researcher"},
+                "transcript": {"entries": [_widget("Go?", [{"label": "Yes", "value": "yes"}])]},
+                "cursor": "w1",
+            }
+        )
+        chat = gbot_tui.Chat("Researcher")
+        chat.ingest(page, first=True)
+        self.assertEqual(chat.agent_id, "")
+        self.assertEqual(chat.viewer_session, "sess-9")
+        job = gbot_tui.chat_key(chat, "1", None)
+        self.assertEqual(job[1][1], "")
+        distinct = gbot_tui.parse_thread(
+            {
+                "target": {"id": "agent-real", "sessionId": "sess-9", "name": "Researcher"},
+                "transcript": {"entries": [_widget("Go?", [{"label": "Yes", "value": "yes"}])]},
+                "cursor": "w1",
+            }
+        )
+        live = gbot_tui.Chat("Researcher")
+        live.ingest(distinct, first=True)
+        picked = gbot_tui.chat_key(live, "1", None)
+        self.assertEqual(picked[1][1], "agent-real")
+
+
+class _Gateway(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        self.server.hits.append(
+            {
+                "path": self.path,
+                "type": self.headers.get("Content-Type"),
+                "auth": self.headers.get("Authorization"),
+                "body": body.decode("utf-8"),
+            }
+        )
+        mode = self.server.mode
+        if self.path.endswith("/respondGrokBotWidget"):
+            if mode == "json":
+                raw, code, ctype = b'{"accepted":true}', 200, "application/json"
+            elif mode == "plain":
+                raw, code, ctype = b"OK", 200, "text/plain"
+            elif mode == "refuse":
+                raw, code, ctype = b'{"accepted":false,"refusal":"gone"}', 200, "application/json"
+            else:
+                raw, code, ctype = b"no", 500, "text/plain"
+        else:
+            raw, code, ctype = b"{}", 200, "application/json"
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def log_message(self, fmt, *args):
+        return
+
+
+class WidgetHookTests(unittest.TestCase):
+    def setUp(self):
+        self.env = {
+            key: os.environ.get(key)
+            for key in ("PATH", "GBOT_TUI_WIDGET_HOOK", "MOCK_GATEWAY", "MOCK_LOG", "NODE_OPTIONS")
+        }
+        self.tmp = tempfile.TemporaryDirectory()
+        server = HTTPServer(("127.0.0.1", 0), _Gateway)
+        server.hits = []
+        server.mode = "json"
+        self.server = server
+        self.thread = threading.Thread(target=server.serve_forever, daemon=True)
+        self.thread.start()
+        port = server.server_address[1]
+        log = os.path.join(self.tmp.name, "calls.log")
+        script = os.path.join(self.tmp.name, "gbot")
+        with open(script, "w", encoding="utf-8") as handle:
+            handle.write(
+                """#!/usr/bin/env node
+const fs = require("fs");
+const args = process.argv.slice(2);
+function record(line) {
+  fs.appendFileSync(process.env.MOCK_LOG, line + "\\n");
+}
+const dash = args.indexOf("--");
+if (args[0] === "send") {
+  const rest = dash >= 0 ? args.slice(dash + 1) : args.slice(1);
+  record("send " + rest.join("\\t"));
+  process.stdout.write(JSON.stringify({ ok: true }) + "\\n");
+  process.exit(0);
+}
+if (args[0] === "thread") {
+  fetch(process.env.MOCK_GATEWAY + "/api/getAgentTranscriptTail", {
+    method: "POST",
+    headers: { authorization: "Bearer secret" },
+    body: "{}",
+  }).then(() => {
+    record("thread");
+    process.stdout.write(JSON.stringify({
+      target: { id: "from-thread", name: args[args.length - 1] },
+      transcript: { entries: [] },
+      cursor: "",
+    }) + "\\n");
+  }).catch((err) => {
+    process.stdout.write(JSON.stringify({ error: { message: String(err && err.message || err) } }) + "\\n");
+    process.exit(1);
+  });
+} else {
+  process.stdout.write(JSON.stringify({ ok: true }) + "\\n");
+}
+"""
+            )
+        os.chmod(script, 0o755)
+        os.environ["PATH"] = self.tmp.name + os.pathsep + (os.environ.get("PATH") or "")
+        os.environ["MOCK_GATEWAY"] = f"http://127.0.0.1:{port}"
+        os.environ["MOCK_LOG"] = log
+        os.environ["GBOT_TUI_WIDGET_HOOK"] = "1"
+        self.log = log
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        for key, value in self.env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        self.tmp.cleanup()
+
+    def _log(self):
+        try:
+            with open(self.log, encoding="utf-8") as handle:
+                return handle.read()
+        except OSError:
+            return ""
+
+    def _widget_hits(self):
+        return [hit for hit in self.server.hits if hit["path"].endswith("/respondGrokBotWidget")]
+
+    def test_the_hook_posts_json_and_a_non_json_success_falls_back_to_send(self):
+        gbot_tui.respond_widget("Researcher", "agent-real", "e1", "Yes please")
+        hits = self._widget_hits()
+        self.assertEqual(len(hits), 1)
+        self.assertIn("application/json", (hits[0]["type"] or "").lower())
+        self.assertEqual(hits[0]["auth"], "Bearer secret")
+        body = json.loads(hits[0]["body"])
+        self.assertEqual(body["agentId"], "agent-real")
+        self.assertEqual(body["entryId"], "e1")
+        self.assertEqual(body["value"], "Yes please")
+        self.assertNotIn("send ", self._log())
+
+        self.server.hits.clear()
+        open(self.log, "w", encoding="utf-8").close()
+        self.server.mode = "plain"
+        gbot_tui.respond_widget("Researcher", "agent-real", "e1", "Yes please")
+        self.assertTrue(self._widget_hits())
+        self.assertIn("send ", self._log())
+        self.assertIn("Yes please", self._log())
+
+        open(self.log, "w", encoding="utf-8").close()
+        self.server.mode = "refuse"
+        gbot_tui.respond_widget("Researcher", "agent-real", "e1", "Yes please")
+        self.assertIn("Yes please", self._log())
+
+        open(self.log, "w", encoding="utf-8").close()
+        self.server.hits.clear()
+        gbot_tui.respond_widget("Researcher", "", "e1", "typed")
+        self.assertEqual(self._widget_hits(), [])
+        self.assertIn("typed", self._log())
+        self.assertNotIn("thread", self._log())
+
+    def test_without_the_hook_the_value_is_only_a_message(self):
+        os.environ.pop("GBOT_TUI_WIDGET_HOOK", None)
+        gbot_tui.respond_widget("Researcher", "agent-real", "e1", "Just send")
+        self.assertEqual(self._widget_hits(), [])
+        self.assertIn("Just send", self._log())
+        self.assertNotIn("thread", self._log())
 
 
 class OverviewTests(unittest.TestCase):
@@ -2105,7 +2442,9 @@ class OverviewTests(unittest.TestCase):
             False,
             60,
         )
-        self.assertIn(("working   ", "yellow"), spans)
+        self.assertIn(("working   ", "cyan"), spans)
+        self.assertEqual(gbot_tui.STATUS_STYLE["blocked"], "yellow")
+        self.assertNotEqual(gbot_tui.STATUS_STYLE["working"], gbot_tui.STATUS_STYLE["blocked"])
 
     def test_a_streaming_reply_stays_working_through_quiet_polls(self):
         page = gbot_tui.parse_thread(
@@ -2181,6 +2520,140 @@ class OverviewTests(unittest.TestCase):
         by_name = {bot["name"]: bot for bot in views}
         self.assertEqual(by_name["A"]["activity"]["state"], "idle")
         self.assertNotIn("activity", by_name["B"])
+
+    def test_an_open_widget_needs_you(self):
+        widget = _widget("Ship it?", [{"label": "Yes", "value": "yes"}], id="w")
+        entries = [
+            {"id": "u", "role": "user", "text": "hi"},
+            widget,
+        ]
+        snap = gbot_tui.judge_activity(entries, "w", "u")
+        self.assertEqual(snap["state"], "blocked")
+        self.assertEqual(snap["preview"], "Ship it?")
+        self.assertEqual(gbot_tui.status_label(snap["state"]), "needs you")
+        text = gbot_tui.format_overview(
+            [{"name": "Chef", "activity": snap}]
+        )
+        self.assertIn("needs you", text)
+        self.assertIn("Ship it?", text)
+        stale = [widget, {"id": "u2", "role": "user", "text": "yes"}]
+        later = gbot_tui.judge_activity(stale, "u2", "w")
+        self.assertNotEqual(later["state"], "blocked")
+        self.assertEqual(later["state"], "working")
+
+    def test_working_gives_up_when_nothing_new_arrives(self):
+        class Clock:
+            def __init__(self, at):
+                self.at = at
+                self.old = None
+
+            def __enter__(self):
+                self.old = gbot_tui.clock
+                gbot_tui.clock = lambda: self.at
+                return self
+
+            def __exit__(self, *args):
+                gbot_tui.clock = self.old
+
+        entries = [
+            {"id": "m1", "role": "assistant", "text": "hi"},
+            {"id": "m2", "role": "user", "text": "go"},
+        ]
+        with Clock(50) as clock:
+            snap = gbot_tui.judge_activity(entries, "m2", "m2")
+            self.assertEqual(snap["state"], "working")
+            clock.at = 50 + gbot_tui.WORKING_TIMEOUT - 1
+            snap = gbot_tui.judge_activity(entries, "m2", "m2", previous=snap)
+            self.assertEqual(snap["state"], "working")
+            clock.at = 50 + gbot_tui.WORKING_TIMEOUT
+            snap = gbot_tui.judge_activity(entries, "m2", "m2", previous=snap)
+            self.assertEqual(snap["state"], "idle")
+            idle = snap
+            moved = [
+                {"id": "m1", "role": "assistant", "text": "hi"},
+                {"id": "m2", "role": "user", "text": "go"},
+                {"id": "m3", "role": "assistant", "text": "partial", "isStreaming": True},
+            ]
+            snap = gbot_tui.judge_activity(moved, "m3", "m3", previous=snap)
+            self.assertEqual(snap["state"], "working")
+            spans = gbot_tui.picker_spans(
+                {"name": "Chef", "activity": idle},
+                False,
+                60,
+            )
+            self.assertNotIn("working", "".join(text for text, _style in spans))
+
+        streaming = [
+            {"id": "m1", "role": "user", "text": "go"},
+            {"id": "m2", "role": "assistant", "text": "partial", "isStreaming": True},
+        ]
+        bots = [{"id": "a2", "name": "Chef"}]
+
+        def read(bot):
+            return {"entries": streaming, "cursor": "m2"}
+
+        with Clock(10) as clock:
+            views, error = gbot_tui.build_overview(bots, read)
+            self.assertIsNone(error)
+            self.assertEqual(views[0]["activity"]["state"], "working")
+            clock.at = 10 + gbot_tui.WORKING_TIMEOUT
+            views, error = gbot_tui.build_overview(bots, read)
+            self.assertEqual(views[0]["activity"]["state"], "idle")
+
+        page = gbot_tui.parse_thread(
+            {
+                "target": {"id": "a2", "name": "Chef"},
+                "transcript": {"entries": entries},
+                "cursor": "m2",
+            }
+        )
+        with Clock(1000) as clock:
+            chat = gbot_tui.Chat("Chef")
+            chat.ingest(page, first=True)
+            self.assertEqual(chat.phase, "working")
+            header = "".join(text for text, _style in gbot_tui.title_spans(chat.title, chat.phase, 40))
+            self.assertIn("working", header)
+            self.assertEqual(gbot_tui.title_spans(chat.title, "working", 40)[1][1], "cyan")
+            quiet = gbot_tui.parse_thread({"transcript": {"entries": []}, "cursor": "m2"})
+            clock.at = 1000 + gbot_tui.WORKING_TIMEOUT - 1
+            chat.ingest(quiet)
+            self.assertEqual(chat.phase, "working")
+            self.assertIn("Generating", "".join(text for text, _style in gbot_tui.footer_spans(chat.phase, "")))
+            clock.at = 1000 + gbot_tui.WORKING_TIMEOUT
+            chat.ingest(quiet)
+            self.assertEqual(chat.phase, "idle")
+            self.assertNotIn("Generating", "".join(text for text, _style in gbot_tui.footer_spans(chat.phase, "")))
+            self.assertNotIn("working", "".join(text for text, _style in gbot_tui.title_spans(chat.title, chat.phase, 40)))
+            self.assertEqual(gbot_tui.lookup_activity({"name": "Chef", "id": "a2"})["state"], "idle")
+
+        stream = gbot_tui.parse_thread(
+            {
+                "target": {"id": "a2", "name": "Chef"},
+                "transcript": {"entries": streaming},
+                "cursor": "m2",
+            }
+        )
+        with Clock(0) as clock:
+            chat = gbot_tui.Chat("Chef")
+            chat.ingest(stream, first=True)
+            self.assertEqual(chat.phase, "working")
+            clock.at = gbot_tui.WORKING_TIMEOUT
+            self.assertTrue(chat.expire_working())
+            self.assertEqual(chat.phase, "idle")
+            grown = gbot_tui.parse_thread(
+                {
+                    "target": {"id": "a2", "name": "Chef"},
+                    "transcript": {
+                        "entries": [
+                            {"id": "m1", "role": "user", "text": "go"},
+                            {"id": "m2", "role": "assistant", "text": "partial more", "isStreaming": True},
+                        ]
+                    },
+                    "cursor": "m2",
+                }
+            )
+            chat.ingest(grown)
+            self.assertEqual(chat.phase, "working")
 
 
 if __name__ == "__main__":

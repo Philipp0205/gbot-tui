@@ -27,6 +27,13 @@ APP = "gbot-tui"
 # shortcut: two empty polls after a reply count as finished, so a bot that
 # pauses longer than that looks done while it is still working.
 QUIET_POLLS = 2
+# A turn that never grows (the last line stays yours, or isStreaming stays
+# set) would otherwise say `working` forever. This is how long with no new
+# text before the chat and the overview fall back to idle.
+WORKING_TIMEOUT = 120
+# The gateway widget call is optional. The answer is a normal message unless
+# this is 1/true/yes/on, and a failed hook still falls back to that message.
+WIDGET_HOOK_ENV = "GBOT_TUI_WIDGET_HOOK"
 # Poll cadence in seconds. Each read is one gbot process, so idle backs off.
 WAITING_DELAY = 0.3
 STREAM_DELAY = 1.0
@@ -44,7 +51,7 @@ class GbotError(Exception):
     pass
 
 
-def entry_text(entry, picks=(), numbered=True):
+def entry_text(entry, picks=(), numbered=True, step_at=0, step_answers=()):
     if not isinstance(entry, dict):
         return ""
     for key in ("text", "prompt"):
@@ -66,7 +73,7 @@ def entry_text(entry, picks=(), numbered=True):
         return "\n".join(p for p in parts if p)
     if isinstance(content, dict) and isinstance(content.get("text"), str):
         return content["text"]
-    shown = widget_text(entry, picks, numbered)
+    shown = widget_text(entry, picks, numbered, step_at, step_answers)
     if shown:
         return shown
     if isinstance(message, dict) and isinstance(message.get("content"), str):
@@ -86,13 +93,12 @@ def widget_message(entry):
     return widget if isinstance(widget, dict) else None
 
 
-def widget_options(entry):
+def _option_pairs(raw):
     """(label, value) in the order the bot sent them. The value is what gets sent."""
-    widget = widget_message(entry)
-    if not widget or not isinstance(widget.get("options"), list):
+    if not isinstance(raw, list):
         return []
     options = []
-    for opt in widget["options"]:
+    for opt in raw:
         if not isinstance(opt, dict):
             continue
         label = opt.get("label") if isinstance(opt.get("label"), str) else ""
@@ -102,6 +108,37 @@ def widget_options(entry):
         if label and value:
             options.append((label, value))
     return options
+
+
+def widget_options(entry):
+    """(label, value) on a single-question widget."""
+    widget = widget_message(entry)
+    if not widget:
+        return []
+    return _option_pairs(widget.get("options"))
+
+
+def step_questions(entry):
+    """Questions on one card. Each has prompt, options, multi, and custom.
+
+    A widget without `steps` is one question, handled by widget_options.
+    """
+    widget = widget_message(entry)
+    raw = widget.get("steps") if widget else None
+    if not isinstance(raw, list):
+        return []
+    steps = []
+    for step in raw:
+        if not isinstance(step, dict):
+            continue
+        prompt = step.get("prompt") if isinstance(step.get("prompt"), str) else ""
+        prompt = prompt.strip()
+        options = _option_pairs(step.get("options"))
+        multi = step.get("multiSelect") is True
+        custom = step.get("allowCustom") is True
+        if prompt or options or custom:
+            steps.append({"prompt": prompt, "options": options, "multi": multi, "custom": custom})
+    return steps
 
 
 def widget_answered(entry):
@@ -115,24 +152,180 @@ def widget_skipped(entry):
     )
 
 
+def _question_answerable(step, widget):
+    if step["options"] or step["custom"]:
+        return True
+    return bool(widget and widget.get("allowCustom") is True)
+
+
 def widget_open(entry):
-    return bool(widget_options(entry)) and not widget_answered(entry) and not widget_skipped(entry)
+    if widget_answered(entry) or widget_skipped(entry) or not widget_message(entry):
+        return False
+    steps = step_questions(entry)
+    if steps:
+        widget = widget_message(entry)
+        return any(_question_answerable(step, widget) for step in steps)
+    return bool(widget_options(entry))
 
 
 def latest_widget(entries):
-    """The newest choice the user can still answer."""
+    """The newest choice the user can still answer.
+
+    A widget behind a later user message is stale. Digits belong to the
+    composer then, because the user already replied.
+    """
+    last_user = -1
+    for index, entry in enumerate(entries):
+        if isinstance(entry, dict) and is_user(entry):
+            last_user = index
     found = None
-    for entry in entries:
-        if widget_open(entry):
+    for index, entry in enumerate(entries):
+        if index > last_user and widget_open(entry):
             found = entry
     return found
 
 
-def widget_text(entry, picks=(), numbered=True):
+# 1-9 stay digits. 10 and on are a, b, c, so a tenth option has a key.
+OPTION_DIGITS = 9
+OPTION_LETTERS = 26
+
+
+def option_key(index):
+    """1-based position as a key. Empty when this option has no key."""
+    if index < 1:
+        return ""
+    if index <= OPTION_DIGITS:
+        return str(index)
+    letter = index - OPTION_DIGITS - 1
+    if letter < OPTION_LETTERS:
+        return chr(ord("a") + letter)
+    return ""
+
+
+def key_to_index(key, count):
+    """0-based option, "ignore", or None when the key is ordinary text.
+
+    A digit that does not select an open option is ignored, including 0, so
+    it does not fall into the composer. A letter past the last option is text.
+    """
+    if not isinstance(key, str) or len(key) != 1 or count <= 0:
+        return None
+    if key.isdigit():
+        if key == "0":
+            return "ignore"
+        index = int(key) - 1
+        if index < OPTION_DIGITS and index < count:
+            return index
+        return "ignore"
+    if "a" <= key <= "z":
+        index = OPTION_DIGITS + ord(key) - ord("a")
+        if index < count:
+            return index
+    return None
+
+
+def _key_span(keys):
+    """`1`, `1-2`, or `1-9,a-c`."""
+    digits = [key for key in keys if key.isdigit()]
+    letters = [key for key in keys if key.isalpha()]
+    parts = []
+    if digits:
+        parts.append(digits[0] if len(digits) == 1 else f"{digits[0]}-{digits[-1]}")
+    if letters:
+        parts.append(letters[0] if len(letters) == 1 else f"{letters[0]}-{letters[-1]}")
+    return ",".join(parts)
+
+
+def current_question(entry, step_at=0):
+    """Prompt, options, multi-select, and allowCustom for the question keys answer."""
+    widget = widget_message(entry)
+    if not widget:
+        return "", [], False, False
+    steps = step_questions(entry)
+    if steps:
+        at = min(max(int(step_at or 0), 0), len(steps) - 1)
+        step = steps[at]
+        custom = step["custom"] or widget.get("allowCustom") is True
+        return step["prompt"], step["options"], step["multi"], custom
+    prompt = widget.get("prompt") if isinstance(widget.get("prompt"), str) else ""
+    return prompt.strip(), widget_options(entry), widget.get("multiSelect") is True, widget.get("allowCustom") is True
+
+
+def _option_lines(options, open_, multi, chosen, picked):
+    lines = []
+    matched = False
+    uncovered = False
+    for index, (label, value) in enumerate(options, 1):
+        marked = value in chosen or value in picked
+        matched = matched or value in chosen
+        key = option_key(index) if open_ else ""
+        if open_ and not key:
+            uncovered = True
+        if open_ and key and multi:
+            mark = "●" if marked else " "
+            lines.append(f"{mark} {key}  {label}")
+        elif open_ and key:
+            lines.append(f"{key}  {label}")
+        elif marked:
+            lines.append(f"●  {label}")
+        else:
+            lines.append(f"   {label}")
+    return lines, matched, uncovered
+
+
+def _steps_text(entry, steps, picks, numbered, step_at, step_answers):
+    widget = widget_message(entry)
+    answered = widget_answered(entry)
+    # A finished card stores one answer per step, with a blank line between them.
+    if answered and not step_answers:
+        step_answers = answered.split("\n\n")
+    answers = list(step_answers or [])
+    open_ = widget_open(entry) and numbered
+    at = int(step_at or 0) if open_ else len(steps)
+    lines = []
+    head = widget.get("prompt") if isinstance(widget.get("prompt"), str) else ""
+    head = head.strip()
+    if head and head not in {step["prompt"] for step in steps}:
+        lines.append(head)
+    if widget_skipped(entry) and not answered:
+        if lines:
+            lines[-1] += "  · skipped"
+        elif steps and steps[0]["prompt"]:
+            steps = [dict(steps[0], prompt=steps[0]["prompt"] + "  · skipped"), *steps[1:]]
+        else:
+            lines.append("skipped")
+    for index, step in enumerate(steps):
+        if step["prompt"] and not (index == 0 and lines and lines[-1].startswith(step["prompt"])):
+            lines.append(step["prompt"])
+        if index < len(answers) and str(answers[index]).strip():
+            chosen = {part for part in str(answers[index]).split("\n") if part}
+            option_lines, matched, _extra = _option_lines(step["options"], False, False, chosen, ())
+            lines.extend(option_lines)
+            if not matched:
+                lines.append("●  " + str(answers[index]).strip())
+            continue
+        current = open_ and index == at
+        option_lines, _matched, extra = _option_lines(
+            step["options"], current, step["multi"], set(), set(picks or ()) if current else ()
+        )
+        lines.extend(option_lines)
+        if current and extra:
+            lines.append("answer the rest in the app")
+        elif current and not step["options"] and not _question_answerable(step, widget):
+            lines.append("answer in the app")
+    if not answered and not widget_skipped(entry) and not any(_question_answerable(step, widget) for step in steps):
+        lines.append("answer in the app")
+    return "\n".join(line for line in lines if line is not None)
+
+
+def widget_text(entry, picks=(), numbered=True, step_at=0, step_answers=()):
     """The prompt and its options. The open choice is numbered. A picked one is marked."""
     widget = widget_message(entry)
     if widget is None:
         return ""
+    steps = step_questions(entry)
+    if steps:
+        return _steps_text(entry, steps, picks, numbered, step_at, step_answers)
     prompt = widget.get("prompt")
     prompt = prompt.strip() if isinstance(prompt, str) else ""
     if widget_skipped(entry) and not widget_answered(entry) and prompt:
@@ -145,31 +338,27 @@ def widget_text(entry, picks=(), numbered=True):
     # Only the newest open widget takes number keys, so older ones are not numbered.
     open_ = widget_open(entry) and numbered
     lines = [prompt] if prompt else []
-    matched = False
-    for index, (label, value) in enumerate(options, 1):
-        marked = value in chosen or value in picked
-        matched = matched or value in chosen
-        if open_ and multi:
-            mark = "●" if marked else " "
-            lines.append(f"{mark} {index}  {label}")
-        elif open_:
-            lines.append(f"{index}  {label}")
-        elif marked:
-            lines.append(f"●  {label}")
-        else:
-            lines.append(f"   {label}")
+    option_lines, matched, extra = _option_lines(options, open_, multi, chosen, picked)
+    lines.extend(option_lines)
+    if open_ and extra:
+        lines.append("answer the rest in the app")
     if answered and not matched:
         lines.append(f"●  {answered}")
     return "\n".join(lines)
 
 
-def choice_hint(entry):
-    options = widget_options(entry) if entry else []
+def choice_hint(entry, step_at=0):
+    prompt, options, multi, custom = current_question(entry, step_at) if entry else ("", [], False, False)
     if not options:
+        if entry and widget_open(entry) and custom:
+            return "type an answer"
         return ""
-    span = "1" if len(options) == 1 else f"1-{len(options)}"
-    widget = widget_message(entry)
-    if widget and widget.get("multiSelect") is True:
+    keys = [option_key(index) for index in range(1, len(options) + 1)]
+    keys = [key for key in keys if key]
+    if not keys:
+        return "answer in the app"
+    span = _key_span(keys)
+    if multi:
         return f"{span} choose · enter sends"
     return f"{span} answer"
 
@@ -362,15 +551,43 @@ def parse_thread(payload):
     target = payload.get("target") if isinstance(payload, dict) else {}
     if not isinstance(target, dict):
         target = {}
+    session = target.get("sessionId") if isinstance(target.get("sessionId"), str) else ""
     return {
         "entries": [entry for entry in entries if isinstance(entry, dict)],
         "cursor": cursor,
         "gap_reset": bool(payload.get("gapReset")) if isinstance(payload, dict) else False,
         "name": target.get("name") or "",
         "id": target.get("id") or "",
+        "agent_id": gateway_agent_id(target),
+        "viewer_session": session.strip(),
         "avatar_shape": target.get("avatarShape") or "",
         "avatar_color": target.get("avatarColor") or "",
     }
+
+
+def gateway_agent_id(target):
+    """The id `respondGrokBotWidget` calls `agentId`.
+
+    `gbot thread` puts the gateway agent id on `target.id` (`agent.id`, else
+    `agentId`). `target.agentId` wins when it is also present. `target.sessionId`
+    is the viewer's session and is a different field. When `id` and `sessionId`
+    are the same string and `agentId` is absent, there is no agent id to send.
+    """
+    if not isinstance(target, dict):
+        return ""
+    session = target.get("sessionId") if isinstance(target.get("sessionId"), str) else ""
+    session = session.strip()
+    explicit = target.get("agentId") if isinstance(target.get("agentId"), str) else ""
+    explicit = explicit.strip()
+    if explicit:
+        if session and explicit == session:
+            return ""
+        return explicit
+    ident = target.get("id") if isinstance(target.get("id"), str) else ""
+    ident = ident.strip()
+    if not ident or (session and ident == session):
+        return ""
+    return ident
 
 
 def osc_report(state, title, kind=None):
@@ -737,7 +954,8 @@ OVERVIEW_LIMIT = 80
 OVERVIEW_PAUSE = 8
 OVERVIEW_STATES = ("blocked", "unread", "working", "idle")
 ATTENTION_RANK = {"blocked": 0, "unread": 1, "working": 2, "idle": 4}
-STATUS_STYLE = {"blocked": "yellow", "unread": "green", "working": "yellow", "idle": "dim"}
+# `working` stays off the yellow used for `needs you`, in the list and the header.
+STATUS_STYLE = {"blocked": "yellow", "unread": "green", "working": "cyan", "idle": "dim"}
 # In-progress flags a transcript entry may carry. Absent on a finished line.
 PROGRESS_STATES = {"running", "streaming", "in_progress", "generating", "working"}
 
@@ -776,6 +994,8 @@ def _clean_snap(snap):
         "unread": unread if isinstance(unread, int) and unread > 0 else 0,
         "cursor": snap.get("cursor") if isinstance(snap.get("cursor"), str) else "",
         "preview": snap.get("preview") if isinstance(snap.get("preview"), str) else "",
+        "token": snap.get("token") if isinstance(snap.get("token"), str) else "",
+        "since": snap.get("since") if isinstance(snap.get("since"), (int, float)) else 0,
     }
 
 
@@ -898,6 +1118,25 @@ def one_line(text, limit=160):
     return flat[: limit - 1] + "…"
 
 
+def clock():
+    """Monotonic time. Tests replace this to move a quiet turn forward."""
+    return time.monotonic()
+
+
+def content_token(entries):
+    """Identity of the visible text. A longer reply is new content; a quiet flag is not."""
+    parts = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        kind = "u" if is_user(entry) else "b"
+        flag = ""
+        if entry.get("streaming") is True or entry.get("inProgress") is True or entry.get("isStreaming") is True:
+            flag = "*"
+        parts.append(kind + flag + entry_text(entry))
+    return "\x1e".join(parts)
+
+
 def awaiting_reply(entries):
     """True when the last line with text is the user's. The bot has not answered."""
     speaker = ""
@@ -956,6 +1195,12 @@ def activity_preview(entries, state):
             if card["details"]:
                 return one_line(card["details"][0])
             return "Needs approval"
+        widget = latest_widget(entries)
+        if widget:
+            prompt, _options, _multi, _custom = current_question(widget)
+            if prompt:
+                return one_line(prompt)
+            return "Needs a choice"
     for entry in reversed(entries):
         text = entry_text(entry).strip()
         if text:
@@ -963,17 +1208,37 @@ def activity_preview(entries, state):
     return ""
 
 
-def judge_activity(entries, cursor, seen):
+def _working_since(previous, token, now):
+    """When this same text first looked in progress. A new clock starts over."""
+    if not isinstance(previous, dict) or previous.get("token") != token:
+        return now
+    old = previous.get("since")
+    if not isinstance(old, (int, float)):
+        return now
+    # A since from a previous process can sit past this clock. Start over then.
+    if old > now:
+        return now
+    return old
+
+
+def judge_activity(entries, cursor, seen, previous=None):
     """What one thread tail says. `seen` is the last cursor the user had on screen.
 
     An empty `seen` does not mark the whole history as new. `blocked` wins over
-    a new reply, and a new reply wins over `running`.
+    a new reply, and a new reply wins over `running`. An open widget after the
+    user's last message is `needs you`. `working` that gains no text for
+    WORKING_TIMEOUT falls back to idle. `previous` is the last snap, so the
+    overview can time that quiet stretch with `clock`.
     """
     entries = [entry for entry in entries if isinstance(entry, dict) and not entry.get("local")]
     cursor = cursor or last_id(entries)
-    if pending_approval(entries):
+    now = clock()
+    token = content_token(entries)
+    running = awaiting_reply(entries) or entry_in_progress(entries)
+    since = _working_since(previous, token, now) if running else 0
+    if pending_approval(entries) or latest_widget(entries):
         phase = "blocked"
-    elif awaiting_reply(entries) or entry_in_progress(entries):
+    elif running and now - since < WORKING_TIMEOUT:
         phase = "working"
     else:
         phase = "idle"
@@ -989,6 +1254,8 @@ def judge_activity(entries, cursor, seen):
         "unread": unread,
         "cursor": cursor,
         "preview": activity_preview(entries, state),
+        "token": token,
+        "since": since,
     }
 
 
@@ -1104,7 +1371,7 @@ def record_page(bot, page):
     """Judge one thread. The first look pins the seen cursor; a scan does not move it."""
     entries, cursor = page_entries(page)
     mark = seen_mark(bot)
-    snap = judge_activity(entries, cursor, mark)
+    snap = judge_activity(entries, cursor, mark, previous=lookup_activity(bot))
     if not mark:
         baseline_seen(bot, snap.get("cursor") or cursor)
     store_activity(bot, snap)
@@ -1562,32 +1829,59 @@ def respond_approval(target, entry_id, request_id, decision):
     )
 
 
-# gbot 0.12.4 has no widget command. The hook posts the choice on the gateway
-# session a one-entry thread read opens, then lets that read finish.
+# Optional path. gbot 0.12.4 has no widget command, so this hook posts the
+# choice on the gateway session a one-entry thread read opens. It is off
+# unless GBOT_TUI_WIDGET_HOOK is set. The answer is still a normal message.
 WIDGET_HOOK = r"""
 const fs = require("fs");
 const orig = globalThis.fetch;
 const body = process.env.GBOT_WIDGET_BODY;
 const resultPath = process.env.GBOT_WIDGET_RESULT;
+function copyHeaders(incoming) {
+  const headers = {};
+  if (incoming && typeof incoming.forEach === "function") {
+    incoming.forEach((value, key) => { headers[key] = value; });
+  } else if (incoming && typeof incoming === "object") {
+    Object.assign(headers, incoming);
+  }
+  delete headers["Content-Type"];
+  delete headers["content-type"];
+  headers["content-type"] = "application/json";
+  return headers;
+}
 if (typeof orig === "function" && body && resultPath) {
   let once = false;
   globalThis.fetch = async function (url, opts) {
     const href = typeof url === "string" ? url : (url && url.url) || "";
     if (!once && href.includes("/api/")) {
       once = true;
-      const headers = Object.assign({}, (opts && opts.headers) || {});
       const base = href.slice(0, href.indexOf("/api/"));
       let payload;
       try {
         const res = await orig.call(globalThis, base + "/api/respondGrokBotWidget", {
           method: "POST",
           redirect: "error",
-          headers,
+          headers: copyHeaders(opts && opts.headers),
           body,
         });
-        payload = { ok: res.ok, status: res.status, text: (await res.text()).slice(0, 500) };
+        const text = (await res.text()).slice(0, 500);
+        let confirmed = false;
+        if (res.ok) {
+          const trimmed = text.trim();
+          if (!trimmed) {
+            confirmed = true;
+          } else {
+            try {
+              JSON.parse(trimmed);
+              confirmed = true;
+            } catch (err) {
+              confirmed = false;
+            }
+          }
+        }
+        payload = { ok: !!(res.ok && confirmed), status: res.status, text, confirmed };
       } catch (err) {
-        payload = { ok: false, status: 0, text: String((err && err.message) || err) };
+        payload = { ok: false, status: 0, text: String((err && err.message) || err), confirmed: false };
       }
       fs.writeFileSync(resultPath, JSON.stringify(payload));
     }
@@ -1597,16 +1891,28 @@ if (typeof orig === "function" && body && resultPath) {
 """
 
 
+def widget_hook_enabled():
+    return os.environ.get(WIDGET_HOOK_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def widget_error(payload):
-    """Empty when the gateway accepted the choice."""
+    """Empty when the gateway accepted the choice.
+
+    A 2xx body that is not JSON is not acceptance. An empty body still counts,
+    matching a gateway that answers 204 with nothing to parse.
+    """
     if not isinstance(payload, dict) or not payload.get("ok"):
         text = payload.get("text") if isinstance(payload, dict) else ""
         return (text or "choice was rejected").strip() or "choice was rejected"
+    if payload.get("confirmed") is False:
+        return "choice was not confirmed"
     text = payload.get("text") or ""
-    try:
-        data = json.loads(text) if text else {}
-    except json.JSONDecodeError:
+    if not str(text).strip():
         return ""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return "choice was not confirmed"
     if not isinstance(data, dict):
         return ""
     if data.get("accepted") is False or data.get("refusal"):
@@ -1614,10 +1920,14 @@ def widget_error(payload):
     return ""
 
 
-def respond_widget(target, agent_id, entry_id, value):
-    """Send one widget answer. Raises GbotError when the gateway rejects it."""
+def post_widget(target, agent_id, entry_id, value):
+    """POST respondGrokBotWidget through gbot's gateway session.
+
+    Raises GbotError when the call did not confirm. `agent_id` has to be the
+    gateway agent id. A session id must not be passed in that slot.
+    """
     if not agent_id or not entry_id:
-        raise GbotError("This choice cannot be sent yet.")
+        raise GbotError("This choice has no agent id.")
     body = json.dumps(
         {"agentId": agent_id, "entryId": entry_id, "value": value},
         ensure_ascii=False,
@@ -1641,7 +1951,8 @@ def respond_widget(target, agent_id, entry_id, value):
         except GbotError as error:
             thread_error = error
         try:
-            raw = open(result.name, encoding="utf-8").read()
+            with open(result.name, encoding="utf-8") as handle:
+                raw = handle.read()
         except OSError:
             raw = ""
         if not raw:
@@ -1659,6 +1970,27 @@ def respond_widget(target, agent_id, entry_id, value):
                 os.unlink(path)
             except OSError:
                 pass
+
+
+def respond_widget(target, agent_id, entry_id, value):
+    """Deliver one widget answer as the user's reply.
+
+    The value goes out with `gbot send`. `GBOT_TUI_WIDGET_HOOK=1` tries the
+    gateway hook first. A failure there, including a 2xx body that is not
+    JSON, falls back to the same send. `agent_id` empty means the only id on
+    hand was a session id, so the hook is skipped.
+    """
+    if widget_hook_enabled() and agent_id and entry_id:
+        try:
+            post_widget(target, agent_id, entry_id, value)
+            return
+        except GbotError as hook_error:
+            try:
+                send_message(target, value)
+            except GbotError as send_error:
+                raise GbotError(f"{hook_error}; {send_error}") from send_error
+            return
+    send_message(target, value)
 
 
 def ancestor_pids():
@@ -1969,6 +2301,8 @@ class Chat:
         self.target = target
         self.title = target
         self.session_id = ""
+        self.agent_id = ""
+        self.viewer_session = ""
         self.messages = []
         self.cursor = ""
         self.phase = "idle"
@@ -1988,10 +2322,14 @@ class Chat:
         self.pending_request = ""
         self.widget_picks = {}
         self.widget_sent = {}
+        self.widget_steps = {}
         self.widget_busy = False
         self.widget_entry = ""
         self.widget_phase = "idle"
+        self._held_steps = None
         self.choice_wait = False
+        self.content_token = ""
+        self.content_at = None
         self.full_reload = False
         self.replacing = False
         self.rows_rev = 0
@@ -2036,6 +2374,15 @@ class Chat:
             self.title = page["name"]
             self.resume = resume_arg(page["name"]) or resume_arg(page["id"]) or self.resume
             bind_app(self.title)
+        if page.get("agent_id"):
+            self.agent_id = page["agent_id"]
+        elif page.get("id") and not page.get("viewer_session"):
+            # target.id is the agent id when the thread names no other session.
+            self.agent_id = page["id"]
+        elif "agent_id" in page and page.get("viewer_session"):
+            self.agent_id = page.get("agent_id") or ""
+        if page.get("viewer_session"):
+            self.viewer_session = page["viewer_session"]
         if page["id"]:
             self.session_id = page["id"]
         if page.get("avatar_shape"):
@@ -2058,6 +2405,7 @@ class Chat:
                 self.cursor = page["cursor"]
         self._stamp_answered()
         self._stamp_choices()
+        self.note_content()
         self.touch_rows()
         return fresh
 
@@ -2124,7 +2472,9 @@ class Chat:
         entries = [entry for entry in self.messages if isinstance(entry, dict)]
         cursor = self.cursor or last_id([entry for entry in entries if not entry.get("local")])
         remember_seen(self.target, self.session_id, cursor)
-        if self.phase == "blocked":
+        shown = [entry for entry in entries if not entry.get("local")]
+        # An open widget is needs-you on the list even while this chat is idle.
+        if self.phase == "blocked" or (self.phase != "working" and latest_widget(shown)):
             state = "blocked"
         elif self.phase == "working":
             state = "working"
@@ -2136,7 +2486,9 @@ class Chat:
                 "state": state,
                 "unread": 0,
                 "cursor": cursor,
-                "preview": activity_preview(entries, state),
+                "preview": activity_preview(shown, state),
+                "token": content_token(shown),
+                "since": 0 if self.content_at is None else self.content_at,
             },
         )
 
@@ -2183,9 +2535,66 @@ class Chat:
                 self.note("blocked")
         self.sync_activity()
 
+    def choice_agent_id(self):
+        """Agent id for the optional hook. A viewer session is never that id."""
+        if self.agent_id:
+            return self.agent_id
+        if self.viewer_session:
+            return ""
+        return self.session_id
+
+    def step_at(self, entry):
+        if not isinstance(entry, dict):
+            return 0
+        return (self.widget_steps.get(entry.get("id")) or {}).get("at", 0)
+
+    def note_content(self):
+        """Restart the quiet-turn clock when the transcript text changes."""
+        token = content_token(self.messages)
+        now = clock()
+        if token != self.content_token or self.content_at is None:
+            self.content_token = token
+            self.content_at = now
+
+    def quiet_for(self):
+        """True when the visible text has been unchanged for WORKING_TIMEOUT."""
+        now = clock()
+        if self.content_at is None:
+            self.content_at = now
+            return False
+        return now - self.content_at >= WORKING_TIMEOUT
+
+    def content_expired(self):
+        return self.phase == "working" and self.quiet_for()
+
+    def settle_working(self, phase):
+        """Keep a live reply in `working`, and give up when it stops changing."""
+        if phase == "done" and entry_in_progress(self.messages):
+            phase = "working"
+        # Any turn with no new text, including one whose last line is the user's
+        # or whose isStreaming flag never clears.
+        if phase == "working" and self.quiet_for():
+            return "idle"
+        if phase in {"idle", "done"} and entry_in_progress(self.messages) and not self.quiet_for():
+            return "working"
+        return phase
+
+    def expire_working(self):
+        """Drop a turn that has had no new text for WORKING_TIMEOUT."""
+        if not self.content_expired():
+            return False
+        self.choice_wait = False
+        self.note("idle")
+        self.sync_activity()
+        return True
+
     def begin_choice(self, value):
-        """Mark the newest open widget answered and return the gateway arguments."""
-        if self.widget_busy or not self.loaded or not self.session_id:
+        """Mark the newest open widget answered and return the gateway arguments.
+
+        The mark shows immediately. The value is what `gbot send` will carry.
+        `agent_id` is empty when the thread only had a session id.
+        """
+        if self.widget_busy or not self.loaded or not (self.agent_id or self.session_id):
             return None
         entry = latest_widget(self.messages)
         if entry is None:
@@ -2196,6 +2605,7 @@ class Chat:
         self.widget_sent[entry_id] = value
         entry["respondedValue"] = value
         self.widget_picks.pop(entry_id, None)
+        self.messages.append({"role": "user", "text": value, "local": True, "widget_answer": entry_id})
         self.widget_entry = entry_id
         self.widget_busy = True
         self.widget_phase = self.phase
@@ -2203,16 +2613,51 @@ class Chat:
         self.saw_other = False
         self.quiet = 0
         self.touch_rows()
+        self.note_content()
         self.note("working")
         self.sync_activity()
-        return (self.target, self.session_id, entry_id, value)
+        return (self.target, self.choice_agent_id(), entry_id, value)
+
+    def commit_choice(self, value):
+        """Record one answer. A finished card returns the gateway arguments.
+
+        A `steps` card advances one question at a time and sends once, with a
+        blank line between answers. "step" means another question is waiting.
+        """
+        if not value:
+            return None
+        entry = latest_widget(self.messages)
+        if entry is None:
+            return None
+        steps = step_questions(entry)
+        if not steps:
+            return self.begin_choice(value)
+        entry_id = entry.get("id") if isinstance(entry.get("id"), str) else ""
+        if not entry_id:
+            return None
+        state = self.widget_steps.get(entry_id) or {"at": 0, "answers": []}
+        answers = list(state.get("answers") or [])
+        at = int(state.get("at") or 0)
+        if at >= len(steps):
+            return None
+        answers.append(value)
+        at += 1
+        self.widget_picks.pop(entry_id, None)
+        if at < len(steps):
+            self.widget_steps[entry_id] = {"at": at, "answers": answers}
+            self.touch_rows()
+            return "step"
+        self._held_steps = (entry_id, {"at": len(steps) - 1, "answers": answers[:-1]})
+        self.widget_steps.pop(entry_id, None)
+        return self.begin_choice("\n\n".join(answers))
 
     def toggle_choice(self, index):
         entry = latest_widget(self.messages)
-        widget = widget_message(entry)
-        if entry is None or not widget or widget.get("multiSelect") is not True:
+        if entry is None:
             return False
-        options = widget_options(entry)
+        _prompt, options, multi, _custom = current_question(entry, self.step_at(entry))
+        if not multi:
+            return False
         if index < 0 or index >= len(options):
             return False
         entry_id = entry.get("id")
@@ -2242,10 +2687,19 @@ class Chat:
         self.widget_busy = False
         self.widget_entry = ""
         self.choice_wait = False
+        self.messages = [
+            entry
+            for entry in self.messages
+            if not (entry.get("local") and entry.get("widget_answer") == entry_id)
+        ]
         for entry in self.messages:
             if entry.get("id") == entry_id and entry.get("respondedValue") == value:
                 entry.pop("respondedValue", None)
+        if self._held_steps and self._held_steps[0] == entry_id:
+            self.widget_steps[entry_id] = self._held_steps[1]
+        self._held_steps = None
         self.touch_rows()
+        self.note_content()
         phase = self.widget_phase if self.widget_phase in {"working", "blocked"} else "idle"
         self.note(phase)
         self.sync_activity()
@@ -2302,6 +2756,7 @@ class Chat:
                 phase = "working"
             else:
                 phase = "idle"
+            phase = self.settle_working(phase)
             self.phase = phase
             publish(phase, self.title, self.session_id, self.resume)
             TAB.show(self.title)
@@ -2314,8 +2769,7 @@ class Chat:
             self.saw_other,
             pending_approval(self.messages),
         )
-        if phase == "done" and entry_in_progress(self.messages):
-            phase = "working"
+        phase = self.settle_working(phase)
         self.note(phase)
         self.sync_activity()
 
@@ -2329,6 +2783,7 @@ class Chat:
         self.quiet = 0
         self.follow = True
         self.messages.append({"role": "user", "text": text, "local": True})
+        self.note_content()
         self.note("working")
         self.sync_activity()
         return text
@@ -2605,10 +3060,13 @@ def bubble_fg(bubble):
 
 
 def theme_palette(dark):
-    """256-color indices for the named styles. Yellow on white is unreadable."""
+    """256-color indices for the named styles. Yellow on white is unreadable.
+
+    Cyan is the `working` mark, so it stays off the yellow used for needs-you.
+    """
     if dark:
-        return {"green": 108, "gray": 245}
-    return {"yellow": 130, "red": 124, "green": 28, "gray": 240}
+        return {"green": 108, "gray": 245, "cyan": 44}
+    return {"yellow": 130, "red": 124, "green": 28, "gray": 240, "cyan": 23}
 
 
 def xterm_color(hex_color):
@@ -2769,6 +3227,7 @@ def visible_rows(chat, width):
     # Wrapping the whole thread on every keystroke is what made typing feel late.
     last = chat.messages[-1] if chat.messages else None
     picks = getattr(chat, "widget_picks", None) or {}
+    progress = getattr(chat, "widget_steps", None) or {}
     key = (
         id(chat.messages),
         len(chat.messages),
@@ -2776,9 +3235,14 @@ def visible_rows(chat, width):
         entry_text(last) if last else "",
         chat.rows_rev,
         tuple((name, tuple(values)) for name, values in picks.items()),
+        tuple(
+            (name, state.get("at"), tuple(state.get("answers") or ()))
+            for name, state in progress.items()
+            if isinstance(state, dict)
+        ),
     )
     if getattr(chat, "_rows_key", None) != key:
-        chat._rows = transcript_rows(chat.messages, width, picks)
+        chat._rows = transcript_rows(chat.messages, width, picks, progress)
         chat._rows_key = key
     return chat._rows
 
@@ -2799,18 +3263,22 @@ def card_lines(entry, width):
     return lines
 
 
-def transcript_rows(entries, width, picks=None):
+def transcript_rows(entries, width, picks=None, progress=None):
     rows = []
     user_w = max(width - 8, 1)
     text_w = max(width - 4, 1)
     picks = picks or {}
+    progress = progress or {}
     current = latest_widget(entries)
     current_id = current.get("id") if current else None
     for entry in entries:
         lines = card_lines(entry, width)
         chosen = picks.get(entry.get("id")) if isinstance(entry, dict) else None
         numbered = not current_id or (isinstance(entry, dict) and entry.get("id") == current_id)
-        text = entry_text(entry, chosen or (), numbered).strip()
+        state = progress.get(entry.get("id")) if isinstance(entry, dict) else None
+        step_at = (state or {}).get("at", 0) if isinstance(state, dict) else 0
+        step_answers = (state or {}).get("answers") or () if isinstance(state, dict) else ()
+        text = entry_text(entry, chosen or (), numbered, step_at, step_answers).strip()
         if not text and not lines:
             continue
         if rows:
@@ -2835,11 +3303,11 @@ def transcript_rows(entries, width, picks=None):
 
 
 def title_spans(title, phase, width):
-    """The header name, and a yellow `working` while a reply is in progress."""
+    """The header name, and a cyan `working` while a reply is in progress."""
     room = max(width - 4, 0)
     mark = " · working" if phase == "working" else ""
     if mark and room > len(mark):
-        return [(clip(title, room - len(mark)), "bold"), (mark, "yellow")]
+        return [(clip(title, room - len(mark)), "bold"), (mark, STATUS_STYLE["working"])]
     return [(clip(title, room), "bold")]
 
 
@@ -2883,7 +3351,8 @@ def footer_spans(phase, error, decide=False, width=0, choice=""):
         return [("Generating", "bold"), ("  —  pgup scroll", "dim")]
     hint = "enter send · esc bots · ctrl-c quit · pgup scroll"
     if choice:
-        hint = f"{choice} · {hint}"
+        # A space, then the digit or letter, types it instead of answering.
+        hint = f"{choice} · space then key types · {hint}"
     return [(hint, "dim")]
 
 
@@ -2916,6 +3385,7 @@ ATTR = {
     # Calmer than the pending warning. Theme replaces these with real colors.
     "green": curses.A_DIM,
     "gray": curses.A_DIM,
+    "cyan": curses.A_BOLD,
 }
 
 CARD_STYLE = {"card": "yellow", "card-ok": "green", "card-no": "gray"}
@@ -2953,8 +3423,10 @@ def apply_theme(stdscr):
         palette = theme_palette(dark_terminal()) if curses.COLORS >= 256 else {}
         curses.init_pair(3, palette.get("yellow", curses.COLOR_YELLOW), -1)
         curses.init_pair(4, palette.get("red", curses.COLOR_RED), -1)
+        curses.init_pair(7, palette.get("cyan", curses.COLOR_CYAN), -1)
         ATTR["yellow"] = curses.color_pair(3)
         ATTR["red"] = curses.color_pair(4)
+        ATTR["cyan"] = curses.color_pair(7)
         if curses.COLORS >= 256:
             curses.init_pair(5, palette["green"], -1)
             curses.init_pair(6, palette["gray"], -1)
@@ -3028,7 +3500,8 @@ def draw(stdscr, chat):
         decide = bool(latest_decision(chat.messages, chat.answered)) and not chat.deciding
         hint = ""
         if getattr(chat, "loaded", False) and not getattr(chat, "widget_busy", False) and not chat.typed:
-            hint = choice_hint(latest_widget(chat.messages))
+            entry = latest_widget(chat.messages)
+            hint = choice_hint(entry, chat.step_at(entry) if entry else 0)
         footer = footer_rows(chat.phase, chat.error, decide=decide, width=width, choice=hint)
         # Error rows come out of the transcript, which keeps at least one row.
         footer = footer[-max(min(len(footer), body_h), 1) :]
@@ -3161,39 +3634,51 @@ def page_step(lines, half):
     return max(step // 2, 1) if half else step
 
 
-def picked_lines(entry, picks):
+def picked_lines(entry, picks, step_at=0):
+    _prompt, options, _multi, _custom = current_question(entry, step_at)
     chosen = set(picks or ())
-    return "\n".join(value for _label, value in widget_options(entry) if value in chosen)
+    return "\n".join(value for _label, value in options if value in chosen)
 
 
 def choice_key(chat, key):
-    """What a digit does while a widget is open.
+    """What a digit or a letter does while a widget is open.
 
-    A tuple is the gateway job. "toggle" and "ignore" consume the key.
-    None means the digit is ordinary text.
+    A tuple is the send job. "toggle", "step", and "ignore" consume the key.
+    None means the key is ordinary text. Text already in the composer wins,
+    so a space and then a digit types the digit.
     """
-    if not isinstance(key, str) or len(key) != 1 or not key.isdigit() or chat.typed:
+    if not isinstance(key, str) or len(key) != 1 or chat.typed:
         return None
     if chat.widget_busy:
-        return "ignore"
+        if key.isdigit() or ("a" <= key <= "z"):
+            return "ignore"
+        return None
     entry = latest_widget(chat.messages)
     if entry is None:
         return None
-    if not chat.loaded or not chat.session_id:
-        return "ignore"
-    index = int(key) - 1
-    options = widget_options(entry)
-    if index < 0 or index >= len(options):
+    if not chat.loaded or not (chat.agent_id or chat.session_id):
+        if key.isdigit():
+            return "ignore"
         return None
-    widget = widget_message(entry)
-    if widget and widget.get("multiSelect") is True:
-        chat.toggle_choice(index)
+    _prompt, options, multi, _custom = current_question(entry, chat.step_at(entry))
+    if not options:
+        return None
+    picked = key_to_index(key, len(options))
+    if picked is None:
+        return None
+    if picked == "ignore":
+        return "ignore"
+    if multi:
+        chat.toggle_choice(picked)
         return "toggle"
-    args = chat.begin_choice(options[index][1])
-    if not args:
+    result = chat.commit_choice(options[picked][1])
+    if result == "step":
+        chat.error = ""
+        return "step"
+    if not result:
         return None
     chat.error = ""
-    return ("choice", args)
+    return ("choice", result)
 
 
 def chat_key(chat, key, stdscr):
@@ -3222,16 +3707,32 @@ def chat_key(chat, key, stdscr):
             chat.follow = True
         return None
     if key in ("\n", "\r", curses.KEY_ENTER):
-        # shortcut: typed text stays a normal message, not a custom widget
-        # answer. Upgrade when a bot ignores that and waits on the widget.
-        entry = latest_widget(chat.messages) if not chat.typed and not chat.widget_busy else None
-        if entry is not None and (widget_message(entry) or {}).get("multiSelect") is True:
-            value = picked_lines(entry, chat.widget_picks.get(entry.get("id")))
-            args = chat.begin_choice(value) if value else None
-            if args:
+        entry = latest_widget(chat.messages) if not chat.widget_busy else None
+        if entry is not None and chat.typed.strip():
+            _prompt, _options, _multi, custom = current_question(entry, chat.step_at(entry))
+            if custom:
+                text = chat.typed.strip()
+                chat.typed = ""
                 chat.error = ""
-                chat.follow = True
-                return ("choice", args)
+                result = chat.commit_choice(text)
+                if result == "step":
+                    return None
+                if result:
+                    chat.follow = True
+                    return ("choice", result)
+        if entry is not None and not chat.typed:
+            _prompt, _options, multi, _custom = current_question(entry, chat.step_at(entry))
+            if multi:
+                value = picked_lines(entry, chat.widget_picks.get(entry.get("id")), chat.step_at(entry))
+                result = chat.commit_choice(value) if value else None
+                if result == "step":
+                    chat.error = ""
+                    chat.follow = True
+                    return None
+                if result:
+                    chat.error = ""
+                    chat.follow = True
+                    return ("choice", result)
         text = chat.arm_send()
         if not text:
             return None
@@ -3255,7 +3756,7 @@ def chat_key(chat, key, stdscr):
         chat.typed = chat.typed[:-1]
         return None
     picked = choice_key(chat, key)
-    if picked in {"ignore", "toggle"}:
+    if picked in {"ignore", "toggle", "step"}:
         return None
     if isinstance(picked, tuple):
         return picked
@@ -3382,6 +3883,8 @@ def chat_loop(stdscr, chat):
                     chat.label = label
                     chat.avatar_color = chat.avatar_color or bot.get("avatarColor") or ""
                     dirty = True
+            if chat.expire_working():
+                dirty = True
             now = time.monotonic()
             if waiting == 0 and now >= next_poll and (chat.loaded or chat.error):
                 jobs.put(("read", chat.take_read()))
