@@ -67,7 +67,7 @@ Authorization on those posts is `Bearer <gatewayToken>`. Local sockets in `gbot`
 
 `Chat` holds the target, title, session id, messages, cursor, typed draft, scroll position, and a phase.
 
-The first load replaces the message list and keeps a local line the thread does not have yet. Later polls pass `--after <cursor>` and merge the new entries, replacing a local user row when the text matches. `gapReset` means the cursor is stale, so the whole thread is replaced, and an unacked local line stays at the end.
+The first load replaces the message list and keeps a local line the thread does not have yet. Later polls pass `--after <cursor>` and merge the new entries. An incoming entry whose id is already on screen replaces that row. A local user row is replaced when the text matches. `gapReset` means the cursor is stale, so the whole thread is replaced, and an unacked local line stays at the end.
 
 Sending clears the draft, appends the user's line to the transcript, and marks the phase `working`. One background worker then calls `gbot send`. The curses loop does not wait on it. The next poll replaces that local row when the thread returns the same user text, and keeps the local row when the poll does not have it yet.
 
@@ -85,12 +85,12 @@ The two-poll window is about four seconds, because the curses loop waits up to 2
 `curses.wrapper` owns the terminal. Keys stay local:
 
 - printable characters and backspace edit the draft. The draft wraps inside the box, and the box grows until one transcript row remains
-- Enter sends. While a decision is waiting and the composer is empty, `y` approves and `n` declines through `gbot approvals respond`
+- Enter sends. While a decision is waiting and the composer is empty, `y` approves and `n` declines through `gbot approvals respond`. The card switches to Approved or Declined immediately, that request id cannot be answered again, and the next read is the whole thread so the gateway status replaces the local one. A failed respond puts the card back to pending
 - Escape returns to the bot list. The list filters as you type; letters match a name or title in order, and a typed substring wins over a scattered one. Up and down move the highlight. The chat's short key wait is turned off here, or the list crashes with no input
 - Page Up / Page Down scroll. Scrolling up turns off follow-tail. Scrolling back to the bottom turns it on
 - Ctrl-C or Ctrl-D exits
 
-The layout follows the desktop chat. The header is the bot's name, a color mark for its avatar, and its tagline when the bot list has one. Opening by name loads that list first, so the tagline is there too. Your lines are a gray bubble on the right (ANSI 235 on a dark terminal, 254 on a light one, from `COLORFGBG`). The bot's lines sit on the left, next to that same mark, in its avatar color, lightened when that color would be hard to read on black. Text wraps on words. A pending approval shows the action's details and, when gbot has the card ids, `y` / `n` in the footer. Under that is a full-width box composer and a one-line footer. The footer says `enter send`, `Generating`, `Pending decision`, or the last `gbot` error. After a reply, two quiet polls mark the turn done and the footer returns to the idle hint.
+The layout follows the desktop chat. The header is the bot's name, a color mark for its avatar, and its tagline when the bot list has one. Opening by name loads that list first, so the tagline is there too. Your lines are a gray bubble on the right (ANSI 235 on a dark terminal, 254 on a light one, from `COLORFGBG`). The bot's lines sit on the left, next to that same mark, in its avatar color, lightened when that color would be hard to read on black. The bot list uses that same color for the mark, including red and yellow, which are also the names of the warning styles. Text wraps on words. A wrapped "- " line keeps a hanging indent. A pending approval shows the action's details and, when gbot has the card ids, `y` / `n` in the footer. Under that is a full-width box composer and a one-line footer. The empty composer leaves a space between the arrow and the cursor. The footer says `enter send`, `Generating`, `Pending decision`, or the last `gbot` error. After a reply, two quiet polls mark the turn done and the footer returns to the idle hint.
 
 On exit the TUI emits an OSC clear and, inside Herdr, `herdr pane release-agent`.
 

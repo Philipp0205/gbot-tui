@@ -83,8 +83,8 @@ DETAIL_KEYS = (
 )
 
 
-def approval_of(entry):
-    """The pending card on one transcript entry, or None."""
+def message_card(entry):
+    """The approval or permission object on one entry, whatever its status."""
     if not isinstance(entry, dict) or entry.get("kind") != "send-message":
         return None
     message = entry.get("message")
@@ -94,7 +94,15 @@ def approval_of(entry):
     card = message.get("approval") if kind == "auto-review-approval" else None
     if kind == "local-tool-permission":
         card = message.get("ask")
-    if not isinstance(card, dict) or card.get("status") != "pending":
+    if not isinstance(card, dict):
+        return None
+    return card
+
+
+def approval_of(entry):
+    """The pending card on one transcript entry, or None."""
+    card = message_card(entry)
+    if card is None or card.get("status") != "pending":
         return None
     details = []
     for key in DETAIL_KEYS:
@@ -106,18 +114,71 @@ def approval_of(entry):
     return {"entry_id": entry_id, "request_id": request_id, "details": details}
 
 
+def request_of(entry):
+    card = message_card(entry)
+    if card is None:
+        return ""
+    request_id = card.get("requestId")
+    return request_id if isinstance(request_id, str) else ""
+
+
 def pending_approval(entries):
     return any(approval_of(entry) for entry in entries)
 
 
-def latest_decision(entries):
-    """Newest card gbot can answer. Accept and decline need both ids."""
+def latest_decision(entries, answered=()):
+    """Newest card gbot can answer. Accept and decline need both ids.
+
+    `answered` is the request ids already sent, so a second key cannot
+    respond again while a poll still shows the old pending card.
+    """
     found = None
     for entry in entries:
         card = approval_of(entry)
-        if card and card["entry_id"] and card["request_id"]:
-            found = card
+        if not card or not card["entry_id"] or not card["request_id"]:
+            continue
+        if card["request_id"] in answered:
+            continue
+        found = card
     return found
+
+
+# Local status written the moment y/n is accepted. The next full read
+# replaces it with whatever status the gateway stored.
+DECISION_STATUS = {"accept": "approved", "decline": "declined"}
+
+CARD_HEADING = {
+    "pending": "Needs approval",
+    "accept": "Approved",
+    "accepted": "Approved",
+    "approve": "Approved",
+    "approved": "Approved",
+    "allow": "Approved",
+    "allow-once": "Approved",
+    "allowed": "Approved",
+    "decline": "Declined",
+    "declined": "Declined",
+    "deny": "Declined",
+    "denied": "Declined",
+    "rejected": "Declined",
+}
+
+
+def card_heading(status):
+    folded = status.lower() if isinstance(status, str) else ""
+    if folded in CARD_HEADING:
+        return CARD_HEADING[folded]
+    if not folded:
+        return ""
+    return folded.replace("-", " ").capitalize()
+
+
+def set_card_status(entry, status):
+    card = message_card(entry)
+    if card is None:
+        return False
+    card["status"] = status
+    return True
 
 
 def watch_step(phase, new_entries, quiet, saw_other, pending):
@@ -804,29 +865,43 @@ def clip(text, width):
 def wrap(text, width):
     """Wrap on spaces. A word longer than the width is the only hard break.
 
-    The space at the break is not drawn on the next line, or the continuation
-    looks indented.
+    The space at the break is not drawn on the next line. A line that starts
+    with "- " keeps a hanging indent, so the continuation lines up under the
+    text after the bullet rather than under the "-".
     """
     width = max(width, 1)
     lines = []
     for raw in text.splitlines() or [""]:
-        rest = raw
-        if rest == "":
-            lines.append("")
+        lines.extend(_wrap_line(raw, width))
+    return lines or [""]
+
+
+def _wrap_line(raw, width):
+    if raw == "":
+        return [""]
+    pad = "  " if raw.startswith("- ") else ""
+    if pad and width <= len(pad):
+        pad = ""
+    rest = raw
+    first = True
+    lines = []
+    while rest:
+        limit = width if first or not pad else width - len(pad)
+        if len(rest) <= limit:
+            lines.append(rest if first else pad + rest)
+            break
+        window = rest[: limit + 1]
+        cut = window.rfind(" ")
+        head = rest[:cut] if cut > 0 else ""
+        # The bullet's own space is not a break, or the first line is just "-".
+        if cut > 0 and head.strip() and not (first and pad and cut <= len(pad)):
+            lines.append(head if first else pad + head)
+            rest = rest[cut + 1 :].lstrip(" ")
+            first = False
             continue
-        while rest:
-            if len(rest) <= width:
-                lines.append(rest)
-                break
-            window = rest[: width + 1]
-            cut = window.rfind(" ")
-            head = rest[:cut] if cut > 0 else ""
-            if cut > 0 and head.strip():
-                lines.append(head)
-                rest = rest[cut + 1 :].lstrip(" ")
-                continue
-            lines.append(rest[:width])
-            rest = rest[width:].lstrip(" ")
+        lines.append(rest[:limit] if first else pad + rest[:limit])
+        rest = rest[limit:].lstrip(" ")
+        first = False
     return lines or [""]
 
 
@@ -850,6 +925,11 @@ class Chat:
         self.avatar_shape = bot.get("avatarShape") or bot.get("avatar_shape") or ""
         self.label = (bot.get("title") or bot.get("tagline") or "").strip()
         self.deciding = False
+        self.answered = {}
+        self.pending_request = ""
+        self.full_reload = False
+        self.replacing = False
+        self.rows_rev = 0
 
     def note(self, phase):
         if phase != self.phase:
@@ -873,12 +953,15 @@ class Chat:
                 if not self._covers(entry):
                     self.messages.append(entry)
             self.cursor = page["cursor"]
-            return []
-        fresh = list(page["entries"])
-        for entry in fresh:
-            self._absorb(entry)
-        if page["cursor"]:
-            self.cursor = page["cursor"]
+            fresh = []
+        else:
+            fresh = list(page["entries"])
+            for entry in fresh:
+                self._absorb(entry)
+            if page["cursor"]:
+                self.cursor = page["cursor"]
+        self._stamp_answered()
+        self.touch_rows()
         return fresh
 
     def _covers(self, local):
@@ -901,6 +984,12 @@ class Chat:
         return False
 
     def _absorb(self, entry):
+        entry_id = entry.get("id") if isinstance(entry, dict) else None
+        if isinstance(entry_id, str) and entry_id:
+            for index, existing in enumerate(self.messages):
+                if existing.get("id") == entry_id:
+                    self.messages[index] = entry
+                    return
         if self._take_local(entry):
             return
         index = next((i for i, local in enumerate(self.messages) if local.get("local")), None)
@@ -909,8 +998,84 @@ class Chat:
         else:
             self.messages.insert(index, entry)
 
+    def _stamp_answered(self):
+        """A poll that still says pending must not undo a decision just sent."""
+        for entry in self.messages:
+            decision = self.answered.get(request_of(entry))
+            if not decision:
+                continue
+            card = message_card(entry)
+            if card is not None and card.get("status") == "pending":
+                set_card_status(entry, DECISION_STATUS[decision])
+
+    def touch_rows(self):
+        self.rows_rev += 1
+        self._rows_key = None
+
+    def begin_decision(self, decision):
+        """Mark the newest card decided and return the gbot arguments.
+
+        None means this request was already answered, or there is nothing to answer.
+        """
+        card = latest_decision(self.messages, self.answered)
+        if not card or decision not in DECISION_STATUS:
+            return None
+        request_id = card["request_id"]
+        self.answered[request_id] = decision
+        status = DECISION_STATUS[decision]
+        for entry in self.messages:
+            if entry.get("id") == card["entry_id"] or request_of(entry) == request_id:
+                set_card_status(entry, status)
+        self.pending_request = request_id
+        self.deciding = True
+        self.touch_rows()
+        if self.phase == "blocked" and not pending_approval(self.messages):
+            self.note("idle")
+        return (self.target, card["entry_id"], request_id, decision)
+
+    def finish_decision(self):
+        """The respond call returned. The next read is the whole thread."""
+        self.deciding = False
+        self.pending_request = ""
+        self.full_reload = True
+
+    def fail_decision(self):
+        """The respond call failed. Put the card back so it can be retried."""
+        request_id = self.pending_request
+        self.deciding = False
+        self.pending_request = ""
+        if request_id:
+            self.answered.pop(request_id, None)
+            for entry in self.messages:
+                if request_of(entry) == request_id:
+                    set_card_status(entry, "pending")
+            self.touch_rows()
+            if pending_approval(self.messages) and self.phase != "blocked":
+                self.note("blocked")
+
+    def take_read(self):
+        """Arguments for the next `gbot thread` call.
+
+        After a decision the following read drops `--after` once, so the
+        gateway can return the card with its new status. Later polls resume
+        from the cursor.
+        """
+        if self.full_reload:
+            self.full_reload = False
+            self.replacing = True
+            return (self.target,)
+        if self.cursor:
+            return (self.target, self.cursor)
+        return (self.target,)
+
+    def read_failed(self):
+        if self.replacing:
+            self.replacing = False
+            self.full_reload = True
+
     def ingest(self, page, first=False):
-        replace = first or not self.cursor or page["gap_reset"]
+        replace = first or not self.cursor or page["gap_reset"] or self.replacing
+        self.replacing = False
         if replace:
             self.apply(page, replace=True)
             fresh = []
@@ -1053,15 +1218,15 @@ def bubble_column(width, text):
 
 
 def composer_text_width(width):
-    # " → " plus the two borders, and one cell so the cursor is not on the border.
-    return max(width - 6, 1)
+    # " →  " plus the two borders, and one cell so the cursor is not on the border.
+    return max(width - 7, 1)
 
 
 def composer_cursor_column(line, placeholder):
-    """Empty draft: sit on the space before the placeholder, not on its first letter."""
+    """Empty draft: sit on the space between the arrow and the placeholder."""
     if placeholder:
-        return 3
-    return 4 + len(line or "")
+        return 4
+    return 5 + len(line or "")
 
 
 def draft_lines(typed, width):
@@ -1094,7 +1259,13 @@ def layout(height, text_lines=1):
 def visible_rows(chat, width):
     # Wrapping the whole thread on every keystroke is what made typing feel late.
     last = chat.messages[-1] if chat.messages else None
-    key = (id(chat.messages), len(chat.messages), width, entry_text(last) if last else "")
+    key = (
+        id(chat.messages),
+        len(chat.messages),
+        width,
+        entry_text(last) if last else "",
+        chat.rows_rev,
+    )
     if getattr(chat, "_rows_key", None) != key:
         chat._rows = transcript_rows(chat.messages, width)
         chat._rows_key = key
@@ -1102,13 +1273,18 @@ def visible_rows(chat, width):
 
 
 def card_lines(entry, width):
-    card = approval_of(entry)
-    if not card:
+    card = message_card(entry)
+    if card is None:
         return []
-    lines = ["Needs approval"]
+    heading = card_heading(card.get("status"))
+    if not heading:
+        return []
+    lines = [heading]
     room = max(width - 2, 1)
-    for detail in card["details"]:
-        lines.extend(wrap(detail, room))
+    for key in DETAIL_KEYS:
+        value = card.get(key)
+        if isinstance(value, str) and value.strip():
+            lines.extend(wrap(value.strip(), room))
     return lines
 
 
@@ -1151,7 +1327,7 @@ def composer_lines(width, typed):
     shown = typed if typed else "Add a follow-up"
     if typed:
         shown = draft_lines(typed, width)[0]
-    body = f" → {shown}"[: span - 2].ljust(span - 2)
+    body = f" →  {shown}"[: span - 2].ljust(span - 2)
     return "┌" + rule + "┐", "│" + body + "│", "└" + rule + "┘"
 
 
@@ -1231,6 +1407,14 @@ def put(stdscr, y, x, text, attr=0):
 
 
 def span_attr(style):
+    """Named text styles stay named. A bot color uses a `bot:` prefix.
+
+    "red" and "yellow" are both avatar colors and the warning styles. The
+    footer asks for the warning style by those names. The bot list asks for
+    the avatar color as `bot:red`, which is the lightened bot color.
+    """
+    if isinstance(style, str) and style.startswith("bot:"):
+        return bot_text_attr(style[4:])
     if style in ATTR:
         return ATTR[style]
     return avatar_attr(style)
@@ -1251,7 +1435,7 @@ def paint_composer(stdscr, y, width, lines, placeholder=False):
     attr = ATTR["dim"] if placeholder else ATTR["default"]
     for index, line in enumerate(lines):
         put(stdscr, y + index, 0, "│", ATTR["default"])
-        prefix = " → " if index == 0 else "   "
+        prefix = " →  " if index == 0 else "    "
         put(stdscr, y + index, 1, (prefix + line)[:inner], attr)
         put(stdscr, y + index, span - 1, "│", ATTR["default"])
 
@@ -1306,13 +1490,13 @@ def draw(stdscr, chat):
             stdscr,
             composer_at,
             0,
-            clip("→ " + shown, max(width - 1, 0)),
+            clip("→  " + shown, max(width - 1, 0)),
             ATTR["default"] if chat.typed else ATTR["dim"],
         )
-        column = 1 if not chat.typed else 2 + len(chat.typed)
+        column = 2 if not chat.typed else 3 + len(chat.typed)
         cursor = (composer_at, min(column, max(width - 2, 0)))
     if footer_h:
-        decide = bool(latest_decision(chat.messages)) and not chat.deciding
+        decide = bool(latest_decision(chat.messages, chat.answered)) and not chat.deciding
         paint_spans(stdscr, height - 1, 1, footer_spans(chat.phase, chat.error, decide=decide))
     # The footer write leaves the cursor on "scroll". Put it back in the box.
     if cursor:
@@ -1384,14 +1568,15 @@ def chat_loop(stdscr, chat):
                     source, message = payload
                     chat.error = message
                     if source == "decide":
-                        chat.deciding = False
+                        chat.fail_decision()
                     if source == "send" and chat.phase == "working":
                         chat.note("idle")
                     if source == "read":
+                        chat.read_failed()
                         next_poll = time.monotonic() + 2
                 elif kind in {"sent", "decided"}:
                     if kind == "decided":
-                        chat.deciding = False
+                        chat.finish_decision()
                     next_poll = 0
                 elif not loaded:
                     chat.ingest(payload, first=True)
@@ -1401,8 +1586,7 @@ def chat_loop(stdscr, chat):
                     chat.ingest(payload, first=False)
             now = time.monotonic()
             if waiting == 0 and now >= next_poll and (loaded or chat.error):
-                after = chat.cursor
-                jobs.put(("read", (chat.target, after) if after else (chat.target,)))
+                jobs.put(("read", chat.take_read()))
                 waiting += 1
                 next_poll = now + 2
             if dirty:
@@ -1443,25 +1627,19 @@ def chat_loop(stdscr, chat):
                 jobs.put(("send", (chat.target, text)))
                 waiting += 1
                 continue
-            if (
-                key in ("y", "Y", "n", "N")
-                and chat.phase == "blocked"
-                and not chat.typed
-                and not chat.deciding
+            if key in ("y", "Y", "n", "N") and not chat.typed and (
+                chat.phase == "blocked" or chat.deciding
             ):
-                card = latest_decision(chat.messages)
-                if card:
-                    decision = "accept" if key in ("y", "Y") else "decline"
-                    chat.deciding = True
-                    chat.error = ""
-                    jobs.put(
-                        (
-                            "decide",
-                            (chat.target, card["entry_id"], card["request_id"], decision),
-                        )
-                    )
-                    waiting += 1
+                if chat.deciding:
                     continue
+                decision = "accept" if key in ("y", "Y") else "decline"
+                args = chat.begin_decision(decision)
+                if not args:
+                    continue
+                chat.error = ""
+                jobs.put(("decide", args))
+                waiting += 1
+                continue
             if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
                 chat.typed = chat.typed[:-1]
                 continue
@@ -1508,7 +1686,9 @@ def picker_spans(bot, selected, width):
     lead_style = "bold" if selected else "dim"
     color = (bot.get("avatarColor") or bot.get("avatar_color") or "").lower()
     room = max(width - 7, 1)
-    mark = ("● ", color or "default")
+    # red and yellow are also warning styles. Ask for the avatar color by name.
+    mark_style = "bot:" + color if color in AVATAR_COLORS and color in ATTR else (color or "default")
+    mark = ("● ", mark_style)
     if not title:
         return [(lead, lead_style), mark, (clip(name, room), name_style)]
     name_room = min(len(name), max(room // 2, 1))

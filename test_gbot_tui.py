@@ -278,15 +278,14 @@ class LookTests(unittest.TestCase):
         top, mid, bot = gbot_tui.composer_lines(32, "")
         self.assertTrue(top.startswith("┌") and top.endswith("┐"))
         self.assertTrue(bot.startswith("└") and bot.endswith("┘"))
-        self.assertIn("→", mid)
-        self.assertIn("Add a follow-up", mid)
+        self.assertIn("→  Add a follow-up", mid)
         _top, typed, _bot = gbot_tui.composer_lines(32, "hello")
         self.assertIn("hello", typed)
         self.assertNotIn("Add a follow-up", typed)
         wide, _middle, wide_bottom = gbot_tui.composer_lines(58, "")
         self.assertEqual(len(wide), 58)
         self.assertEqual(len(wide_bottom), 58)
-        self.assertEqual(gbot_tui.composer_cursor_column("", True), 3)
+        self.assertEqual(gbot_tui.composer_cursor_column("", True), 4)
 
     def test_long_draft_wraps_and_the_box_grows(self):
         text = "abcdefghijklmnopqrstuvwxyz"
@@ -378,6 +377,198 @@ class LookTests(unittest.TestCase):
         card = gbot_tui.latest_decision([entry])
         self.assertEqual((card["entry_id"], card["request_id"]), ("card", "ask"))
 
+    def test_a_decision_updates_the_card_and_will_not_send_twice(self):
+        chat = gbot_tui.Chat("Researcher")
+        chat.phase = "blocked"
+        chat.messages = [
+            {
+                "id": "card",
+                "kind": "send-message",
+                "message": {
+                    "type": "auto-review-approval",
+                    "approval": {
+                        "status": "pending",
+                        "requestId": "ask",
+                        "command": "npm publish",
+                    },
+                },
+            }
+        ]
+        first = chat.begin_decision("accept")
+        self.assertEqual(first, ("Researcher", "card", "ask", "accept"))
+        texts = [text for kind, text in gbot_tui.transcript_rows(chat.messages, 40) if kind == "card"]
+        self.assertEqual(texts[0], "Approved")
+        self.assertIn("npm publish", texts)
+        self.assertIsNone(gbot_tui.latest_decision(chat.messages, chat.answered))
+        self.assertFalse(gbot_tui.pending_approval(chat.messages))
+        self.assertEqual(chat.phase, "idle")
+        self.assertIsNone(chat.begin_decision("decline"))
+        declined = gbot_tui.Chat("Researcher")
+        declined.phase = "blocked"
+        declined.messages = [
+            {
+                "id": "card",
+                "kind": "send-message",
+                "message": {
+                    "type": "local-tool-permission",
+                    "ask": {"status": "pending", "requestId": "ask"},
+                },
+            }
+        ]
+        declined.begin_decision("decline")
+        rows = gbot_tui.transcript_rows(declined.messages, 40)
+        self.assertEqual(rows, [("card", "Declined")])
+
+    def test_a_failed_decision_can_be_retried(self):
+        chat = gbot_tui.Chat("Researcher")
+        chat.phase = "blocked"
+        chat.messages = [
+            {
+                "id": "card",
+                "kind": "send-message",
+                "message": {
+                    "type": "auto-review-approval",
+                    "approval": {"status": "pending", "requestId": "ask"},
+                },
+            }
+        ]
+        chat.begin_decision("accept")
+        chat.fail_decision()
+        self.assertEqual(chat.messages[0]["message"]["approval"]["status"], "pending")
+        self.assertEqual(chat.phase, "blocked")
+        self.assertEqual(chat.begin_decision("decline")[-1], "decline")
+
+    def test_a_decision_reloads_the_full_thread_once(self):
+        chat = gbot_tui.Chat("Researcher")
+        chat.cursor = "m9"
+        chat.finish_decision()
+        self.assertEqual(chat.take_read(), ("Researcher",))
+        self.assertTrue(chat.replacing)
+        self.assertEqual(chat.take_read(), ("Researcher", "m9"))
+        chat.finish_decision()
+        chat.take_read()
+        chat.read_failed()
+        self.assertEqual(chat.take_read(), ("Researcher",))
+
+    def test_the_full_reload_replaces_a_card_the_cursor_would_skip(self):
+        chat = gbot_tui.Chat("Researcher")
+        chat.phase = "blocked"
+        chat.cursor = "card"
+        chat.messages = [
+            {
+                "id": "card",
+                "kind": "send-message",
+                "message": {
+                    "type": "auto-review-approval",
+                    "approval": {"status": "pending", "requestId": "ask", "command": "npm publish"},
+                },
+            }
+        ]
+        chat.begin_decision("accept")
+        chat.finish_decision()
+        chat.take_read()
+        stale = gbot_tui.parse_thread(
+            {
+                "transcript": {
+                    "entries": [
+                        {
+                            "id": "card",
+                            "kind": "send-message",
+                            "message": {
+                                "type": "auto-review-approval",
+                                "approval": {
+                                    "status": "pending",
+                                    "requestId": "ask",
+                                    "command": "npm publish",
+                                },
+                            },
+                        }
+                    ]
+                },
+                "cursor": "card",
+            }
+        )
+        chat.ingest(stale)
+        self.assertEqual(len(chat.messages), 1)
+        texts = [text for kind, text in gbot_tui.transcript_rows(chat.messages, 40) if kind == "card"]
+        self.assertEqual(texts[0], "Approved")
+        self.assertIsNone(chat.begin_decision("decline"))
+        fresh = gbot_tui.parse_thread(
+            {
+                "transcript": {
+                    "entries": [
+                        {
+                            "id": "card",
+                            "kind": "send-message",
+                            "message": {
+                                "type": "auto-review-approval",
+                                "approval": {
+                                    "status": "approved",
+                                    "requestId": "ask",
+                                    "command": "npm publish",
+                                },
+                            },
+                        }
+                    ]
+                },
+                "cursor": "card",
+            }
+        )
+        chat.replacing = True
+        chat.ingest(fresh)
+        self.assertEqual(len(chat.messages), 1)
+        texts = [text for kind, text in gbot_tui.transcript_rows(chat.messages, 40) if kind == "card"]
+        self.assertEqual(texts[0], "Approved")
+
+    def test_an_updated_entry_replaces_the_same_id(self):
+        chat = gbot_tui.Chat("Researcher")
+        chat.messages = [{"id": "m1", "role": "assistant", "text": "old"}]
+        chat.cursor = "m1"
+        page = gbot_tui.parse_thread(
+            {
+                "transcript": {"entries": [{"id": "m1", "role": "assistant", "text": "new"}]},
+                "cursor": "m1",
+            }
+        )
+        chat.apply(page, replace=False)
+        self.assertEqual(len(chat.messages), 1)
+        self.assertEqual(gbot_tui.entry_text(chat.messages[0]), "new")
+        extra = gbot_tui.parse_thread(
+            {
+                "transcript": {"entries": [{"id": "m2", "role": "assistant", "text": "later"}]},
+                "cursor": "m2",
+            }
+        )
+        chat.apply(extra, replace=False)
+        self.assertEqual(
+            [gbot_tui.entry_text(entry) for entry in chat.messages],
+            ["new", "later"],
+        )
+
+    def test_red_and_yellow_list_dots_use_the_bot_color(self):
+        sentinel = object()
+        warn = object()
+        saved_text = dict(gbot_tui.TEXT_ATTR)
+        saved_red = gbot_tui.ATTR["red"]
+        try:
+            gbot_tui.TEXT_ATTR["red"] = sentinel
+            gbot_tui.TEXT_ATTR["yellow"] = sentinel
+            gbot_tui.ATTR["red"] = warn
+            self.assertIs(gbot_tui.span_attr("bot:red"), sentinel)
+            self.assertIs(gbot_tui.span_attr("bot:yellow"), sentinel)
+            self.assertIs(gbot_tui.span_attr("red"), warn)
+            self.assertIs(gbot_tui.span_attr("bold"), gbot_tui.ATTR["bold"])
+        finally:
+            gbot_tui.TEXT_ATTR.clear()
+            gbot_tui.TEXT_ATTR.update(saved_text)
+            gbot_tui.ATTR["red"] = saved_red
+        spans = gbot_tui.picker_spans({"name": "Alert", "title": "", "avatarColor": "red"}, True, 40)
+        self.assertEqual(spans[1], ("● ", "bot:red"))
+        yellow = gbot_tui.picker_spans(
+            {"name": "Alert", "title": "", "avatarColor": "yellow"}, True, 40
+        )
+        self.assertEqual(yellow[1], ("● ", "bot:yellow"))
+
     def test_wrap_keeps_words_together(self):
         self.assertEqual(gbot_tui.wrap("right now", 7), ["right", "now"])
         self.assertEqual(gbot_tui.wrap("your turn", 4), ["your", "turn"])
@@ -388,6 +579,8 @@ class LookTests(unittest.TestCase):
             ["abcdefghij", "klmnopqrst", "uvwxyz"],
         )
         self.assertTrue(all(not line.startswith(" ") for line in gbot_tui.wrap("hello world", 6)))
+        self.assertEqual(gbot_tui.wrap("- hello world", 10), ["- hello", "  world"])
+        self.assertEqual(gbot_tui.wrap("- short", 20), ["- short"])
 
     def test_red_text_is_lighter_on_black(self):
         original = gbot_tui.avatar_color("red")
