@@ -1363,34 +1363,48 @@ def composer_lines(width, typed):
 
 
 DECIDE_HINT = "  y approve · n decline · ctrl-y/n types"
+SHORT_HINT = "  y/n"
+ERROR_ROWS = 3
 
 
 def footer_spans(phase, error, decide=False, width=0):
+    """One footer line. With a width, the y/n hint shrinks before the error does."""
+    room = max(width - 2, 0) if width else 0
     if phase == "blocked":
         # The error used to replace this line, so a failed respond hid y/n
         # while the card was pending again.
-        spans = [(error, "red")] if error else [("Pending decision", "yellow")]
-        if decide:
-            spans.append((DECIDE_HINT, "dim"))
-        return fit_spans(spans, max(width - 2, 0) if width else 0)
+        lead = (error, "red") if error else ("Pending decision", "yellow")
+        if not decide:
+            return [(clip(lead[0], room) if room else lead[0], lead[1])]
+        hint = DECIDE_HINT
+        if room and len(lead[0]) + len(hint) > room:
+            hint = SHORT_HINT
+        if room and len(lead[0]) + len(hint) > room:
+            lead = (clip(lead[0], max(room - len(hint), 1)), lead[1])
+        return [lead, (hint, "dim")]
     if error:
-        return [(error, "red")]
+        return [(clip(error, room) if room else error, "red")]
     if phase == "working":
         return [("Generating", "bold"), ("  —  pgup scroll", "dim")]
     return [("enter send · esc bots · ctrl-c quit · pgup scroll", "dim")]
 
 
-def fit_spans(spans, room):
-    """Keep the last span, and clip the first, when the footer is one short line."""
-    if room <= 0 or sum(len(text) for text, _style in spans) <= room:
-        return spans
-    if len(spans) == 1:
-        return [(clip(spans[0][0], room), spans[0][1])]
-    tail = spans[-1]
-    head_room = room - len(tail[0])
-    if head_room < 4:
-        return [(clip(tail[0], room), tail[1])]
-    return [(clip(spans[0][0], head_room), spans[0][1]), tail]
+def footer_rows(phase, error, decide=False, width=0):
+    """Footer lines, bottom last. An error too long for one line gets rows of its own.
+
+    A 401 or a gateway message has to stay readable in a 58-column window, so
+    it is wrapped above the footer rather than clipped beside the y/n hint.
+    """
+    room = max(width - 2, 1)
+    hint = len(SHORT_HINT) if phase == "blocked" and decide else 0
+    if not error or len(error) + hint <= room:
+        return [footer_spans(phase, error, decide, width)]
+    lines = wrap(error, room)
+    if len(lines) > ERROR_ROWS:
+        lines = lines[: ERROR_ROWS - 1] + [clip(" ".join(lines[ERROR_ROWS - 1 :]), room)]
+    rows = [[(line, "red")] for line in lines]
+    rows.append(footer_spans(phase, "", decide, width))
+    return rows
 
 
 # -1 keeps the terminal background. A filled curses color is the block this CLI does not use.
@@ -1509,6 +1523,13 @@ def draw(stdscr, chat):
     stdscr.erase()
     lines = draft_lines(chat.typed, width)
     header, body_h, composer_h, footer_h = layout(height, len(lines) or 1)
+    footer = []
+    if footer_h:
+        decide = bool(latest_decision(chat.messages, chat.answered)) and not chat.deciding
+        footer = footer_rows(chat.phase, chat.error, decide=decide, width=width)
+        # Error rows come out of the transcript, which keeps at least one row.
+        footer = footer[-max(min(len(footer), body_h), 1) :]
+        body_h -= len(footer) - 1
     color = getattr(chat, "avatar_color", "")
     label = getattr(chat, "label", "")
     if header:
@@ -1561,14 +1582,8 @@ def draw(stdscr, chat):
         )
         column = 2 if not chat.typed else 3 + len(chat.typed)
         cursor = (composer_at, min(column, max(width - 2, 0)))
-    if footer_h:
-        decide = bool(latest_decision(chat.messages, chat.answered)) and not chat.deciding
-        paint_spans(
-            stdscr,
-            height - 1,
-            1,
-            footer_spans(chat.phase, chat.error, decide=decide, width=width),
-        )
+    for offset, spans in enumerate(footer):
+        paint_spans(stdscr, height - len(footer) + offset, 1, spans)
     # The footer write leaves the cursor on "scroll". Put it back in the box.
     if cursor:
         try:

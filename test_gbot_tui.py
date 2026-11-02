@@ -606,14 +606,28 @@ class LookTests(unittest.TestCase):
         self.assertEqual(failed[0], ("gateway down", "red"))
         self.assertIn("approve", failed[1][0])
         self.assertIn("decline", failed[1][0])
-        narrow = gbot_tui.footer_spans(
-            "blocked",
-            "the approval gateway rejected this decision because the card changed",
-            decide=True,
-            width=58,
-        )
-        self.assertIn("approve", narrow[-1][0])
-        self.assertLessEqual(sum(len(text) for text, _style in narrow), 56)
+        roomy = gbot_tui.footer_spans("blocked", "gateway down", decide=True, width=80)
+        self.assertIn("approve", roomy[-1][0])
+
+    def test_a_long_error_stays_readable_in_a_narrow_footer(self):
+        short = "EnsureSandBox failed: 401 Unauthorized"
+        rows = gbot_tui.footer_rows("blocked", short, decide=True, width=58)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], (short, "red"))
+        self.assertEqual(rows[0][1][0].strip(), "y/n")
+        self.assertLessEqual(sum(len(text) for text, _style in rows[0]), 56)
+        long = "the approval gateway rejected this decision because the card changed (401)"
+        rows = gbot_tui.footer_rows("blocked", long, decide=True, width=58)
+        self.assertGreater(len(rows), 1)
+        shown = " ".join(text for row in rows[:-1] for text, _style in row)
+        self.assertEqual(shown, long)
+        self.assertTrue(all(style == "red" for row in rows[:-1] for _text, style in row))
+        self.assertTrue(all(sum(len(text) for text, _style in row) <= 56 for row in rows))
+        self.assertIn("y", "".join(text for text, _style in rows[-1]))
+        self.assertEqual(rows[-1][0], ("Pending decision", "yellow"))
+        idle = gbot_tui.footer_rows("idle", long, width=58)
+        self.assertEqual(" ".join(text for row in idle[:-1] for text, _style in row), long)
+        self.assertEqual(idle[-1], gbot_tui.footer_spans("idle", ""))
 
     def test_decided_cards_leave_the_warning_color(self):
         pending = {
