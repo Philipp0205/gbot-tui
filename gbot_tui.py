@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Chat with one Grok Bot. Inside Herdr, the pane shows up in the agents list."""
+"""Chat with one Grok Bot. Inside Herdr, the pane shows up in the agents list.
+
+The bot list is an overview: who needs you, who is running, and who has a new reply.
+"""
 
 import atexit
 import base64
@@ -359,25 +362,30 @@ def gbot_failure(stdout, stderr):
     return "gbot failed"
 
 
+# One gbot process at a time, so a list scan cannot pass a send or a chat read.
+GBOT_LOCK = threading.Lock()
+
+
 def gbot(*args, timeout=60):
     env = os.environ.copy()
     # gbot 0.12.4 tells Cursor it is Grok Bot 0.20.0, which the server rejects.
     env.setdefault("SAND_CLIENT_VERSION", sand_client_version())
-    try:
-        proc = subprocess.run(
-            gbot_argv(args),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise GbotError("gbot timed out") from error
-    except FileNotFoundError as error:
-        raise GbotError("gbot is not on PATH") from error
-    if proc.returncode != 0:
-        raise GbotError(gbot_failure(proc.stdout, proc.stderr))
-    return parse_gbot(proc.stdout)
+    with GBOT_LOCK:
+        try:
+            proc = subprocess.run(
+                gbot_argv(args),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise GbotError("gbot timed out") from error
+        except FileNotFoundError as error:
+            raise GbotError("gbot is not on PATH") from error
+        if proc.returncode != 0:
+            raise GbotError(gbot_failure(proc.stdout, proc.stderr))
+        return parse_gbot(proc.stdout)
 
 
 ROSTER = {}
@@ -546,6 +554,474 @@ def read_thread_cache(target):
     if not isinstance(entries, list):
         return []
     return [entry for entry in entries if isinstance(entry, dict)]
+
+
+# How many trailing entries the overview reads. Same window as a chat poll,
+# so a pending card the chat would see is visible here too.
+OVERVIEW_LIMIT = 80
+# The list stays open. Scan again this long after the previous pass finishes.
+OVERVIEW_PAUSE = 8
+OVERVIEW_STATES = ("blocked", "unread", "working", "idle")
+ATTENTION_RANK = {"blocked": 0, "unread": 1, "working": 2, "idle": 4}
+STATUS_STYLE = {"blocked": "yellow", "unread": "green", "working": "bold", "idle": "dim"}
+# In-progress flags a transcript entry may carry. Absent on a finished line.
+PROGRESS_STATES = {"running", "streaming", "in_progress", "generating", "working"}
+
+STATE_LOCK = threading.Lock()
+ACTIVITY = {}
+SEEN = {}
+ACTIVITY_LOADED = {"done": False}
+SEEN_LOADED = {"done": False}
+
+
+def activity_path():
+    return os.path.join(cache_dir(), "activity.json")
+
+
+def seen_path():
+    return os.path.join(cache_dir(), "seen.json")
+
+
+def activity_keys(bot):
+    keys = []
+    bot_id = bot.get("id") if isinstance(bot, dict) else ""
+    name = bot.get("name") if isinstance(bot, dict) else ""
+    if isinstance(bot_id, str) and bot_id:
+        keys.append("id:" + bot_id)
+    if isinstance(name, str) and name:
+        keys.append("name:" + name)
+    return keys
+
+
+def _clean_snap(snap):
+    if not isinstance(snap, dict) or snap.get("state") not in OVERVIEW_STATES:
+        return None
+    unread = snap.get("unread")
+    return {
+        "state": snap["state"],
+        "unread": unread if isinstance(unread, int) and unread > 0 else 0,
+        "cursor": snap.get("cursor") if isinstance(snap.get("cursor"), str) else "",
+        "preview": snap.get("preview") if isinstance(snap.get("preview"), str) else "",
+    }
+
+
+def load_activity():
+    with STATE_LOCK:
+        if ACTIVITY_LOADED["done"]:
+            return
+        ACTIVITY_LOADED["done"] = True
+        data = read_json(activity_path())
+        if not isinstance(data, dict):
+            return
+        for key, snap in data.items():
+            clean = _clean_snap(snap)
+            if isinstance(key, str) and clean:
+                ACTIVITY[key] = clean
+
+
+def load_seen():
+    with STATE_LOCK:
+        if SEEN_LOADED["done"]:
+            return
+        SEEN_LOADED["done"] = True
+        data = read_json(seen_path())
+        if not isinstance(data, dict):
+            return
+        for key, cursor in data.items():
+            if isinstance(key, str) and isinstance(cursor, str) and cursor:
+                SEEN[key] = cursor
+
+
+def _save_locked(path, data):
+    write_private(path, data)
+
+
+def store_activity(bot, snap):
+    clean = _clean_snap(snap)
+    keys = activity_keys(bot)
+    if not clean or not keys:
+        return
+    load_activity()
+    with STATE_LOCK:
+        for key in keys:
+            ACTIVITY[key] = clean
+        _save_locked(activity_path(), dict(ACTIVITY))
+
+
+def lookup_activity(bot):
+    load_activity()
+    with STATE_LOCK:
+        for key in activity_keys(bot):
+            snap = ACTIVITY.get(key)
+            if snap:
+                return dict(snap)
+    return None
+
+
+def remember_seen(name, bot_id, cursor):
+    """The latest entry this chat had on screen. A later reply is then `new`."""
+    if not isinstance(cursor, str) or not cursor:
+        return
+    load_seen()
+    with STATE_LOCK:
+        if bot_id:
+            SEEN["id:" + str(bot_id)] = cursor
+        if name:
+            SEEN["name:" + name] = cursor
+        _save_locked(seen_path(), dict(SEEN))
+
+
+def lookup_seen(bot):
+    load_seen()
+    with STATE_LOCK:
+        for key in activity_keys(bot):
+            cursor = SEEN.get(key)
+            if cursor:
+                return cursor
+    return ""
+
+
+def seen_mark(bot):
+    """The cursor to diff against. A bot never opened is not all `new` on first sight.
+
+    Order: the chat's seen file, then the cached thread (the last time it was
+    on screen), then the previous scan. That last one is only a baseline, so
+    the next pass can see replies that arrived after it.
+    """
+    seen = lookup_seen(bot)
+    if seen:
+        return seen
+    cached = last_id(read_thread_cache(bot.get("name") or ""))
+    if cached:
+        return cached
+    previous = lookup_activity(bot)
+    if previous and previous.get("cursor"):
+        return previous["cursor"]
+    return ""
+
+
+def one_line(text, limit=160):
+    flat = " ".join(str(text).split())
+    if len(flat) <= limit:
+        return flat
+    if limit <= 1:
+        return "…"
+    return flat[: limit - 1] + "…"
+
+
+def awaiting_reply(entries):
+    """True when the last line with text is the user's. The bot has not answered."""
+    speaker = ""
+    for entry in entries:
+        if entry.get("local"):
+            continue
+        text = entry_text(entry).strip()
+        if not text:
+            continue
+        speaker = "user" if is_user(entry) else "other"
+    return speaker == "user"
+
+
+def entry_in_progress(entries):
+    if not entries:
+        return False
+    last = entries[-1]
+    if last.get("local"):
+        return False
+    if last.get("streaming") is True or last.get("inProgress") is True:
+        return True
+    status = last.get("status")
+    if isinstance(status, str) and status.lower() in PROGRESS_STATES:
+        return True
+    return False
+
+
+def notable(entry):
+    """A line worth calling new: a bot message or a card, not the user's own text."""
+    if not isinstance(entry, dict) or entry.get("local") or is_user(entry):
+        return False
+    if entry_text(entry).strip():
+        return True
+    return approval_of(entry) is not None
+
+
+def unseen_notable(entries, seen):
+    if not seen:
+        return 0
+    index = next((i for i, entry in enumerate(entries) if entry.get("id") == seen), None)
+    # The seen id is older than this tail, so every line here arrived after it.
+    rest = entries if index is None else entries[index + 1 :]
+    return sum(1 for entry in rest if notable(entry))
+
+
+def activity_preview(entries, state):
+    if state == "blocked":
+        for entry in reversed(entries):
+            card = approval_of(entry)
+            if not card:
+                continue
+            if card["details"]:
+                return one_line(card["details"][0])
+            return "Needs approval"
+    for entry in reversed(entries):
+        text = entry_text(entry).strip()
+        if text:
+            return one_line(text)
+    return ""
+
+
+def judge_activity(entries, cursor, seen):
+    """What one thread tail says. `seen` is the last cursor the user had on screen.
+
+    An empty `seen` does not mark the whole history as new. `blocked` wins over
+    a new reply, and a new reply wins over `running`.
+    """
+    entries = [entry for entry in entries if isinstance(entry, dict) and not entry.get("local")]
+    cursor = cursor or last_id(entries)
+    if pending_approval(entries):
+        phase = "blocked"
+    elif awaiting_reply(entries) or entry_in_progress(entries):
+        phase = "working"
+    else:
+        phase = "idle"
+    unread = unseen_notable(entries, seen)
+    if phase == "blocked":
+        state = "blocked"
+    elif unread:
+        state = "unread"
+    else:
+        state = phase
+    return {
+        "state": state,
+        "unread": unread,
+        "cursor": cursor,
+        "preview": activity_preview(entries, state),
+    }
+
+
+def status_label(state, unread=0):
+    if state == "blocked":
+        return "needs you"
+    if state == "unread":
+        count = unread if isinstance(unread, int) else 0
+        if count > 1:
+            return f"{count} new"
+        return "new"
+    if state == "working":
+        return "running"
+    if state == "idle":
+        return "idle"
+    return ""
+
+
+def with_activity(bots):
+    views = []
+    for bot in bots:
+        view = dict(bot)
+        snap = lookup_activity(bot)
+        if snap:
+            view["activity"] = snap
+        views.append(view)
+    return views
+
+
+def order_bots(bots):
+    """Needs-you, then new, then running. A search does not use this order."""
+    ranked = []
+    for index, bot in enumerate(bots):
+        state = ((bot.get("activity") or {}).get("state")) or ""
+        rank = ATTENTION_RANK.get(state, 3)
+        ranked.append((rank, index, bot))
+    ranked.sort()
+    return [bot for _rank, _index, bot in ranked]
+
+
+def attention_counts(bots):
+    counts = {state: 0 for state in OVERVIEW_STATES}
+    for bot in bots:
+        state = ((bot.get("activity") or {}).get("state")) or ""
+        if state in counts:
+            counts[state] += 1
+    return counts
+
+
+def _count_phrase(count, one, many):
+    if count == 1:
+        return one
+    if count:
+        return f"{count} {many}"
+    return ""
+
+
+def overview_summary(bots, checked=None, total=None):
+    """One line: `1 needs you · 2 new · 1 running`, plus a scan hint while reading."""
+    counts = attention_counts(bots)
+    parts = [
+        phrase
+        for phrase in (
+            _count_phrase(counts["blocked"], "1 needs you", "need you"),
+            _count_phrase(counts["unread"], "1 new", "new"),
+            _count_phrase(counts["working"], "1 running", "running"),
+        )
+        if phrase
+    ]
+    scanning = bool(total) and checked is not None and checked < total
+    if not parts:
+        if scanning:
+            if not checked:
+                return "checking threads"
+            return f"checking {checked} of {total}"
+        return _count_phrase(counts["idle"], "1 idle", "idle")
+    if scanning:
+        if not checked:
+            parts.append("checking threads")
+        else:
+            parts.append(f"checking {checked} of {total}")
+    return " · ".join(parts)
+
+
+def format_overview(bots):
+    ordered = order_bots(bots)
+    summary = overview_summary(ordered)
+    name_width = min(max((len(bot["name"]) for bot in ordered), default=0), 24)
+    lines = [summary, ""] if summary else []
+    for bot in ordered:
+        activity = bot.get("activity") or {}
+        label = status_label(activity.get("state") or "", activity.get("unread") or 0)
+        preview = activity.get("preview") or bot.get("title") or bot.get("tagline") or ""
+        preview = " ".join(str(preview).split())
+        line = f"{label:<9}  {bot['name']:<{name_width}}"
+        if preview:
+            line += "  " + preview
+        lines.append(line.rstrip())
+    return "\n".join(lines)
+
+
+def build_overview(bots, read):
+    """Read each bot once. The first look baselines; a later look marks new replies.
+
+    Returns (views, error). `error` is set only when every read failed.
+    """
+    views = []
+    failed = None
+    saw = False
+    for bot in bots:
+        try:
+            page = read(bot)
+        except GbotError as error:
+            failed = str(error)
+            views.append(dict(bot))
+            continue
+        saw = True
+        entries = page.get("entries") if isinstance(page, dict) else []
+        if not isinstance(entries, list):
+            entries = []
+        cursor = page.get("cursor") if isinstance(page, dict) else ""
+        if not isinstance(cursor, str):
+            cursor = ""
+        snap = judge_activity(entries, cursor, seen_mark(bot))
+        store_activity(bot, snap)
+        view = dict(bot)
+        view["activity"] = snap
+        views.append(view)
+    return order_bots(views), (None if saw or not bots else failed)
+
+
+def read_overview(bot):
+    name = bot.get("name") or ""
+    if not name:
+        raise GbotError("No bot.")
+    return read_thread(name, limit=OVERVIEW_LIMIT, timeout=20)
+
+
+class Survey:
+    """Walk the roster off the UI thread and publish each bot as its read returns."""
+
+    def __init__(self, bots, read=None):
+        self._read = read or read_overview
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._bots = list(bots)
+        self._checked = 0
+        self._total = len(self._bots)
+        self._failures = 0
+        self._running = True
+        self._restart = False
+        self.generation = 0
+        self.error = ""
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def replace(self, bots):
+        with self._lock:
+            self._bots = list(bots)
+            self._restart = True
+        self._wake.set()
+
+    def nudge(self):
+        """Drop the pause and scan again. Ctrl-R on the list."""
+        self._wake.set()
+
+    def close(self):
+        self._stop.set()
+        self._wake.set()
+
+    def status(self):
+        with self._lock:
+            return self._running, self._checked, self._total, self.generation
+
+    def problem(self):
+        """The gbot error when every bot in the last pass failed, else ""."""
+        with self._lock:
+            if self._total and self._failures == self._total and not self._running:
+                return self.error
+            return ""
+
+    def _run(self):
+        while not self._stop.is_set():
+            with self._lock:
+                bots = list(self._bots)
+                self._total = len(bots)
+                self._checked = 0
+                self._failures = 0
+                self._running = True
+                self._restart = False
+                self.generation += 1
+            for bot in bots:
+                if self._stop.is_set():
+                    return
+                with self._lock:
+                    if self._restart:
+                        break
+                try:
+                    page = self._read(bot)
+                except GbotError as error:
+                    with self._lock:
+                        self.error = str(error)
+                        self._failures += 1
+                        self._checked += 1
+                        self.generation += 1
+                    continue
+                entries = page.get("entries") if isinstance(page, dict) else []
+                cursor = page.get("cursor") if isinstance(page, dict) else ""
+                if not isinstance(entries, list):
+                    entries = []
+                if not isinstance(cursor, str):
+                    cursor = ""
+                snap = judge_activity(entries, cursor, seen_mark(bot))
+                store_activity(bot, snap)
+                with self._lock:
+                    self._checked += 1
+                    self.generation += 1
+            else:
+                with self._lock:
+                    self._running = False
+                    self.generation += 1
+                self._wake.wait(OVERVIEW_PAUSE)
+                self._wake.clear()
+                continue
+            # The roster was replaced mid-pass. Start over without the pause.
 
 
 AVATAR_LOCK = threading.Lock()
@@ -851,17 +1327,19 @@ def parse_args(argv):
         return "help", ""
     if argv in (["--list"], ["-l"]):
         return "list", ""
+    if argv in (["--overview"], ["-o"]):
+        return "overview", ""
     if argv == ["--complete"]:
         return "complete", ""
     return "open", " ".join(argv).strip()
 
 
-def read_thread(target, after=None):
-    args = ["thread", "--limit", "80"]
+def read_thread(target, after=None, limit=80, timeout=30):
+    args = ["thread", "--limit", str(limit)]
     if after:
         args += ["--after", after]
     args.append(target)
-    return parse_thread(gbot(*args, timeout=30))
+    return parse_thread(gbot(*args, timeout=timeout))
 
 
 def send_message(target, text):
@@ -1326,6 +1804,30 @@ class Chat:
         self.rows_rev += 1
         self._rows_key = None
 
+    def sync_activity(self):
+        """The open chat is what the list shows on the way back.
+
+        A reply on screen is not new. `working` stays running while it arrives.
+        """
+        entries = [entry for entry in self.messages if isinstance(entry, dict)]
+        cursor = self.cursor or last_id([entry for entry in entries if not entry.get("local")])
+        remember_seen(self.target, self.session_id, cursor)
+        if self.phase == "blocked":
+            state = "blocked"
+        elif self.phase == "working":
+            state = "working"
+        else:
+            state = "idle"
+        store_activity(
+            {"id": self.session_id, "name": self.target},
+            {
+                "state": state,
+                "unread": 0,
+                "cursor": cursor,
+                "preview": activity_preview(entries, state),
+            },
+        )
+
     def begin_decision(self, decision):
         """Mark the newest card decided and return the gbot arguments.
 
@@ -1345,6 +1847,7 @@ class Chat:
         self.touch_rows()
         if self.phase == "blocked" and not pending_approval(self.messages):
             self.note("idle")
+        self.sync_activity()
         return (self.target, card["entry_id"], request_id, decision)
 
     def finish_decision(self):
@@ -1366,6 +1869,7 @@ class Chat:
             self.touch_rows()
             if pending_approval(self.messages) and self.phase != "blocked":
                 self.note("blocked")
+        self.sync_activity()
 
     def take_read(self):
         """Arguments for the next `gbot thread` call.
@@ -1415,6 +1919,7 @@ class Chat:
             self.phase = phase
             publish(phase, self.title, self.session_id, self.resume)
             TAB.show(self.title)
+            self.sync_activity()
             return
         phase, self.quiet, self.saw_other = watch_step(
             self.phase,
@@ -1424,6 +1929,7 @@ class Chat:
             pending_approval(self.messages),
         )
         self.note(phase)
+        self.sync_activity()
 
     def arm_send(self):
         text = self.typed.strip()
@@ -1436,6 +1942,7 @@ class Chat:
         self.follow = True
         self.messages.append({"role": "user", "text": text, "local": True})
         self.note("working")
+        self.sync_activity()
         return text
 
 
@@ -2452,8 +2959,37 @@ def fuzzy_score(query, name):
     return score
 
 
+def _status_spans(lead, lead_style, mark, name, name_style, activity, title, room):
+    label = status_label(activity.get("state"), activity.get("unread") or 0)
+    preview = " ".join((activity.get("preview") or title or "").split())
+    field = f"{label:<10}"
+    overhead = 1 + len(field)
+    if room <= overhead:
+        return [(lead, lead_style), mark, (clip(name, room), name_style)]
+    rest = room - overhead
+    name_room = len(name)
+    if name_room > rest:
+        name_room = rest
+    elif preview and name_room > (rest * 2) // 3 and rest >= 12:
+        name_room = max((rest * 2) // 3, 1)
+    preview_room = rest - name_room
+    spans = [
+        (lead, lead_style),
+        mark,
+        (clip(name, name_room), name_style),
+        (" ", "dim"),
+        (field, STATUS_STYLE.get(activity.get("state"), "dim")),
+    ]
+    if preview and preview_room > 0:
+        spans.append((clip(preview, preview_room), "dim"))
+    return spans
+
+
 def picker_spans(bot, selected, width):
-    """One sidebar row: selection mark, avatar, name, and a dim tagline."""
+    """One sidebar row: selection mark, avatar, name, status, and a preview.
+
+    A row with no activity yet keeps the tagline, the same as before a scan.
+    """
     title = (bot.get("title") or bot.get("tagline") or "").strip()
     name = bot["name"]
     name_style = "bold" if selected else "default"
@@ -2465,6 +3001,9 @@ def picker_spans(bot, selected, width):
     # which are also the names of the warning styles.
     mark_style = "bot:" + color if color in AVATAR_COLORS else (color or "default")
     mark = ("● ", mark_style)
+    activity = bot.get("activity") if isinstance(bot.get("activity"), dict) else None
+    if activity and activity.get("state") in OVERVIEW_STATES:
+        return _status_spans(lead, lead_style, mark, name, name_style, activity, title, room)
     if not title:
         return [(lead, lead_style), mark, (clip(name, room), name_style)]
     name_room = min(len(name), max(room // 2, 1))
@@ -2478,6 +3017,26 @@ def picker_spans(bot, selected, width):
     ]
 
 
+def list_banner(query, summary, width):
+    """The line under the title: the search, the counts, or both."""
+    room = max(width - 2, 0)
+    if not room:
+        return []
+    if query and summary:
+        left = clip("/" + query, max(room // 2, 1))
+        rest = max(room - len(left) - 2, 0)
+        spans = [(left, "dim")]
+        if rest:
+            spans.append(("  ", "dim"))
+            spans.append((clip(summary, rest), "dim"))
+        return spans
+    if query:
+        return [(clip("/" + query, room), "dim")]
+    if summary:
+        return [(clip(summary, room), "dim")]
+    return []
+
+
 def fuzzy_bots(query, bots):
     if not query:
         return list(bots)
@@ -2487,6 +3046,9 @@ def fuzzy_bots(query, bots):
         title = bot.get("title") or ""
         if title:
             scores.append(fuzzy_score(query, title))
+        preview = ((bot.get("activity") or {}).get("preview")) or ""
+        if preview:
+            scores.append(fuzzy_score(query, preview))
         best = max((score for score in scores if score is not None), default=None)
         if best is not None:
             ranked.append((-best, index, bot))
@@ -2521,8 +3083,16 @@ class Loader:
             return self.ready, self.result, self.error
 
 
+LIST_HINT = "type to search · enter open · ctrl-r refresh · ctrl-c quit"
+
+
 def pick(stdscr, bots, refresh=None):
-    """The bot list. `refresh` fetches a newer list on a thread while this one is shown."""
+    """The bot list, with who needs you, who is running, and who has a new reply.
+
+    `refresh` fetches a newer roster on a thread. A survey reads each thread
+    beside that. Until you move, the highlight stays on the top row, which is
+    the bot that needs attention. A search keeps match order.
+    """
     # The chat loop reads keys without waiting. Leaving that on makes get_wch
     # raise "no input" the moment this list draws.
     stdscr.timeout(-1)
@@ -2532,100 +3102,130 @@ def pick(stdscr, bots, refresh=None):
     stdscr.keypad(True)
     bots = list(bots)
     loader = Loader(refresh) if refresh else None
-    if loader:
-        stdscr.timeout(30)
+    survey = Survey(bots)
     note = ""
     selected = 0
     query = ""
-    while True:
-        if loader:
-            ready, fresh, error = loader.take()
-            if ready:
-                loader = None
-                stdscr.timeout(-1)
-                if error and not bots:
-                    raise GbotError(error)
-                if error:
-                    note = error
-                elif fresh is not None:
-                    if not fresh and not bots:
-                        raise GbotError("No bots.")
-                    current = fuzzy_bots(query, bots)
-                    name = current[selected]["name"] if current and selected < len(current) else ""
-                    bots = list(fresh)
-                    shown = fuzzy_bots(query, bots)
-                    names = [bot["name"] for bot in shown]
-                    selected = names.index(name) if name in names else 0
-        shown = fuzzy_bots(query, bots)
-        if not shown:
-            selected = 0
-        elif selected >= len(shown):
-            selected = len(shown) - 1
-        height, width = stdscr.getmaxyx()
-        stdscr.erase()
-        put(stdscr, 0, 1, "Grok bots", ATTR["bold"])
-        if query:
-            put(stdscr, 1, 3, clip("/" + query, max(width - 4, 0)), ATTR["dim"])
-        footer = 1 if height >= 4 else 0
-        body_h = max(height - 2 - footer, 0)
-        top = 0
-        if body_h and selected >= body_h:
-            top = selected - body_h + 1
-        if not shown and body_h:
-            empty = "  loading bots…" if loader and not bots else "  no match"
-            put(stdscr, 2, 1, clip(empty, max(width - 2, 0)), ATTR["dim"])
-        for index, bot in enumerate(shown[top : top + body_h]):
-            actual = top + index
-            paint_spans(stdscr, 2 + index, 1, picker_spans(bot, actual == selected, width))
-        if footer:
-            if note:
-                spans = [(clip(note, max(width - 2, 0)), "red")]
+    # False until Up or Down. The top row then stays the one that needs attention.
+    moved = False
+    chosen = ""
+    try:
+        while True:
+            if loader:
+                ready, fresh, error = loader.take()
+                if ready:
+                    loader = None
+                    if error and not bots:
+                        raise GbotError(error)
+                    if error:
+                        note = error
+                    elif fresh is not None:
+                        if not fresh and not bots:
+                            raise GbotError("No bots.")
+                        bots = list(fresh)
+                        survey.replace(bots)
+            views = with_activity(bots)
+            shown = fuzzy_bots(query, views)
+            if not query:
+                shown = order_bots(shown)
+            if moved and chosen:
+                names = [bot["name"] for bot in shown]
+                if chosen in names:
+                    selected = names.index(chosen)
+                else:
+                    moved = False
+                    chosen = ""
+            if not moved:
+                selected = 0
+            if not shown:
+                selected = 0
+            elif selected >= len(shown):
+                selected = len(shown) - 1
+            running, checked, total, _generation = survey.status()
+            if running:
+                summary = overview_summary(shown, checked, total)
             else:
-                spans = [("type to search · enter open · ctrl-c quit", "dim")]
-            paint_spans(stdscr, height - 1, 1, spans)
-        stdscr.refresh()
-        due = theme_due_ms()
-        if loader and due is not None:
-            stdscr.timeout(min(30, due))
-        elif loader:
-            stdscr.timeout(30)
-        elif due is not None:
-            stdscr.timeout(due)
-        else:
-            stdscr.timeout(-1)
-        try:
-            key = stdscr.get_wch()
-        except curses.error:
-            if maybe_retheme(lambda: apply_theme(stdscr)):
-                pass
-            continue
-        if key == curses.KEY_RESIZE:
-            note_appearance()
-            maybe_retheme(lambda: apply_theme(stdscr))
-            continue
-        if key in ("\x03", "\x04"):
-            return None
-        if key in ("\x1b", 27):
-            query = ""
-            selected = 0
-            continue
-        if key == curses.KEY_UP and selected > 0:
-            selected -= 1
-            continue
-        if key == curses.KEY_DOWN and selected < len(shown) - 1:
-            selected += 1
-            continue
-        if key in ("\n", "\r", curses.KEY_ENTER):
-            if shown:
-                return shown[selected]["name"]
-            continue
-        if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
-            query = query[:-1]
-            selected = 0
-            continue
-        if isinstance(key, str) and key.isprintable():
-            query += key
-            selected = 0
+                summary = overview_summary(shown)
+            problem = survey.problem()
+            height, width = stdscr.getmaxyx()
+            stdscr.erase()
+            put(stdscr, 0, 1, "Grok bots", ATTR["bold"])
+            banner = list_banner(query, summary, width)
+            if banner:
+                paint_spans(stdscr, 1, 1, banner)
+            footer = 1 if height >= 4 else 0
+            body_h = max(height - 2 - footer, 0)
+            top = 0
+            if body_h and selected >= body_h:
+                top = selected - body_h + 1
+            if not shown and body_h:
+                empty = "  loading bots…" if loader and not bots else "  no match"
+                put(stdscr, 2, 1, clip(empty, max(width - 2, 0)), ATTR["dim"])
+            for index, bot in enumerate(shown[top : top + body_h]):
+                actual = top + index
+                paint_spans(stdscr, 2 + index, 1, picker_spans(bot, actual == selected, width))
+            if footer:
+                if note:
+                    spans = [(clip(note, max(width - 2, 0)), "red")]
+                elif problem:
+                    spans = [(clip(problem, max(width - 2, 0)), "red")]
+                else:
+                    spans = [(LIST_HINT, "dim")]
+                paint_spans(stdscr, height - 1, 1, spans)
+            stdscr.refresh()
+            due = theme_due_ms()
+            wait = 30 if loader else (150 if running else 400)
+            if due is not None:
+                wait = min(wait, due)
+            stdscr.timeout(wait)
+            try:
+                key = stdscr.get_wch()
+            except curses.error:
+                if maybe_retheme(lambda: apply_theme(stdscr)):
+                    pass
+                continue
+            if key == curses.KEY_RESIZE:
+                note_appearance()
+                maybe_retheme(lambda: apply_theme(stdscr))
+                continue
+            if key in ("\x03", "\x04"):
+                return None
+            if key == "\x12":
+                survey.nudge()
+                continue
+            if key in ("\x1b", 27):
+                query = ""
+                selected = 0
+                moved = False
+                chosen = ""
+                continue
+            if key == curses.KEY_UP and selected > 0:
+                selected -= 1
+                moved = True
+                chosen = shown[selected]["name"] if shown else ""
+                continue
+            if key == curses.KEY_DOWN and selected < len(shown) - 1:
+                selected += 1
+                moved = True
+                chosen = shown[selected]["name"] if shown else ""
+                continue
+            if key in ("\n", "\r", curses.KEY_ENTER):
+                if shown:
+                    return shown[selected]["name"]
+                continue
+            if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                query = query[:-1]
+                selected = 0
+                moved = False
+                chosen = ""
+                continue
+            if isinstance(key, str) and key.isprintable():
+                query += key
+                selected = 0
+                moved = False
+                chosen = ""
+    finally:
+        survey.close()
 
 
 def start_chat(target):
@@ -2701,9 +3301,12 @@ def screens(stdscr, target):
 USAGE = """\
 gbot-tui [name]
 gbot-tui --list
+gbot-tui --overview
 
 Open a chat with one Grok bot. A name opens that bot; a unique prefix works too.
-With no name, pick from the list. --list prints every bot.
+With no name, pick from the list. The list shows which bots need you, which
+are running, and which have a new reply. --list prints every name.
+--overview prints that status and the latest line, then exits.
 Run it inside a Herdr tab and that bot shows up in the agents list.
 """
 
@@ -2719,6 +3322,26 @@ def print_bots():
         return 1
     for bot in bots:
         print(bot["name"])
+    return 0
+
+
+def print_overview():
+    try:
+        bots = list_bots(avatars="skip")
+    except GbotError as error:
+        print(error, file=sys.stderr)
+        return 1
+    if not bots:
+        print("No bots.", file=sys.stderr)
+        return 1
+    views, error = build_overview(
+        bots,
+        lambda bot: read_thread(bot["name"], limit=OVERVIEW_LIMIT, timeout=20),
+    )
+    if error:
+        print(error, file=sys.stderr)
+        return 1
+    print(format_overview(views))
     return 0
 
 
@@ -2874,6 +3497,8 @@ def main(argv):
         return 0
     if action == "list":
         return print_bots()
+    if action == "overview":
+        return print_overview()
     if action == "complete":
         return complete_names()
     if not sys.stdin.isatty() or not sys.stdout.isatty():

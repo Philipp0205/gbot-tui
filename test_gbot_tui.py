@@ -152,6 +152,8 @@ class NameTests(unittest.TestCase):
     def test_parse_list_and_name(self):
         self.assertEqual(gbot_tui.parse_args(["--list"]), ("list", ""))
         self.assertEqual(gbot_tui.parse_args(["-l"]), ("list", ""))
+        self.assertEqual(gbot_tui.parse_args(["--overview"]), ("overview", ""))
+        self.assertEqual(gbot_tui.parse_args(["-o"]), ("overview", ""))
         self.assertEqual(gbot_tui.parse_args(["--complete"]), ("complete", ""))
         self.assertEqual(gbot_tui.parse_args(["Homescreen", "Manager"]), ("open", "Homescreen Manager"))
         self.assertEqual(gbot_tui.parse_args([]), ("open", ""))
@@ -1536,6 +1538,242 @@ class HerdrTests(unittest.TestCase):
         )
         self.assertEqual(command[command.index("--state") + 1], "idle")
         self.assertEqual(command[-2:], ["gbot-tui", "Researcher"])
+
+
+def _reset_overview():
+    gbot_tui.ACTIVITY.clear()
+    gbot_tui.SEEN.clear()
+    gbot_tui.ACTIVITY_LOADED["done"] = False
+    gbot_tui.SEEN_LOADED["done"] = False
+    paths = [gbot_tui.activity_path(), gbot_tui.seen_path(), gbot_tui.thread_cache_path("Chef")]
+    for path in paths:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+class OverviewTests(unittest.TestCase):
+    def setUp(self):
+        _reset_overview()
+
+    def tearDown(self):
+        _reset_overview()
+
+    def test_pending_card_needs_you_and_shows_the_action(self):
+        entries = [
+            {"id": "m1", "role": "assistant", "text": "ready"},
+            {
+                "id": "c1",
+                "kind": "send-message",
+                "message": {
+                    "type": "auto-review-approval",
+                    "approval": {"status": "pending", "command": "npm publish", "requestId": "ask"},
+                },
+            },
+        ]
+        snap = gbot_tui.judge_activity(entries, "c1", "m1")
+        self.assertEqual(snap["state"], "blocked")
+        self.assertEqual(snap["preview"], "npm publish")
+        self.assertEqual(gbot_tui.status_label(snap["state"], snap["unread"]), "needs you")
+
+    def test_a_user_line_with_no_reply_is_running(self):
+        entries = [
+            {"id": "m1", "role": "assistant", "text": "hi"},
+            {"id": "m2", "role": "user", "text": "go"},
+        ]
+        snap = gbot_tui.judge_activity(entries, "m2", "m1")
+        self.assertEqual(snap["state"], "working")
+        self.assertEqual(snap["unread"], 0)
+        self.assertEqual(snap["preview"], "go")
+
+    def test_a_reply_you_have_not_opened_is_new(self):
+        entries = [
+            {"id": "m1", "role": "user", "text": "go"},
+            {"id": "m2", "role": "assistant", "text": "done"},
+            {"id": "m3", "role": "assistant", "text": "and more"},
+        ]
+        snap = gbot_tui.judge_activity(entries, "m3", "m1")
+        self.assertEqual(snap["state"], "unread")
+        self.assertEqual(snap["unread"], 2)
+        self.assertEqual(snap["preview"], "and more")
+        self.assertEqual(gbot_tui.status_label("unread", 2), "2 new")
+
+    def test_a_seen_reply_is_idle_and_a_first_look_is_not_all_new(self):
+        entries = [{"id": "m2", "role": "assistant", "text": "done"}]
+        self.assertEqual(gbot_tui.judge_activity(entries, "m2", "m2")["state"], "idle")
+        first = gbot_tui.judge_activity(entries, "m2", "")
+        self.assertEqual(first["state"], "idle")
+        self.assertEqual(first["unread"], 0)
+
+    def test_a_streaming_reply_you_have_open_stays_running(self):
+        entries = [
+            {"id": "m1", "role": "user", "text": "go"},
+            {"id": "m2", "role": "assistant", "text": "partial", "streaming": True},
+        ]
+        self.assertEqual(gbot_tui.judge_activity(entries, "m2", "m2")["state"], "working")
+        # The same partial, not yet on screen, is a new message.
+        self.assertEqual(gbot_tui.judge_activity(entries, "m2", "m1")["state"], "unread")
+
+    def test_a_seen_id_older_than_this_tail_counts_the_tail(self):
+        entries = [{"id": "m9", "role": "assistant", "text": "later"}]
+        snap = gbot_tui.judge_activity(entries, "m9", "m1")
+        self.assertEqual(snap["state"], "unread")
+
+    def test_attention_sorts_above_idle_and_the_summary_counts_it(self):
+        bots = [
+            {"name": "Idle", "activity": {"state": "idle", "unread": 0}},
+            {"name": "Runner", "activity": {"state": "working", "unread": 0}},
+            {"name": "Fresh", "activity": {"state": "unread", "unread": 1}},
+            {"name": "Ask", "activity": {"state": "blocked", "unread": 0}},
+            {"name": "Wait"},
+        ]
+        self.assertEqual(
+            [bot["name"] for bot in gbot_tui.order_bots(bots)],
+            ["Ask", "Fresh", "Runner", "Wait", "Idle"],
+        )
+        self.assertEqual(
+            gbot_tui.overview_summary(bots[:4]),
+            "1 needs you · 1 new · 1 running",
+        )
+        self.assertEqual(gbot_tui.overview_summary([], checked=0, total=4), "checking threads")
+        self.assertEqual(
+            gbot_tui.overview_summary(bots[:2], checked=1, total=4),
+            "1 running · checking 1 of 4",
+        )
+        self.assertEqual(gbot_tui.overview_summary(bots[:1]), "1 idle")
+
+    def test_the_row_shows_the_status_and_the_preview(self):
+        bot = {
+            "name": "Outfitly",
+            "title": "wardrobe",
+            "avatarColor": "violet",
+            "activity": {"state": "blocked", "unread": 1, "preview": "npm publish", "cursor": "c"},
+        }
+        spans = gbot_tui.picker_spans(bot, True, 60)
+        self.assertEqual(spans[0], ("→ ", "bold"))
+        self.assertEqual(spans[1], ("● ", "bot:violet"))
+        self.assertEqual(spans[2], ("Outfitly", "bold"))
+        self.assertEqual(spans[4], ("needs you ", "yellow"))
+        self.assertEqual(spans[5], ("npm publish", "dim"))
+        narrow = "".join(text for text, _style in gbot_tui.picker_spans(bot, False, 16))
+        self.assertIn("Outfitly", narrow)
+
+    def test_search_matches_the_latest_line(self):
+        bots = [
+            {"name": "Chef", "title": "", "activity": {"preview": "pasta is ready", "state": "unread"}},
+            {"name": "Night", "title": ""},
+        ]
+        self.assertEqual(gbot_tui.fuzzy_bots("pasta", bots)[0]["name"], "Chef")
+
+    def test_seen_is_private_and_the_cached_thread_counts_as_read(self):
+        gbot_tui.remember_seen("Outfitly", "a1", "m3")
+        self.assertEqual(os.stat(gbot_tui.seen_path()).st_mode & 0o777, 0o600)
+        gbot_tui.SEEN.clear()
+        gbot_tui.SEEN_LOADED["done"] = False
+        self.assertEqual(gbot_tui.lookup_seen({"id": "a1", "name": "Outfitly"}), "m3")
+        gbot_tui.write_thread_cache("Chef", [{"id": "m4", "role": "assistant", "text": "old"}])
+        self.assertEqual(gbot_tui.seen_mark({"name": "Chef"}), "m4")
+        gbot_tui.store_activity(
+            {"name": "Nomad", "id": "a9"},
+            {"state": "idle", "unread": 0, "cursor": "m1", "preview": ""},
+        )
+        self.assertEqual(gbot_tui.seen_mark({"name": "Nomad", "id": "a9"}), "m1")
+        gbot_tui.remember_seen("Nomad", "a9", "m9")
+        self.assertEqual(gbot_tui.seen_mark({"name": "Nomad", "id": "a9"}), "m9")
+        self.assertEqual(os.stat(gbot_tui.activity_path()).st_mode & 0o777, 0o600)
+
+    def test_a_later_pass_marks_a_reply_you_have_not_opened(self):
+        bots = [{"id": "a1", "name": "Chef", "title": "what to cook"}]
+        first = {"entries": [{"id": "m1", "role": "assistant", "text": "hello"}], "cursor": "m1"}
+        views, error = gbot_tui.build_overview(bots, lambda bot: first)
+        self.assertIsNone(error)
+        self.assertEqual(views[0]["activity"]["state"], "idle")
+        second = {
+            "entries": [
+                {"id": "m1", "role": "assistant", "text": "hello"},
+                {"id": "m2", "role": "assistant", "text": "lunch is ready"},
+            ],
+            "cursor": "m2",
+        }
+        views, error = gbot_tui.build_overview(bots, lambda bot: second)
+        self.assertEqual(views[0]["activity"]["state"], "unread")
+        self.assertEqual(views[0]["activity"]["preview"], "lunch is ready")
+        text = gbot_tui.format_overview(views)
+        self.assertIn("1 new", text)
+        self.assertIn("Chef", text)
+        self.assertIn("lunch is ready", text)
+
+    def test_opening_the_thread_clears_new(self):
+        page = gbot_tui.parse_thread(
+            {
+                "target": {"id": "a2", "name": "Chef"},
+                "transcript": {"entries": [{"id": "m2", "role": "assistant", "text": "served"}]},
+                "cursor": "m2",
+            }
+        )
+        chat = gbot_tui.Chat("Chef")
+        chat.ingest(page, first=True)
+        self.assertEqual(gbot_tui.lookup_seen({"name": "Chef", "id": "a2"}), "m2")
+        snap = gbot_tui.lookup_activity({"name": "Chef", "id": "a2"})
+        self.assertEqual(snap["unread"], 0)
+        self.assertEqual(snap["state"], "idle")
+        chat.typed = "more"
+        chat.arm_send()
+        self.assertEqual(gbot_tui.lookup_activity({"name": "Chef"})["state"], "working")
+
+    def test_the_scan_publishes_each_bot_and_keeps_a_total_failure(self):
+        bots = [{"name": "A", "id": "1"}, {"name": "B", "id": "2"}]
+
+        def read(bot):
+            return {"entries": [{"id": "m", "role": "user", "text": "go"}], "cursor": "m"}
+
+        survey = gbot_tui.Survey(bots, read)
+        try:
+            deadline = time.monotonic() + 2
+            running, checked, total = True, 0, 2
+            while time.monotonic() < deadline:
+                running, checked, total, _generation = survey.status()
+                if checked == total and not running:
+                    break
+                time.sleep(0.01)
+            self.assertEqual((checked, total, running), (2, 2, False))
+            self.assertEqual(gbot_tui.lookup_activity(bots[0])["state"], "working")
+            self.assertEqual(survey.problem(), "")
+        finally:
+            survey.close()
+
+        def fail(bot):
+            raise gbot_tui.GbotError("gbot is not on PATH")
+
+        _reset_overview()
+        survey = gbot_tui.Survey([{"name": "A", "id": "1"}], fail)
+        try:
+            deadline = time.monotonic() + 2
+            problem = ""
+            while time.monotonic() < deadline:
+                running, checked, total, _generation = survey.status()
+                problem = survey.problem()
+                if problem and not running:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(problem, "gbot is not on PATH")
+        finally:
+            survey.close()
+
+    def test_a_failed_read_does_not_hide_the_bots_that_worked(self):
+        bots = [{"name": "A", "id": "1"}, {"name": "B", "id": "2"}]
+
+        def read(bot):
+            if bot["name"] == "B":
+                raise gbot_tui.GbotError("timeout")
+            return {"entries": [{"id": "m", "role": "assistant", "text": "ok"}], "cursor": "m"}
+
+        views, error = gbot_tui.build_overview(bots, read)
+        self.assertIsNone(error)
+        by_name = {bot["name"]: bot for bot in views}
+        self.assertEqual(by_name["A"]["activity"]["state"], "idle")
+        self.assertNotIn("activity", by_name["B"])
 
 
 if __name__ == "__main__":
