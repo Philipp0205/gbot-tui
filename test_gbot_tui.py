@@ -1145,6 +1145,78 @@ class ThemeTests(unittest.TestCase):
         self.assertFalse(gbot_tui.dark_terminal())
 
 
+class TabTests(unittest.TestCase):
+    SPACES = [
+        {"id": "s1", "tabs": [{"id": "t1", "name": "1"}, {"id": "t2", "name": "Work"}]},
+        {"id": "s2", "tabs": [{"id": "t3", "name": "Outfitly"}]},
+    ]
+
+    def tab(self, tab_id, alone=True):
+        renames = []
+        info = {"labels": {"herdr.tab": tab_id}}
+        title = gbot_tui.TabTitle(
+            find=lambda: (info, alone),
+            spaces=lambda: self.SPACES,
+            rename=lambda _info, name: renames.append(name),
+        )
+        return title, renames
+
+    def test_tab_name_from_ls(self):
+        self.assertEqual(gbot_tui.tab_name("t1", self.SPACES), "")
+        self.assertEqual(gbot_tui.tab_name("t2", self.SPACES), "Work")
+        self.assertEqual(gbot_tui.tab_name("t3", self.SPACES), "Outfitly")
+        self.assertEqual(gbot_tui.tab_name("gone", self.SPACES), "")
+
+    def test_back_to_the_list_gives_the_tab_its_number_again(self):
+        title, renames = self.tab("t1")
+        title.show("Outfitly")
+        title.restore()
+        title.show("Researcher")
+        title.restore()
+        title.restore()
+        self.assertTrue(title.flush(2))
+        self.assertEqual(renames, ["Outfitly", "", "Researcher", ""])
+
+    def test_a_named_tab_keeps_its_name(self):
+        title, renames = self.tab("t2")
+        title.show("Outfitly")
+        title.restore()
+        self.assertTrue(title.flush(2))
+        self.assertEqual(renames, ["Outfitly", "Work"])
+
+    def test_a_shared_tab_is_left_alone(self):
+        title, renames = self.tab("t2", alone=False)
+        title.show("Outfitly")
+        title.restore()
+        self.assertTrue(title.flush(2))
+        self.assertEqual(renames, [])
+
+    def test_restore_without_a_rename_does_nothing(self):
+        title, renames = self.tab("t2")
+        self.assertTrue(title.flush(0.1))
+        title.restore()
+        self.assertTrue(title.flush(2))
+        self.assertEqual(renames, [])
+
+    def test_leaving_a_chat_restores_the_tab_and_the_list_title(self):
+        calls = []
+        saved = gbot_tui.TAB, gbot_tui.emit, gbot_tui.window_title, gbot_tui.silence_herdr
+        title, renames = self.tab("t2")
+        gbot_tui.TAB = title
+        gbot_tui.emit = lambda state, name, kind=None: calls.append(("emit", state))
+        gbot_tui.window_title = lambda text: calls.append(("title", text))
+        gbot_tui.silence_herdr = lambda label: None
+        try:
+            chat = gbot_tui.Chat("Outfitly")
+            title.show("Outfitly")
+            gbot_tui.leave_chat(chat, final=False)
+            self.assertTrue(title.flush(2))
+        finally:
+            gbot_tui.TAB, gbot_tui.emit, gbot_tui.window_title, gbot_tui.silence_herdr = saved
+        self.assertEqual(renames, ["Outfitly", "Work"])
+        self.assertIn(("title", "gbot"), calls)
+
+
 class HerdrTests(unittest.TestCase):
     def test_osc_carries_state_and_title(self):
         report = gbot_tui.osc_report("working", "Researcher")

@@ -847,7 +847,8 @@ def ancestor_pids():
     while pid and pid not in pids and len(pids) < 12:
         pids.add(pid)
         try:
-            text = open(f"/proc/{pid}/status", encoding="utf-8").read()
+            with open(f"/proc/{pid}/status", encoding="utf-8") as status:
+                text = status.read()
         except OSError:
             break
         parent = 0
@@ -916,8 +917,9 @@ def own_terminal(infos=None):
 
 
 def rename_tab(info, name):
+    """An empty name gives the tab back its number."""
     tab = (info.get("labels") or {}).get("herdr.tab")
-    if not tab or not name:
+    if not tab or name is None:
         return
     subprocess.run(
         ["herdr-app", "do", "tab.rename", "--id", tab, "--name", name],
@@ -927,12 +929,101 @@ def rename_tab(info, name):
     )
 
 
-def emit(state, title, kind=None):
+def herdr_spaces():
+    got = subprocess.run(["herdr-app", "ls"], capture_output=True, text=True, timeout=3)
+    try:
+        return (json.loads(got.stdout or "{}") or {}).get("spaces") or []
+    except (json.JSONDecodeError, AttributeError):
+        return []
+
+
+def tab_name(tab, spaces):
+    """The tab's own name from `herdr-app ls`, or "" when Herdr shows its number."""
+    for space in spaces:
+        for position, entry in enumerate(space.get("tabs") or [], start=1):
+            if entry.get("id") == tab:
+                name = entry.get("name") or ""
+                return "" if name == str(position) else name
+    return ""
+
+
+class TabTitle:
+    """Names the Herdr tab after the bot and gives it its old name back.
+
+    One worker runs the jobs in order, so a restore never lands before the
+    rename it undoes, and the curses loop never waits on herdr-app.
+    """
+
+    def __init__(self, find=None, spaces=None, rename=None):
+        self.find = find or own_terminal
+        self.spaces = spaces or herdr_spaces
+        self.rename = rename or rename_tab
+        self.jobs = queue.Queue()
+        self.lock = threading.Lock()
+        self.thread = None
+        self.info = None
+        self.original = None
+        self.shown = None
+
+    def show(self, title):
+        self._put("show", title)
+
+    def restore(self):
+        self._put("restore", None)
+
+    def flush(self, timeout=3.0):
+        with self.lock:
+            if self.thread is None:
+                return True
+        done = threading.Event()
+        self._put("flush", done)
+        return done.wait(timeout)
+
+    def _put(self, kind, value):
+        with self.lock:
+            self.jobs.put((kind, value))
+            if self.thread is None:
+                self.thread = threading.Thread(target=self._run, daemon=True)
+                self.thread.start()
+
+    def _run(self):
+        while True:
+            kind, value = self.jobs.get()
+            try:
+                self._do(kind, value)
+            except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
+                pass
+
+    def _do(self, kind, value):
+        if kind == "flush":
+            value.set()
+        elif kind == "show":
+            if self.info is None:
+                info, alone = self.find()
+                if not info or not alone:
+                    return
+                tab = (info.get("labels") or {}).get("herdr.tab")
+                self.original = tab_name(tab, self.spaces())
+                self.info = info
+            if value != self.shown:
+                self.rename(self.info, value)
+                self.shown = value
+        elif kind == "restore":
+            if self.info is not None and self.shown is not None:
+                self.rename(self.info, self.original)
+                self.shown = None
+
+
+TAB = TabTitle()
+# The window title while the bot list is up.
+LIST_TITLE = "gbot"
+
+
+def write_tty(data):
     try:
         tty = os.open("/dev/tty", os.O_WRONLY)
     except OSError:
         tty = None
-    data = osc_report(state, title, kind).encode()
     try:
         if tty is None:
             sys.stdout.buffer.write(data)
@@ -944,6 +1035,20 @@ def emit(state, title, kind=None):
     finally:
         if tty is not None:
             os.close(tty)
+
+
+def emit(state, title, kind=None):
+    write_tty(osc_report(state, title, kind).encode())
+
+
+def window_title(text):
+    label = text.replace("\x1b", "").replace("\r", " ").replace("\n", " ")
+    write_tty(f"\033]0;{label}\033\\".encode())
+
+
+# xterm's title stack: push on start, pop on exit. Terminals without it ignore both.
+PUSH_TITLE = b"\033[22;0t"
+POP_TITLE = b"\033[23;0t"
 
 
 def tell_herdr(phase, label, session_id, resume):
@@ -1265,17 +1370,7 @@ class Chat:
                 phase = "idle"
             self.phase = phase
             publish(phase, self.title, self.session_id, self.resume)
-            title = self.title
-
-            def rename():
-                try:
-                    info, alone = own_terminal()
-                    if info and alone:
-                        rename_tab(info, title)
-                except (OSError, subprocess.TimeoutExpired):
-                    pass
-
-            threading.Thread(target=rename, daemon=True).start()
+            TAB.show(self.title)
             return
         phase, self.quiet, self.saw_other = watch_step(
             self.phase,
@@ -2372,6 +2467,9 @@ def start_chat(target):
 
 def leave_chat(chat, final):
     emit("clear", chat.title)
+    TAB.restore()
+    if not final:
+        window_title(LIST_TITLE)
 
     def release():
         try:
@@ -2457,6 +2555,9 @@ def complete_names():
 
 
 def session(target):
+    write_tty(PUSH_TITLE)
+    if not target:
+        window_title(LIST_TITLE)
     try:
         return curses.wrapper(lambda stdscr: screens(stdscr, target))
     except GbotError as error:
@@ -2464,6 +2565,10 @@ def session(target):
         return 1
     except KeyboardInterrupt:
         return 130
+    finally:
+        TAB.restore()
+        TAB.flush()
+        write_tty(POP_TITLE)
 
 
 def refresh_roster_later():
