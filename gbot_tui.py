@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Chat with one Grok Bot. Inside Herdr, the pane shows up in the agents list.
 
-The bot list is an overview: who needs you, who is running, and who has a new reply.
+The bot list is a selection: each row leads with that bot's state
+(needs you, unread, running, or idle) and then its name.
 """
 
 import atexit
@@ -634,6 +635,10 @@ OVERVIEW_PAUSE = 8
 OVERVIEW_STATES = ("blocked", "unread", "working", "idle")
 ATTENTION_RANK = {"blocked": 0, "unread": 1, "working": 2, "idle": 4}
 STATUS_STYLE = {"blocked": "yellow", "unread": "green", "working": "bold", "idle": "dim"}
+# "needs you" and "80 unread" are 9 wide. Two spaces keep the next column off the word.
+STATE_COLUMN = 11
+# Sits between the name and the latest line, the same mark the tagline uses.
+PREVIEW_MARK = " · "
 # In-progress flags a transcript entry may carry. Absent on a finished line.
 PROGRESS_STATES = {"running", "streaming", "in_progress", "generating", "working"}
 
@@ -706,13 +711,16 @@ def _save_locked(path, data):
     write_private(path, data)
 
 
-def store_activity(bot, snap):
+def store_activity(bot, snap, only_if_absent=False):
     clean = _clean_snap(snap)
     keys = activity_keys(bot)
     if not clean or not keys:
         return
     load_activity()
     with STATE_LOCK:
+        # A live read can land while the list is still judging a saved thread.
+        if only_if_absent and any(ACTIVITY.get(key) for key in keys):
+            return
         for key in keys:
             ACTIVITY[key] = clean
         _save_locked(activity_path(), dict(ACTIVITY))
@@ -729,7 +737,7 @@ def lookup_activity(bot):
 
 
 def remember_seen(name, bot_id, cursor, only_if_absent=False):
-    """The latest entry this chat had on screen. A later reply is then `new`.
+    """The latest entry this chat had on screen. A later reply is then unread.
 
     `only_if_absent` is the first scan of a bot nobody has opened. It must not
     move a cursor the chat, or an earlier scan, already stored.
@@ -766,7 +774,7 @@ def seen_mark(bot):
     The seen file wins. The first look writes it once, and the chat advances
     it when the thread is on screen. A cached thread counts when that file has
     no row, because the thread was on screen. The activity cursor does not:
-    it advances every pass, which cleared `new` on the pass after it appeared.
+    it advances every pass, which cleared unread on the pass after it appeared.
     """
     seen = lookup_seen(bot)
     if seen:
@@ -858,8 +866,8 @@ def activity_preview(entries, state):
 def judge_activity(entries, cursor, seen):
     """What one thread tail says. `seen` is the last cursor the user had on screen.
 
-    An empty `seen` does not mark the whole history as new. `blocked` wins over
-    a new reply, and a new reply wins over `running`.
+    An empty `seen` does not mark the whole history unread. `blocked` wins over
+    an unread reply, and an unread reply wins over `running`.
     """
     entries = [entry for entry in entries if isinstance(entry, dict) and not entry.get("local")]
     cursor = cursor or last_id(entries)
@@ -890,8 +898,8 @@ def status_label(state, unread=0):
     if state == "unread":
         count = unread if isinstance(unread, int) else 0
         if count > 1:
-            return f"{count} new"
-        return "new"
+            return f"{count} unread"
+        return "unread"
     if state == "working":
         return "running"
     if state == "idle":
@@ -899,11 +907,27 @@ def status_label(state, unread=0):
     return ""
 
 
+def cached_thread_activity(bot):
+    """State from the thread already on disk, before the next `gbot thread` returns."""
+    name = bot.get("name") or ""
+    entries = read_thread_cache(name) if name else []
+    if not entries:
+        return None
+    return judge_activity(entries, last_id(entries), seen_mark(bot))
+
+
 def with_activity(bots):
+    """Attach a state to each bot. A saved thread counts until the live read lands."""
     views = []
     for bot in bots:
         view = dict(bot)
         snap = lookup_activity(bot)
+        if not snap:
+            snap = cached_thread_activity(bot)
+            if snap:
+                store_activity(bot, snap, only_if_absent=True)
+                # The scan may have stored a newer state while this was judged.
+                snap = lookup_activity(bot) or snap
         if snap:
             view["activity"] = snap
         views.append(view)
@@ -939,13 +963,13 @@ def _count_phrase(count, one, many):
 
 
 def overview_summary(bots, checked=None, total=None):
-    """One line: `1 needs you · 2 new · 1 running`, plus a scan hint while reading."""
+    """One line: `1 needs you · 2 unread · 1 running`, plus a scan hint while reading."""
     counts = attention_counts(bots)
     parts = [
         phrase
         for phrase in (
             _count_phrase(counts["blocked"], "1 needs you", "need you"),
-            _count_phrase(counts["unread"], "1 new", "new"),
+            _count_phrase(counts["unread"], "1 unread", "unread"),
             _count_phrase(counts["working"], "1 running", "running"),
         )
         if phrase
@@ -975,9 +999,9 @@ def format_overview(bots):
         label = status_label(activity.get("state") or "", activity.get("unread") or 0)
         preview = activity.get("preview") or bot.get("title") or bot.get("tagline") or ""
         preview = " ".join(str(preview).split())
-        line = f"{label:<9}  {bot['name']:<{name_width}}"
+        line = f"{label:<{STATE_COLUMN}}{bot['name']:<{name_width}}"
         if preview:
-            line += "  " + preview
+            line += PREVIEW_MARK + preview
         lines.append(line.rstrip())
     return "\n".join(lines)
 
@@ -3052,23 +3076,18 @@ def fuzzy_score(query, name):
     return score
 
 
-STATE_COLUMN = 10
-
-
 def list_columns(bots, width):
-    """Shared name and status widths so every preview starts at the same column.
+    """Shared state and name widths so every preview starts at the same column.
 
     A narrow window gives the name less room before it gives up the grid.
+    Every named bot is in the grid, so a row still waiting on a read keeps the
+    same state column as the ones that already have a word.
     """
     room = max(width - 7, 1)
-    overhead = 1 + STATE_COLUMN
+    overhead = STATE_COLUMN + len(PREVIEW_MARK)
     if room <= overhead + 4:
         return None
-    names = []
-    for bot in bots:
-        activity = bot.get("activity") if isinstance(bot.get("activity"), dict) else None
-        if activity and activity.get("state") in OVERVIEW_STATES and bot.get("name"):
-            names.append(bot["name"])
+    names = [bot["name"] for bot in bots if bot.get("name")]
     if not names:
         return None
     rest = room - overhead
@@ -3088,53 +3107,67 @@ def _pad(text, width):
     return text + (" " * (width - len(text)))
 
 
+def state_field(label, state_w):
+    """The state word plus the gap before the name. A missing state is a dash."""
+    text = label or "-"
+    if len(text) >= state_w:
+        return text + "  "
+    return _pad(text, state_w)
+
+
 def _status_spans(lead, lead_style, mark, name, name_style, activity, title, room, columns=None):
-    label = status_label(activity.get("state"), activity.get("unread") or 0)
+    """State, then name, then the latest line. The state column is what you scan."""
+    label = status_label(activity.get("state") or "", activity.get("unread") or 0)
     preview = " ".join((activity.get("preview") or title or "").split())
     state_w = columns["state"] if columns else STATE_COLUMN
-    field = _pad(label, state_w)[: max(state_w, len(label))]
+    field = state_field(label, state_w)
+    style = STATUS_STYLE.get(activity.get("state"), "dim")
+    sep = PREVIEW_MARK if preview else ""
     if columns:
         name_w = columns["name"]
-        if name_w + 1 + state_w > room:
-            name_w = max(room - 1 - state_w, 1)
+        fixed = len(field) + len(sep)
+        if name_w + fixed > room:
+            name_w = max(room - fixed, 1)
         shown = _pad(clip(name, name_w), name_w)
-        preview_room = room - name_w - 1 - len(field)
+        preview_room = room - len(field) - len(shown) - len(sep)
         spans = [
             (lead, lead_style),
             mark,
+            (field, style),
             (shown, name_style),
-            (" ", "dim"),
-            (field, STATUS_STYLE.get(activity.get("state"), "dim")),
         ]
         if preview and preview_room > 0:
+            spans.append((sep, "dim"))
             spans.append((clip(preview, preview_room), "dim"))
         return spans
-    overhead = 1 + len(field)
-    if room <= overhead:
+    # A very narrow window keeps the name. The state word needs its column.
+    if room < len(field) + 1:
         return [(lead, lead_style), mark, (clip(name, room), name_style)]
-    rest = room - overhead
+    rest = room - len(field)
     name_room = len(name)
+    if preview and name_room + len(sep) > rest and rest >= 12:
+        name_room = max((rest * 2) // 3, 1)
     if name_room > rest:
         name_room = rest
-    elif preview and name_room > (rest * 2) // 3 and rest >= 12:
-        name_room = max((rest * 2) // 3, 1)
-    preview_room = rest - name_room
+    preview_room = rest - name_room - len(sep)
     spans = [
         (lead, lead_style),
         mark,
+        (field, style),
         (clip(name, name_room), name_style),
-        (" ", "dim"),
-        (field, STATUS_STYLE.get(activity.get("state"), "dim")),
     ]
     if preview and preview_room > 0:
+        spans.append((sep, "dim"))
         spans.append((clip(preview, preview_room), "dim"))
     return spans
 
 
 def picker_spans(bot, selected, width, columns=None):
-    """One sidebar row: selection mark, avatar, name, status, and a preview.
+    """One selection row: mark, avatar, state, name, and a preview.
 
-    A row with no activity yet keeps the tagline, the same as before a scan.
+    The state is `needs you`, `unread`, `running`, or `idle`. A row with no
+    reading yet holds that column with a dash so the names still line up.
+    Without a shared grid, a row that has no state yet keeps the tagline.
     """
     title = (bot.get("title") or bot.get("tagline") or "").strip()
     name = bot["name"]
@@ -3150,6 +3183,18 @@ def picker_spans(bot, selected, width, columns=None):
     activity = bot.get("activity") if isinstance(bot.get("activity"), dict) else None
     if activity and activity.get("state") in OVERVIEW_STATES:
         return _status_spans(lead, lead_style, mark, name, name_style, activity, title, room, columns)
+    if columns:
+        return _status_spans(
+            lead,
+            lead_style,
+            mark,
+            name,
+            name_style,
+            {"state": "", "unread": 0, "preview": title},
+            "",
+            room,
+            columns,
+        )
     if not title:
         return [(lead, lead_style), mark, (clip(name, room), name_style)]
     name_room = min(len(name), max(room // 2, 1))
@@ -3251,7 +3296,7 @@ LIST_HINT = "type to search · enter open · ctrl-r refresh · ctrl-c quit"
 
 
 def pick(stdscr, bots, refresh=None):
-    """The bot list, with who needs you, who is running, and who has a new reply.
+    """The bot list. Each row leads with needs you, unread, running, or idle.
 
     `refresh` fetches a newer roster on a thread. A survey reads each thread
     beside that. Until you move, the highlight stays on the top row, which is
@@ -3472,9 +3517,9 @@ gbot-tui --list
 gbot-tui --overview
 
 Open a chat with one Grok bot. A name opens that bot; a unique prefix works too.
-With no name, pick from the list. The list shows which bots need you, which
-are running, and which have a new reply. --list prints every name.
---overview prints that status and the latest line, then exits.
+With no name, pick from the list. Each row leads with that bot's state:
+needs you, unread, running, or idle, then the latest line. --list prints
+every name. --overview prints that status and the latest line, then exits.
 Run it inside a Herdr tab and that bot shows up in the agents list.
 """
 
