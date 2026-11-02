@@ -44,9 +44,95 @@ class GbotError(Exception):
     pass
 
 
+# The desktop chat does not show the model's thinking. These names mark a
+# whole entry, a tool, or one part of a message.
+THINKING_NAMES = frozenset({
+    "thinking",
+    "thought",
+    "reasoning",
+    "redacted-thinking",
+    "agent-thought",
+    "agent-thought-chunk",
+})
+_THINKING_BLOCK = re.compile(
+    r"<(?:think|thinking|reasoning)\b[^>]*>.*?</(?:think|thinking|reasoning)>",
+    re.IGNORECASE | re.DOTALL,
+)
+_THINKING_OPEN = re.compile(
+    r"<(?:think|thinking|reasoning)\b[^>]*>.*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+_THINKING_CLOSE = re.compile(r"</(?:think|thinking|reasoning)>", re.IGNORECASE)
+
+
+def _thinking_name(value):
+    if not isinstance(value, str):
+        return False
+    return value.strip().lower().replace("_", "-") in THINKING_NAMES
+
+
+def is_thinking_part(part):
+    if not isinstance(part, dict):
+        return False
+    for key in ("type", "kind", "role", "name"):
+        if _thinking_name(part.get(key)):
+            return True
+    return False
+
+
+def is_thinking(entry):
+    """True when this row is the model's thinking, not a chat message."""
+    if not isinstance(entry, dict) or entry.get("local") or is_user(entry):
+        return False
+    message = entry.get("message")
+    if isinstance(message, dict) and _thinking_name(message.get("type")):
+        return True
+    if entry.get("kind") == "send-message":
+        return False
+    for key in ("kind", "role", "type", "name", "tool", "toolName", "tool_name"):
+        if _thinking_name(entry.get(key)):
+            return True
+    for key in ("toolCall", "tool_call", "function"):
+        nested = entry.get(key)
+        if isinstance(nested, dict) and (
+            _thinking_name(nested.get("name")) or _thinking_name(nested.get("type"))
+        ):
+            return True
+    return False
+
+
+def hide_thinking_markup(text):
+    """Drop <think>, <thinking>, and <reasoning> blocks from a reply."""
+    if not isinstance(text, str) or "<" not in text:
+        return text
+    cleaned = _THINKING_BLOCK.sub("", text)
+    cleaned = _THINKING_OPEN.sub("", cleaned)
+    cleaned = _THINKING_CLOSE.sub("", cleaned)
+    if cleaned == text:
+        return text
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _part_text(part):
+    if isinstance(part, str):
+        return part
+    if isinstance(part, dict) and not is_thinking_part(part):
+        return part.get("text") or part.get("content") or ""
+    return ""
+
+
 def entry_text(entry):
-    if not isinstance(entry, dict):
+    if not isinstance(entry, dict) or is_thinking(entry):
         return ""
+    text = _entry_body(entry)
+    if is_user(entry):
+        return text
+    return hide_thinking_markup(text)
+
+
+def _entry_body(entry):
     for key in ("text", "prompt"):
         if isinstance(entry.get(key), str) and entry[key]:
             return entry[key]
@@ -57,14 +143,8 @@ def entry_text(entry):
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = []
-        for part in content:
-            if isinstance(part, str):
-                parts.append(part)
-            elif isinstance(part, dict):
-                parts.append(part.get("text") or part.get("content") or "")
-        return "\n".join(p for p in parts if p)
-    if isinstance(content, dict) and isinstance(content.get("text"), str):
+        return "\n".join(piece for piece in (_part_text(part) for part in content) if piece)
+    if isinstance(content, dict) and not is_thinking_part(content) and isinstance(content.get("text"), str):
         return content["text"]
     if isinstance(message, dict) and isinstance(message.get("content"), str):
         return message["content"]

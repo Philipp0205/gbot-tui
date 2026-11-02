@@ -38,6 +38,36 @@ class ParseTests(unittest.TestCase):
         self.assertTrue(gbot_tui.is_user({"role": "user", "text": "hi"}))
         self.assertFalse(gbot_tui.is_user({"role": "assistant", "text": "yo"}))
 
+    def test_thinking_is_not_message_text(self):
+        self.assertEqual(gbot_tui.entry_text({"kind": "thinking", "text": "plan the reply"}), "")
+        self.assertEqual(
+            gbot_tui.entry_text({"kind": "tool-call", "name": "thinking", "content": "still planning"}),
+            "",
+        )
+        self.assertEqual(
+            gbot_tui.entry_text({
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "text": "private"},
+                    {"type": "text", "text": "the answer"},
+                ],
+            }),
+            "the answer",
+        )
+        self.assertEqual(
+            gbot_tui.entry_text({
+                "kind": "send-message",
+                "message": {"type": "text", "content": "<thinking>\nhidden\n</thinking>\n\nvisible"},
+            }),
+            "visible",
+        )
+        self.assertEqual(
+            gbot_tui.entry_text({"role": "assistant", "text": "<think>streaming the plan"}),
+            "",
+        )
+        self.assertEqual(gbot_tui.entry_text({"role": "user", "text": "<think>keep this</think> hi"}), "<think>keep this</think> hi")
+        self.assertEqual(gbot_tui.entry_text({"role": "assistant", "text": "yo"}), "yo")
+
     def test_thread_delta(self):
         page = gbot_tui.parse_thread(
             {
@@ -135,6 +165,16 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(phase, "working")
         phase, quiet, saw = gbot_tui.watch_step(phase, [], quiet, saw, False)
         self.assertEqual((phase, quiet, saw), ("done", 0, False))
+
+    def test_thinking_does_not_finish_the_turn(self):
+        phase, quiet, saw = gbot_tui.watch_step(
+            "working",
+            [{"kind": "thinking", "text": "hmm"}],
+            0,
+            False,
+            False,
+        )
+        self.assertEqual((phase, quiet, saw), ("working", 0, False))
 
     def test_pending_approval_blocks(self):
         entries = [
@@ -452,6 +492,43 @@ class LookTests(unittest.TestCase):
         )
         self.assertEqual([kind for kind, _text in rows], ["user", "gap", "text"])
         self.assertGreater(gbot_tui.bubble_column(40, "hi"), 20)
+
+    def test_thinking_stays_off_the_transcript(self):
+        rows = gbot_tui.transcript_rows(
+            [
+                {"role": "user", "text": "hi"},
+                {"kind": "thinking", "text": "plan the reply"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "text": "still planning"},
+                        {"type": "text", "text": "the answer"},
+                    ],
+                },
+            ],
+            40,
+        )
+        texts = [text for kind, text in rows if kind != "gap"]
+        self.assertEqual(texts, ["hi", "the answer"])
+        self.assertNotIn("plan the reply", texts)
+        self.assertNotIn("still planning", texts)
+        marked = gbot_tui.transcript_rows(
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "reasoning", "text": "private plan"},
+                        {"type": "text", "text": "<think>still hidden</think>\n\nSay **hello**"},
+                    ],
+                }
+            ],
+            40,
+        )
+        shown = " ".join(gbot_tui.line_plain(line) for kind, line in marked if kind != "gap")
+        self.assertIn("hello", shown)
+        self.assertNotIn("**", shown)
+        self.assertNotIn("private plan", shown)
+        self.assertNotIn("still hidden", shown)
 
     def test_pending_card_reads_needs_approval(self):
         rows = gbot_tui.transcript_rows(
@@ -1844,6 +1921,27 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(snap["preview"], "and more")
         self.assertEqual(gbot_tui.status_label("unread", 2), "2 unread")
         self.assertEqual(gbot_tui.status_label("unread", 1), "unread")
+
+    def test_thinking_is_not_a_new_reply(self):
+        entries = [
+            {"id": "m1", "role": "user", "text": "go"},
+            {"id": "m2", "role": "assistant", "text": "done"},
+            {"id": "m3", "kind": "thinking", "text": "more private"},
+        ]
+        snap = gbot_tui.judge_activity(entries, "m3", "m1")
+        self.assertEqual(snap["state"], "unread")
+        self.assertEqual(snap["unread"], 1)
+        self.assertEqual(snap["preview"], "done")
+        waiting = [
+            {"id": "m1", "role": "user", "text": "go"},
+            {"id": "m2", "kind": "thinking", "text": "private plan"},
+        ]
+        snap = gbot_tui.judge_activity(waiting, "m2", "m1")
+        self.assertEqual(snap["state"], "working")
+        self.assertEqual(snap["unread"], 0)
+        self.assertEqual(snap["preview"], "go")
+        marked = [{"role": "assistant", "text": "<thinking>nope</thinking>\n\n**lunch** is ready"}]
+        self.assertEqual(gbot_tui.activity_preview(marked, "idle"), "lunch is ready")
 
     def test_a_seen_reply_is_idle_and_a_first_look_is_not_all_new(self):
         entries = [{"id": "m2", "role": "assistant", "text": "done"}]
