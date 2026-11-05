@@ -197,7 +197,17 @@ def entry_text(entry, picks=(), numbered=True, step_at=0, step_answers=()):
     return hide_thinking_markup(text)
 
 
+def attachment_text(entry):
+    name = entry.get("file_name") or os.path.basename(entry.get("file_path") or "") or "attachment"
+    details = [str(entry[key]) for key in ("secondaryText",) if entry.get(key)]
+    if entry.get("width") and entry.get("height"):
+        details.append(f"{entry['width']}x{entry['height']}")
+    return f"\U0001F4CE {name}" + (f" ({', '.join(details)})" if details else "")
+
+
 def _entry_body(entry, picks=(), numbered=True, step_at=0, step_answers=()):
+    if entry.get("kind") == "user-attachment":
+        return attachment_text(entry)
     for key in ("text", "prompt"):
         if isinstance(entry.get(key), str) and entry[key]:
             return entry[key]
@@ -514,7 +524,7 @@ def entry_role(entry):
 
 def is_user(entry):
     role = entry_role(entry).lower()
-    return role in {"user", "human"} or role.endswith(":user")
+    return role in {"user", "human", "user-attachment"} or role.endswith(":user")
 
 
 # Fields gbot copies off a pending auto-review or local-tool card.
