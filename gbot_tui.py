@@ -44,6 +44,64 @@ IDLE_DELAYS = (2.0, 2.0, 3.0, 5.0, 8.0)
 # how late a resize can be noticed.
 WAKE_CAP = 0.1
 
+# A progress line the bot sends while it works ("Checking the agent now.",
+# "Ich schau mir EXE-3318 kurz an."). The desktop shows that as Thinking.
+# A link or a second paragraph is the reply itself, so it stays.
+_STATUS_BEAT = re.compile(
+    r"^(?:"
+    r"hi\b.{0,80}?\bich\s+(?:check\w*|schau\w*|such\w*)\b"
+    r"|(?:(?:"
+    r"gut|okay|got it|right|sounds good|good idea|sure|will do|makes sense|probably(?:\s*,\s*yes)?|on it"
+    r")[,.!]?\s+)?"
+    r"(?:"
+    r"(?:still\s+)?(?:checking|looking(?:\s+up)?|reading|searching|refreshing|comparing)\b"
+    r"|i(?:'m|\s+am)\s+(?:still\s+)?(?:\w+ing|going)\b"
+    r"|i(?:'ll|\s+will)\s+(?:send|tell|let|get back|look|check|start|be back|come back|grab|hand|pull|read|pass|delete|make|do|re-run|draft|mute)\b"
+    r"|i(?:'ve|\s+have)\s+asked\b"
+    r"|i haven't found\b"
+    r"|on it\b"
+    r"|(?:gute idee,\s+)?ich\s+(?:schau\w*|such\w*|durchsuch\w*|verschieb\w*|lass\w*|poste\w*|schick\w*|check\w*|gleich\w*|meld\w*|bin\s+gerade|geb\w*|führ\w*)\b"
+    r"|mach ich[.!,]?\s+ich\s+(?:schau\w*|such\w*|durchsuch\w*|geb\w*|führ\w*)\b"
+    r"|ich hab(?:e)?\s+@"
+    r"|@\S+\s+schreibt\s+jetzt\b"
+    r"|läuft\b"
+    r"))",
+    re.IGNORECASE,
+)
+_STATUS_BEAT_LATER = re.compile(
+    r"\b(?:wird\s+gerade|geht\s+gerade|schicke ich,\s+sobald|kommen direkt nach|kommt direkt nach)\b",
+    re.IGNORECASE,
+)
+
+
+def is_status_beat(text):
+    raw = str(text).strip()
+    if not raw or len(raw) > 400 or "\n" in raw or "http" in raw.lower():
+        return False
+    return _STATUS_BEAT.match(raw) is not None or _STATUS_BEAT_LATER.search(raw) is not None
+
+
+def _row_key(entry):
+    ident = entry.get("id") if isinstance(entry, dict) else None
+    if isinstance(ident, str) and ident:
+        return ident
+    return id(entry)
+
+
+def hidden_status_ids(entries):
+    """Progress lines to leave out once any later bot line is visible."""
+    shown = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict) and not is_user(entry) and entry_text(entry).strip()
+    ]
+    return {
+        _row_key(entry)
+        for entry in shown[:-1]
+        if is_status_beat(entry_text(entry))
+    }
+
+
 locale.setlocale(locale.LC_ALL, "")
 
 
@@ -686,10 +744,28 @@ def gbot_failure(stdout, stderr):
 GBOT_LOCK = threading.Lock()
 
 
+def token_expired(token, now=None):
+    """True when a Cursor JWT's exp is in the past. Unreadable tokens count as live."""
+    try:
+        import base64
+        import json as _json
+
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = _json.loads(base64.urlsafe_b64decode(payload))["exp"]
+        return float(exp) <= (time.time() if now is None else now)
+    except (IndexError, ValueError, KeyError, TypeError):
+        return False
+
+
 def gbot(*args, timeout=60, env_extra=None):
     env = os.environ.copy()
     # gbot 0.12.4 tells Cursor it is Grok Bot 0.20.0, which the server rejects.
     env.setdefault("SAND_CLIENT_VERSION", sand_client_version())
+    # A stale shell token beats the app's live login inside gbot. Drop it so
+    # gbot reads the token the desktop app keeps refreshed.
+    if token_expired(env.get("CURSOR_ACCESS_TOKEN", "")):
+        env.pop("CURSOR_ACCESS_TOKEN")
     if env_extra:
         env.update(env_extra)
     with GBOT_LOCK:
@@ -1979,6 +2055,21 @@ def read_thread(target, after=None, limit=80, timeout=30):
 
 def send_message(target, text):
     gbot("send", "--", target, text, timeout=90)
+
+
+def parse_route(text, names):
+    """`@bot task` -> (bot name, task). None when the text is not routed.
+
+    A bot name with spaces is written with hyphens: `@Cursor-Cloud-Session`.
+    """
+    if not text.startswith("@"):
+        return None
+    head, _, task = text[1:].partition(" ")
+    task = task.strip()
+    if not head or not task:
+        return None
+    by_slug = {name.replace(" ", "-"): name for name in names}
+    return by_slug[match_bot(head, list(by_slug))], task
 
 
 def respond_approval(target, entry_id, request_id, decision):
@@ -3362,7 +3453,10 @@ def composer_cursor_column(line, placeholder):
 def draft_lines(typed, width):
     if not typed:
         return []
-    return wrap(typed, composer_text_width(width))
+    lines = wrap(typed, composer_text_width(width))
+    if typed.endswith("\n"):
+        lines.append("")
+    return lines
 
 
 def layout(height, text_lines=1):
@@ -3447,7 +3541,10 @@ def transcript_rows(entries, width, picks=None, progress=None):
     progress = progress or {}
     current = latest_widget(entries)
     current_id = current.get("id") if current else None
+    hidden = hidden_status_ids(entries)
     for entry in entries:
+        if isinstance(entry, dict) and _row_key(entry) in hidden:
+            continue
         lines = card_lines(entry, width)
         chosen = picks.get(entry.get("id")) if isinstance(entry, dict) else None
         # No open widget means nothing is numbered, including a stale one
@@ -3805,6 +3902,32 @@ def fast_escape():
         return
 
 
+WHEEL_LINES = 3
+
+
+def enable_wheel():
+    try:
+        curses.mousemask(curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
+        curses.mouseinterval(0)
+    except (AttributeError, curses.error):
+        pass
+
+
+def wheel_direction(key):
+    """-1 for wheel up, 1 for wheel down, None for any other key."""
+    if key != curses.KEY_MOUSE:
+        return None
+    try:
+        state = curses.getmouse()[4]
+    except curses.error:
+        return None
+    if state & curses.BUTTON4_PRESSED:
+        return -1
+    if state & curses.BUTTON5_PRESSED:
+        return 1
+    return None
+
+
 def page_motion(key):
     """(direction, half). Alt-Page is kPRV3/kNXT3; plain Page is KEY_PPAGE/KEY_NPAGE."""
     if key == curses.KEY_PPAGE:
@@ -3955,9 +4078,13 @@ def chat_key(chat, key, stdscr):
         return "back"
     chat.nudge()
     motion = page_motion(key)
+    if motion is None:
+        wheel = wheel_direction(key)
+        if wheel is not None:
+            motion = (wheel, None)
     if motion is not None:
         direction, half = motion
-        step = page_step(curses.LINES, half)
+        step = WHEEL_LINES if half is None else page_step(curses.LINES, half)
         if direction < 0:
             chat.follow = False
             chat.scroll = max(chat.scroll - step, 0)
@@ -3970,7 +4097,11 @@ def chat_key(chat, key, stdscr):
         if chat.scroll >= max(len(rows) - room, 0):
             chat.follow = True
         return None
-    if key in ("\n", "\r", curses.KEY_ENTER):
+    if key == "\n":
+        # nonl() makes Enter "\r", so a bare LF is ctrl+enter / ctrl+j.
+        chat.typed += "\n"
+        return None
+    if key in ("\r", curses.KEY_ENTER):
         entry = latest_widget(chat.messages) if not chat.widget_busy else None
         if entry is not None and chat.typed.strip():
             _prompt, _options, _multi, custom = current_question(entry, chat.step_at(entry))
@@ -3997,6 +4128,17 @@ def chat_key(chat, key, stdscr):
                     chat.error = ""
                     chat.follow = True
                     return ("choice", result)
+        try:
+            route = parse_route(chat.typed.strip(), [bot["name"] for bot in read_roster()])
+        except GbotError as error:
+            chat.error = str(error)
+            return None
+        if route and route[0] != chat.target:
+            chat.typed = ""
+            chat.error = ""
+            return ("route", route)
+        if route:
+            chat.typed = route[1]
         text = chat.arm_send()
         if not text:
             return None
@@ -4048,6 +4190,9 @@ def chat_loop(stdscr, chat):
     fast_escape()
     place_cursor(True)
     stdscr.keypad(True)
+    curses.nonl()
+
+    enable_wheel()
     # gbot's network calls used to run here, so typing froze until each one returned.
     # Keys are read without waiting; the loop sleeps in select on the tty and a pipe.
     stdscr.timeout(0)
@@ -4083,6 +4228,9 @@ def chat_loop(stdscr, chat):
                 elif kind == "choice":
                     respond_widget(*args)
                     finish(("chosen", None))
+                elif kind == "route":
+                    send_message(*args)
+                    finish(("routed", args[0]))
                 else:
                     send_message(*args)
                     finish(("sent", None))
@@ -4124,6 +4272,8 @@ def chat_loop(stdscr, chat):
                     if source == "read":
                         chat.read_failed()
                         next_poll = time.monotonic() + IDLE_DELAYS[0]
+                elif kind == "routed":
+                    chat.error = f"Sent to {payload}."
                 elif kind in {"sent", "decided", "chosen"}:
                     if kind == "decided":
                         chat.finish_decision()
@@ -4449,6 +4599,7 @@ def pick(stdscr, bots, refresh=None):
     fast_escape()
     place_cursor(False)
     stdscr.keypad(True)
+    enable_wheel()
     bots = list(bots)
     loader = Loader(refresh) if refresh else None
     survey = Survey(bots)
@@ -4548,6 +4699,12 @@ def pick(stdscr, bots, refresh=None):
                 selected = 0
                 moved = False
                 chosen = ""
+                continue
+            wheel = wheel_direction(key)
+            if wheel is not None and shown:
+                selected = min(max(selected + wheel, 0), len(shown) - 1)
+                moved = True
+                chosen = shown[selected]["name"]
                 continue
             if key == curses.KEY_UP and selected > 0:
                 selected -= 1

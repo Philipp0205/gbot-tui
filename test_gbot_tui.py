@@ -2774,6 +2774,116 @@ class ServerStateTests(unittest.TestCase):
         self.assertEqual([bot["name"] for bot in ordered], ["B", "A"])
         self.assertEqual(ordered[0]["activity"]["unread"], 3)
 
+class RouteTests(unittest.TestCase):
+    names = ["Chef", "Cursor Cloud Session"]
+
+    def test_routes_by_prefix_and_slug(self):
+        self.assertEqual(gbot_tui.parse_route("@che make soup", self.names), ("Chef", "make soup"))
+        self.assertEqual(
+            gbot_tui.parse_route("@Cursor-Cloud-Session do it", self.names),
+            ("Cursor Cloud Session", "do it"),
+        )
+
+    def test_plain_text_is_not_routed(self):
+        self.assertIsNone(gbot_tui.parse_route("hello @chef", self.names))
+        self.assertIsNone(gbot_tui.parse_route("@chef", self.names))
+
+    def test_unknown_bot_raises(self):
+        with self.assertRaises(gbot_tui.GbotError):
+            gbot_tui.parse_route("@nobody hi", self.names)
+
+
+class StatusBeatTests(unittest.TestCase):
+    def test_a_progress_line_drops_once_the_reply_arrives(self):
+        beat = {
+            "kind": "send-message",
+            "id": "t1s1",
+            "message": {"type": "text", "content": "Checking the agent now."},
+        }
+        answer = {
+            "kind": "send-message",
+            "id": "t1s2",
+            "message": {"type": "text", "content": "Just one cloud agent is working on Hangry."},
+        }
+        rows = [text for kind, text in gbot_tui.transcript_rows([beat, answer], 80) if kind == "text"]
+        self.assertEqual(rows, ["Just one cloud agent is working on Hangry."])
+        # Still the latest line, so it stays until the reply shows up.
+        alone = [text for kind, text in gbot_tui.transcript_rows([beat], 80) if kind == "text"]
+        self.assertEqual(alone, ["Checking the agent now."])
+        # A scheduled fact is the reply. A ticket number inside a progress line is not.
+        plan = {
+            "kind": "send-message",
+            "id": "t2s1",
+            "message": {"type": "text", "content": "Mach ich. Ich lege Moustafa von 14:00 bis 14:30."},
+        }
+        kept = [text for kind, text in gbot_tui.transcript_rows([plan, answer], 80) if kind == "text"]
+        self.assertIn("Mach ich. Ich lege Moustafa von 14:00 bis 14:30.", kept)
+        looking = {
+            "kind": "send-message",
+            "id": "t3s1",
+            "message": {
+                "type": "text",
+                "content": "Ich schau mir EXE-3318 kurz an und schlage dir dann einen Kommentar vor.",
+            },
+        }
+        posted = {
+            "kind": "send-message",
+            "id": "t3s2",
+            "message": {"type": "text", "content": "Dein Kommentar steht jetzt auf EXE-3318."},
+        }
+        rows = [text for kind, text in gbot_tui.transcript_rows([looking, posted], 80) if kind == "text"]
+        self.assertEqual(rows, ["Dein Kommentar steht jetzt auf EXE-3318."])
+        promise = {
+            "kind": "send-message",
+            "id": "t4s1",
+            "message": {
+                "type": "text",
+                "content": 'Ich schicke die Antwort jetzt ohne Grußformel im Thread "Re: GH Copilot".',
+            },
+        }
+        gone = [text for kind, text in gbot_tui.transcript_rows([promise, posted], 80) if kind == "text"]
+        self.assertEqual(gone, ["Dein Kommentar steht jetzt auf EXE-3318."])
+        decision = {
+            "kind": "send-message",
+            "id": "t5s1",
+            "message": {"type": "text", "content": "Okay, I'll leave those 7 alone."},
+        }
+        stayed = [text for kind, text in gbot_tui.transcript_rows([decision, posted], 80) if kind == "text"]
+        self.assertIn("Okay, I'll leave those 7 alone.", stayed)
+        # A question in between does not keep the progress line once the result arrives.
+        sending = {
+            "kind": "send-message",
+            "id": "t6s1",
+            "message": {"type": "text", "content": "Ich schicke die Nachricht jetzt an Robin."},
+        }
+        asked = {"kind": "message", "id": "t6u", "role": "user", "content": "was war die antwort an mario?"}
+        sent = {
+            "kind": "send-message",
+            "id": "t6s2",
+            "message": {"type": "text", "content": "Die Nachricht an Robin ist raus."},
+        }
+        rows = gbot_tui.transcript_rows([sending, asked, sent], 80)
+        self.assertEqual([text for kind, text in rows if kind == "text"], ["Die Nachricht an Robin ist raus."])
+        self.assertEqual(
+            [text for kind, text in rows if kind == "user"],
+            ["was war die antwort an mario?"],
+        )
+
+class TokenTests(unittest.TestCase):
+    @staticmethod
+    def jwt(exp):
+        import json
+        body = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode().rstrip("=")
+        return f"eyJhbGciOiJIUzI1NiJ9.{body}.sig"
+
+    def test_expired_token_is_dropped(self):
+        self.assertTrue(gbot_tui.token_expired(self.jwt(100), now=200))
+        self.assertFalse(gbot_tui.token_expired(self.jwt(300), now=200))
+
+    def test_garbage_counts_as_live(self):
+        self.assertFalse(gbot_tui.token_expired(""))
+        self.assertFalse(gbot_tui.token_expired("not.a.jwt"))
+
 
 if __name__ == "__main__":
     unittest.main()
