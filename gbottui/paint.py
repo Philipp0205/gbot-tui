@@ -2,7 +2,7 @@
 
 import curses
 
-from . import activity, grid, styles
+from . import activity, grid, markdown, styles, terminal
 
 
 def title_spans(title, phase, width):
@@ -78,6 +78,10 @@ def paint_bot_line(stdscr, y, x, line, base):
     col = x
     for text, style in line:
         put(stdscr, y, col, text, transcript_attr(style, base))
+        if "link" in style or style == "dim":
+            for found in markdown._URL_RE.finditer(text):
+                url = found.group(0).rstrip(".,;:!?)]")
+                terminal.LINK_HITS.append((y, col + found.start(), col + found.start() + len(url), url))
         col += len(text)
 
 

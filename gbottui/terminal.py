@@ -2,6 +2,7 @@
 
 import curses
 import os
+import subprocess
 import sys
 
 
@@ -34,11 +35,29 @@ POP_TITLE = b"\033[23;0t"
 
 
 WHEEL_LINES = 3
+LAST_CLICK = None
+LINK_HITS = []
+
+
+def open_link_at(x, y):
+    for hy, x0, x1, url in LINK_HITS:
+        if hy == y and x0 <= x < x1:
+            try:
+                subprocess.Popen(
+                    ["xdg-open", url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError:
+                pass
+            return True
+    return False
 
 
 def enable_wheel():
     try:
-        curses.mousemask(curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
+        curses.mousemask(curses.BUTTON1_PRESSED | curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
         curses.mouseinterval(0)
     except (AttributeError, curses.error):
         pass
@@ -49,9 +68,12 @@ def wheel_direction(key):
     if key != curses.KEY_MOUSE:
         return None
     try:
-        state = curses.getmouse()[4]
+        _id, mx, my, _z, state = curses.getmouse()
     except curses.error:
         return None
+    if state & curses.BUTTON1_PRESSED:
+        global LAST_CLICK
+        LAST_CLICK = (mx, my)
     if state & curses.BUTTON4_PRESSED:
         return -1
     if state & curses.BUTTON5_PRESSED:

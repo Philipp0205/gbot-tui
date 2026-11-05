@@ -170,9 +170,13 @@ def chat_key(chat, key, stdscr):
     chat.nudge()
     motion = terminal.page_motion(key)
     if motion is None:
+        terminal.LAST_CLICK = None
         wheel = terminal.wheel_direction(key)
         if wheel is not None:
             motion = (wheel, None)
+        elif terminal.LAST_CLICK:
+            terminal.open_link_at(*terminal.LAST_CLICK)
+            return None
     if motion is not None:
         direction, half = motion
         step = terminal.WHEEL_LINES if half is None else terminal.page_step(curses.LINES, half)

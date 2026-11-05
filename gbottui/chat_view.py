@@ -2,7 +2,7 @@
 
 import curses
 
-from . import grid, paint, styles, transcript, widgets
+from . import grid, paint, styles, terminal, transcript, widgets
 
 
 def paint_composer(stdscr, y, width, lines, placeholder=False):
@@ -35,6 +35,7 @@ def draw(stdscr, chat):
         stdscr.erase()
     except (AttributeError, curses.error):
         pass
+    terminal.LINK_HITS.clear()
     lines = grid.draft_lines(chat.typed, width)
     header, body_h, composer_h, footer_h = grid.layout(height, len(lines) or 1)
     footer = []
