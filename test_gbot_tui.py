@@ -155,6 +155,14 @@ class ParseTests(unittest.TestCase):
         )
 
 
+class AttachmentTests(unittest.TestCase):
+    def test_attachment_shows_name_and_size(self):
+        entry = {"kind": "user-attachment", "id": "a", "file_name": "p.jpg", "file_path": "/x/y.jpg",
+                 "secondaryText": "649kB", "width": 10, "height": 20}
+        self.assertEqual(gbot_tui.entry_text(entry), "\U0001F4CE p.jpg (649kB, 10x20)")
+        self.assertTrue(gbot_tui.is_user(entry))
+
+
 class WatchTests(unittest.TestCase):
     def test_reply_then_quiet_is_done(self):
         reply = [{"role": "assistant", "text": "shipped"}]
