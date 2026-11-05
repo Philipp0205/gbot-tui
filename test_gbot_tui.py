@@ -2753,5 +2753,21 @@ class OverviewTests(unittest.TestCase):
             self.assertEqual(chat.phase, "working")
 
 
+class TokenTests(unittest.TestCase):
+    @staticmethod
+    def jwt(exp):
+        import json
+        body = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode().rstrip("=")
+        return f"eyJhbGciOiJIUzI1NiJ9.{body}.sig"
+
+    def test_expired_token_is_dropped(self):
+        self.assertTrue(gbot_tui.token_expired(self.jwt(100), now=200))
+        self.assertFalse(gbot_tui.token_expired(self.jwt(300), now=200))
+
+    def test_garbage_counts_as_live(self):
+        self.assertFalse(gbot_tui.token_expired(""))
+        self.assertFalse(gbot_tui.token_expired("not.a.jwt"))
+
+
 if __name__ == "__main__":
     unittest.main()

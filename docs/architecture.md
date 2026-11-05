@@ -50,6 +50,8 @@ The picker and the chat share one curses session, so Enter and Esc do not drop b
 - The loop sleeps in `select` on the terminal and a pipe the worker writes to, so a finished read draws at once. The sleep is capped at 0.1s, which is how late a resize shows.
 - Reads are 0.3s apart while waiting for a reply, 1s while new entries arrive, 2s once they stop (so two quiet polls still take about four seconds), 1s while a card is pending, and 2s backing off to 8s in an idle chat. A key press puts an idle chat back on 2s.
 
+`gbot` runs with the app's live login when `CURSOR_ACCESS_TOKEN` in the shell has expired: the expired token is dropped from its environment before it starts.
+
 ## How a message reaches Grok Bot
 
 `gbot` is [grok-bot-cli](https://github.com/ScriptedAlchemy/grok-bot-cli), an MIT CLI by Zack Jackson. It is not part of the Grok Bot app. The bots run on Cursor's sandbox for the account. The official app and `gbot` are both HTTP clients of that sandbox's gateway.
