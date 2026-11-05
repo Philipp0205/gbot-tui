@@ -44,6 +44,64 @@ IDLE_DELAYS = (2.0, 2.0, 3.0, 5.0, 8.0)
 # how late a resize can be noticed.
 WAKE_CAP = 0.1
 
+# A progress line the bot sends while it works ("Checking the agent now.",
+# "Ich schau mir EXE-3318 kurz an."). The desktop shows that as Thinking.
+# A link or a second paragraph is the reply itself, so it stays.
+_STATUS_BEAT = re.compile(
+    r"^(?:"
+    r"hi\b.{0,80}?\bich\s+(?:check\w*|schau\w*|such\w*)\b"
+    r"|(?:(?:"
+    r"gut|okay|got it|right|sounds good|good idea|sure|will do|makes sense|probably(?:\s*,\s*yes)?|on it"
+    r")[,.!]?\s+)?"
+    r"(?:"
+    r"(?:still\s+)?(?:checking|looking(?:\s+up)?|reading|searching|refreshing|comparing)\b"
+    r"|i(?:'m|\s+am)\s+(?:still\s+)?(?:\w+ing|going)\b"
+    r"|i(?:'ll|\s+will)\s+(?:send|tell|let|get back|look|check|start|be back|come back|grab|hand|pull|read|pass|delete|make|do|re-run|draft|mute)\b"
+    r"|i(?:'ve|\s+have)\s+asked\b"
+    r"|i haven't found\b"
+    r"|on it\b"
+    r"|(?:gute idee,\s+)?ich\s+(?:schau\w*|such\w*|durchsuch\w*|verschieb\w*|lass\w*|poste\w*|schick\w*|check\w*|gleich\w*|meld\w*|bin\s+gerade|geb\w*|führ\w*)\b"
+    r"|mach ich[.!,]?\s+ich\s+(?:schau\w*|such\w*|durchsuch\w*|geb\w*|führ\w*)\b"
+    r"|ich hab(?:e)?\s+@"
+    r"|@\S+\s+schreibt\s+jetzt\b"
+    r"|läuft\b"
+    r"))",
+    re.IGNORECASE,
+)
+_STATUS_BEAT_LATER = re.compile(
+    r"\b(?:wird\s+gerade|geht\s+gerade|schicke ich,\s+sobald|kommen direkt nach|kommt direkt nach)\b",
+    re.IGNORECASE,
+)
+
+
+def is_status_beat(text):
+    raw = str(text).strip()
+    if not raw or len(raw) > 400 or "\n" in raw or "http" in raw.lower():
+        return False
+    return _STATUS_BEAT.match(raw) is not None or _STATUS_BEAT_LATER.search(raw) is not None
+
+
+def _row_key(entry):
+    ident = entry.get("id") if isinstance(entry, dict) else None
+    if isinstance(ident, str) and ident:
+        return ident
+    return id(entry)
+
+
+def hidden_status_ids(entries):
+    """Progress lines to leave out once any later bot line is visible."""
+    shown = [
+        entry
+        for entry in entries
+        if isinstance(entry, dict) and not is_user(entry) and entry_text(entry).strip()
+    ]
+    return {
+        _row_key(entry)
+        for entry in shown[:-1]
+        if is_status_beat(entry_text(entry))
+    }
+
+
 locale.setlocale(locale.LC_ALL, "")
 
 
@@ -3316,7 +3374,10 @@ def transcript_rows(entries, width, picks=None, progress=None):
     progress = progress or {}
     current = latest_widget(entries)
     current_id = current.get("id") if current else None
+    hidden = hidden_status_ids(entries)
     for entry in entries:
+        if isinstance(entry, dict) and _row_key(entry) in hidden:
+            continue
         lines = card_lines(entry, width)
         chosen = picks.get(entry.get("id")) if isinstance(entry, dict) else None
         # No open widget means nothing is numbered, including a stale one
