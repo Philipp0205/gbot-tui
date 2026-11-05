@@ -990,7 +990,9 @@ def _clean_snap(snap):
     if not isinstance(snap, dict) or snap.get("state") not in OVERVIEW_STATES:
         return None
     unread = snap.get("unread")
+    latest = snap.get("latest")
     return {
+        "latest": latest if isinstance(latest, (int, float)) and latest > 0 else 0,
         "state": snap["state"],
         "unread": unread if isinstance(unread, int) and unread > 0 else 0,
         "cursor": snap.get("cursor") if isinstance(snap.get("cursor"), str) else "",
@@ -1255,6 +1257,10 @@ def judge_activity(entries, cursor, seen, previous=None):
         "unread": unread,
         "cursor": cursor,
         "preview": activity_preview(entries, state),
+        "latest": max(
+            (e["timestampMs"] for e in entries if isinstance(e.get("timestampMs"), (int, float))),
+            default=0,
+        ),
         "token": token,
         "since": since,
     }
@@ -1276,11 +1282,164 @@ def status_label(state, unread=0, printed=False):
     return ""
 
 
+BACKEND = "https://api2.cursor.sh/aiserver.v1.GrokBotService/"
+TOKEN_JS = (
+    'const c=require("crypto"),f=require("fs"),o=require("os");'
+    'const k=c.pbkdf2Sync("peanuts","saltysalt",1,16,"sha1");'
+    'const d=b=>{const e=Buffer.from(b,"base64");'
+    'const x=c.createDecipheriv("aes-128-cbc",k,Buffer.alloc(16,32));'
+    'return Buffer.concat([x.update(e.subarray(3)),x.final()]).toString().trim()};'
+    'const s=JSON.parse(f.readFileSync(o.homedir()+"/.config/Grok Bot/sand-secrets.json","utf8"));'
+    'const a=JSON.parse(s["cursor-accounts"]);const n=a.accounts[a.active];'
+    'process.stdout.write(d(n["cursor-access-token"]))'
+)
+# Per-agent read state the desktop app keeps on the server: id -> {"unread", "latest"}.
+SERVER = {}
+
+
+def backend_token():
+    token = os.environ.get("CURSOR_ACCESS_TOKEN", "")
+    if token and not token_expired(token):
+        return token
+    try:
+        proc = subprocess.run(["node", "-e", TOKEN_JS], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _varint(value):
+    out = bytearray()
+    while value >= 0x80:
+        out.append(value & 0x7F | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def _proto_fields(data):
+    """(field, value) pairs of one protobuf message. Varints are ints, the rest bytes."""
+    fields = []
+    i = 0
+    while i < len(data):
+        key = shift = 0
+        while True:
+            byte = data[i]
+            i += 1
+            key |= (byte & 0x7F) << shift
+            shift += 7
+            if byte < 0x80:
+                break
+        kind = key & 7
+        if kind == 0 or kind == 2:
+            value = shift = 0
+            while True:
+                byte = data[i]
+                i += 1
+                value |= (byte & 0x7F) << shift
+                shift += 7
+                if byte < 0x80:
+                    break
+            if kind == 2:
+                value, i = data[i : i + value], i + value
+        else:
+            raise ValueError("unsupported wire type")
+        fields.append((key >> 3, value))
+    return fields
+
+
+def backend_call(method, body, timeout=15):
+    import urllib.request
+    import uuid
+
+    token = backend_token()
+    if not token:
+        raise GbotError("no Cursor token")
+    request = urllib.request.Request(
+        BACKEND + method,
+        data=body,
+        headers={
+            "authorization": "Bearer " + token,
+            "content-type": "application/proto",
+            "x-ghost-mode": "true",
+            "x-request-id": str(uuid.uuid4()),
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
+    except OSError as error:
+        raise GbotError(str(error)) from error
+
+
+def parse_agent_statuses(data):
+    found = {}
+    for field, status in _proto_fields(data):
+        if field != 1 or not isinstance(status, bytes):
+            continue
+        parts = _proto_fields(status)
+        ids = [v for f, v in parts if f == 1 and isinstance(v, bytes)]
+        client = next((v for f, v in parts if f == 3 and isinstance(v, bytes)), b"")
+        if not ids:
+            continue
+        state = dict(_proto_fields(client))
+        unread = state.get(3)
+        latest = state.get(4)
+        found[ids[0].decode("utf-8", "replace")] = {
+            "unread": unread if isinstance(unread, int) else 0,
+            "latest": latest if isinstance(latest, int) else 0,
+        }
+    return found
+
+
+def refresh_server_state(bots):
+    """Best effort. The list falls back to its own reads when this fails."""
+    ids = [bot["id"] for bot in bots if isinstance(bot.get("id"), str) and bot["id"]]
+    if not ids:
+        return
+    body = b"".join(b"\x0a" + _varint(len(raw)) + raw for raw in (i.encode() for i in ids))
+    try:
+        found = parse_agent_statuses(backend_call("ListGrokBotAgentStatuses", body))
+    except (GbotError, ValueError, IndexError):
+        return
+    with STATE_LOCK:
+        SERVER.update(found)
+
+
+def mark_read_later(agent_id):
+    """Tell the server this chat was read, as the desktop app does when it opens one."""
+    with STATE_LOCK:
+        known = SERVER.get(agent_id)
+        if not known or not known["unread"]:
+            return
+        known["unread"] = 0
+    body = b"\x0a" + _varint(len(agent_id.encode())) + agent_id.encode() + b"\x10\x01"
+
+    def run():
+        try:
+            backend_call("SetGrokBotAgentClientState", body)
+        except GbotError:
+            pass
+
+    threading.Thread(target=run, daemon=True).start()
+
+
 def with_activity(bots):
     views = []
     for bot in bots:
         view = dict(bot)
         snap = lookup_activity(bot)
+        with STATE_LOCK:
+            server = SERVER.get(bot.get("id") or "")
+        if server:
+            snap = dict(snap or {"state": "idle", "cursor": "", "preview": ""})
+            snap["unread"] = server["unread"]
+            snap["latest"] = server["latest"] or snap.get("latest") or 0
+            if snap.get("state") != "blocked":
+                if server["unread"]:
+                    snap["state"] = "unread"
+                elif snap.get("state") == "unread":
+                    snap["state"] = "idle"
         if snap:
             view["activity"] = snap
         views.append(view)
@@ -1288,12 +1447,11 @@ def with_activity(bots):
 
 
 def order_bots(bots):
-    """Needs-you, then new, then running. A search does not use this order."""
+    """Most recent message first. A search does not use this order."""
     ranked = []
     for index, bot in enumerate(bots):
-        state = ((bot.get("activity") or {}).get("state")) or ""
-        rank = ATTENTION_RANK.get(state, 3)
-        ranked.append((rank, index, bot))
+        latest = (bot.get("activity") or {}).get("latest") or 0
+        ranked.append((-latest, index, bot))
     ranked.sort()
     return [bot for _rank, _index, bot in ranked]
 
@@ -1420,6 +1578,7 @@ class Survey:
 
     def __init__(self, bots, read=None):
         self._read = read or read_overview
+        self._refresh = refresh_server_state if read is None else (lambda _bots: None)
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -1468,6 +1627,9 @@ class Survey:
                 self._failures = 0
                 self._running = True
                 self._restart = False
+                self.generation += 1
+            self._refresh(bots)
+            with self._lock:
                 self.generation += 1
             for bot in bots:
                 if self._stop.is_set():
@@ -2481,6 +2643,7 @@ class Chat:
         entries = [entry for entry in self.messages if isinstance(entry, dict)]
         cursor = self.cursor or last_id([entry for entry in entries if not entry.get("local")])
         remember_seen(self.target, self.session_id, cursor)
+        mark_read_later(self.session_id)
         shown = [entry for entry in entries if not entry.get("local")]
         # An open widget is needs-you on the list even while this chat is idle.
         if self.phase == "blocked" or (self.phase != "working" and latest_widget(shown)):
@@ -2496,6 +2659,10 @@ class Chat:
                 "unread": 0,
                 "cursor": cursor,
                 "preview": activity_preview(shown, state),
+                "latest": max(
+                    (e["timestampMs"] for e in shown if isinstance(e.get("timestampMs"), (int, float))),
+                    default=0,
+                ),
                 "token": content_token(shown),
                 "since": 0 if self.content_at is None else self.content_at,
             },
