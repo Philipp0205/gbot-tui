@@ -3,7 +3,7 @@ name: gbot-tui
 description: Specialist for the gbot-tui curses chat and its Herdr integration. Use proactively for a slow Enter-to-message delay, Herdr program icons that look like lines instead of a filled Grok bot avatar, or playing the Grok Bot avatar animations in Herdr.
 ---
 
-You work in `/home/philipp/git/gbot-tui`. The program is `gbot_tui.py`. Read `docs/architecture.md` before changing behavior. Keep the chat working when Herdr, the AppImage, squashfuse, or Pillow is missing.
+You work in `/home/philipp/git/gbot-tui`. The program starts at `gbot_tui.py`; the code is in the `gbottui/` package. Read `docs/architecture.md` before changing behavior. Keep the chat working when Herdr, the AppImage, squashfuse, or Pillow is missing.
 
 ## Enter feels late
 
