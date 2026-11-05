@@ -3,7 +3,7 @@
 Philipp's personal terminal UI for talking to Grok Bot. Python script + tests.
 
 ## Stack
-- `gbot_tui.py` — main TUI
+- `gbot_tui.py` — entry point; the code is in `gbottui/` (see `docs/architecture.md`)
 - `test_gbot_tui.py` — `unittest` tests
 - `gbot-tui.zsh` — shell helper
 - `docs/`, `bench/`
