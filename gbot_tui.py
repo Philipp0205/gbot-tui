@@ -1895,6 +1895,21 @@ def send_message(target, text):
     gbot("send", "--", target, text, timeout=90)
 
 
+def parse_route(text, names):
+    """`@bot task` -> (bot name, task). None when the text is not routed.
+
+    A bot name with spaces is written with hyphens: `@Cursor-Cloud-Session`.
+    """
+    if not text.startswith("@"):
+        return None
+    head, _, task = text[1:].partition(" ")
+    task = task.strip()
+    if not head or not task:
+        return None
+    by_slug = {name.replace(" ", "-"): name for name in names}
+    return by_slug[match_bot(head, list(by_slug))], task
+
+
 def respond_approval(target, entry_id, request_id, decision):
     # gbot approvals respond rechecks the card, then resolves it once.
     gbot(
@@ -3271,7 +3286,10 @@ def composer_cursor_column(line, placeholder):
 def draft_lines(typed, width):
     if not typed:
         return []
-    return wrap(typed, composer_text_width(width))
+    lines = wrap(typed, composer_text_width(width))
+    if typed.endswith("\n"):
+        lines.append("")
+    return lines
 
 
 def layout(height, text_lines=1):
@@ -3912,7 +3930,11 @@ def chat_key(chat, key, stdscr):
         if chat.scroll >= max(len(rows) - room, 0):
             chat.follow = True
         return None
-    if key in ("\n", "\r", curses.KEY_ENTER):
+    if key == "\n":
+        # nonl() makes Enter "\r", so a bare LF is ctrl+enter / ctrl+j.
+        chat.typed += "\n"
+        return None
+    if key in ("\r", curses.KEY_ENTER):
         entry = latest_widget(chat.messages) if not chat.widget_busy else None
         if entry is not None and chat.typed.strip():
             _prompt, _options, _multi, custom = current_question(entry, chat.step_at(entry))
@@ -3939,6 +3961,17 @@ def chat_key(chat, key, stdscr):
                     chat.error = ""
                     chat.follow = True
                     return ("choice", result)
+        try:
+            route = parse_route(chat.typed.strip(), [bot["name"] for bot in read_roster()])
+        except GbotError as error:
+            chat.error = str(error)
+            return None
+        if route and route[0] != chat.target:
+            chat.typed = ""
+            chat.error = ""
+            return ("route", route)
+        if route:
+            chat.typed = route[1]
         text = chat.arm_send()
         if not text:
             return None
@@ -3990,6 +4023,8 @@ def chat_loop(stdscr, chat):
     fast_escape()
     place_cursor(True)
     stdscr.keypad(True)
+    curses.nonl()
+
     enable_wheel()
     # gbot's network calls used to run here, so typing froze until each one returned.
     # Keys are read without waiting; the loop sleeps in select on the tty and a pipe.
@@ -4026,6 +4061,9 @@ def chat_loop(stdscr, chat):
                 elif kind == "choice":
                     respond_widget(*args)
                     finish(("chosen", None))
+                elif kind == "route":
+                    send_message(*args)
+                    finish(("routed", args[0]))
                 else:
                     send_message(*args)
                     finish(("sent", None))
@@ -4067,6 +4105,8 @@ def chat_loop(stdscr, chat):
                     if source == "read":
                         chat.read_failed()
                         next_poll = time.monotonic() + IDLE_DELAYS[0]
+                elif kind == "routed":
+                    chat.error = f"Sent to {payload}."
                 elif kind in {"sent", "decided", "chosen"}:
                     if kind == "decided":
                         chat.finish_decision()
