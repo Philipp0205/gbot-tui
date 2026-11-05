@@ -4480,6 +4480,10 @@ def paint_bot_line(stdscr, y, x, line, base):
     col = x
     for text, style in line:
         put(stdscr, y, col, text, transcript_attr(style, base))
+        if "link" in style or style == "dim":
+            for found in _URL_RE.finditer(text):
+                url = found.group(0).rstrip(".,;:!?)]")
+                LINK_HITS.append((y, col + found.start(), col + found.start() + len(url), url))
         col += len(text)
 
 
@@ -4526,6 +4530,7 @@ def draw(stdscr, chat):
         stdscr.erase()
     except (AttributeError, curses.error):
         pass
+    LINK_HITS.clear()
     lines = draft_lines(chat.typed, width)
     header, body_h, composer_h, footer_h = layout(height, len(lines) or 1)
     footer = []
@@ -4643,11 +4648,29 @@ def fast_escape():
 
 
 WHEEL_LINES = 3
+LAST_CLICK = None
+LINK_HITS = []
+
+
+def open_link_at(x, y):
+    for hy, x0, x1, url in LINK_HITS:
+        if hy == y and x0 <= x < x1:
+            try:
+                subprocess.Popen(
+                    ["xdg-open", url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError:
+                pass
+            return True
+    return False
 
 
 def enable_wheel():
     try:
-        curses.mousemask(curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
+        curses.mousemask(curses.BUTTON1_PRESSED | curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
         curses.mouseinterval(0)
     except (AttributeError, curses.error):
         pass
@@ -4658,9 +4681,12 @@ def wheel_direction(key):
     if key != curses.KEY_MOUSE:
         return None
     try:
-        state = curses.getmouse()[4]
+        _id, mx, my, _z, state = curses.getmouse()
     except curses.error:
         return None
+    if state & curses.BUTTON1_PRESSED:
+        global LAST_CLICK
+        LAST_CLICK = (mx, my)
     if state & curses.BUTTON4_PRESSED:
         return -1
     if state & curses.BUTTON5_PRESSED:
@@ -4819,9 +4845,14 @@ def chat_key(chat, key, stdscr):
     chat.nudge()
     motion = page_motion(key)
     if motion is None:
+        global LAST_CLICK
+        LAST_CLICK = None
         wheel = wheel_direction(key)
         if wheel is not None:
             motion = (wheel, None)
+        elif LAST_CLICK:
+            open_link_at(*LAST_CLICK)
+            return None
     if motion is not None:
         direction, half = motion
         step = WHEEL_LINES if half is None else page_step(curses.LINES, half)
