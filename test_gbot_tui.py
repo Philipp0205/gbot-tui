@@ -2173,7 +2173,7 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(gbot_tui.overview_summary([], checked=0, total=4), "checking threads")
         self.assertEqual(
             gbot_tui.overview_summary(bots[:2], checked=1, total=4),
-            "1 working · checking 1 of 4",
+            "1 running · checking 1 of 4",
         )
         self.assertEqual(gbot_tui.overview_summary(bots[:1]), "1 idle")
 
@@ -2477,7 +2477,7 @@ class OverviewTests(unittest.TestCase):
             False,
             60,
         )
-        self.assertIn(("working   ", "yellow"), spans)
+        self.assertIn(("running    ", "bold"), spans)
 
     def test_a_streaming_reply_stays_working_through_quiet_polls(self):
         page = gbot_tui.parse_thread(

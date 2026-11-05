@@ -1094,7 +1094,7 @@ def status_label(state, unread=0):
             return f"{count} unread"
         return "unread"
     if state == "working":
-        return "working"
+        return "running"
     if state == "idle":
         return "idle"
     return ""
