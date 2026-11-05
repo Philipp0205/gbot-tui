@@ -2753,5 +2753,24 @@ class OverviewTests(unittest.TestCase):
             self.assertEqual(chat.phase, "working")
 
 
+class RouteTests(unittest.TestCase):
+    names = ["Chef", "Cursor Cloud Session"]
+
+    def test_routes_by_prefix_and_slug(self):
+        self.assertEqual(gbot_tui.parse_route("@che make soup", self.names), ("Chef", "make soup"))
+        self.assertEqual(
+            gbot_tui.parse_route("@Cursor-Cloud-Session do it", self.names),
+            ("Cursor Cloud Session", "do it"),
+        )
+
+    def test_plain_text_is_not_routed(self):
+        self.assertIsNone(gbot_tui.parse_route("hello @chef", self.names))
+        self.assertIsNone(gbot_tui.parse_route("@chef", self.names))
+
+    def test_unknown_bot_raises(self):
+        with self.assertRaises(gbot_tui.GbotError):
+            gbot_tui.parse_route("@nobody hi", self.names)
+
+
 if __name__ == "__main__":
     unittest.main()
