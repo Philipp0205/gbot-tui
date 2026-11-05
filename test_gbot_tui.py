@@ -2297,15 +2297,15 @@ class OverviewTests(unittest.TestCase):
 
     def test_attention_sorts_above_idle_and_the_summary_counts_it(self):
         bots = [
-            {"name": "Idle", "activity": {"state": "idle", "unread": 0}},
-            {"name": "Runner", "activity": {"state": "working", "unread": 0}},
-            {"name": "Fresh", "activity": {"state": "unread", "unread": 1}},
-            {"name": "Ask", "activity": {"state": "blocked", "unread": 0}},
+            {"name": "Idle", "activity": {"state": "idle", "unread": 0, "latest": 10}},
+            {"name": "Runner", "activity": {"state": "working", "unread": 0, "latest": 30}},
+            {"name": "Fresh", "activity": {"state": "unread", "unread": 1, "latest": 20}},
+            {"name": "Ask", "activity": {"state": "blocked", "unread": 0, "latest": 50}},
             {"name": "Wait"},
         ]
         self.assertEqual(
             [bot["name"] for bot in gbot_tui.order_bots(bots)],
-            ["Ask", "Fresh", "Runner", "Wait", "Idle"],
+            ["Ask", "Runner", "Fresh", "Idle", "Wait"],
         )
         self.assertEqual(
             gbot_tui.overview_summary(bots[:4]),
@@ -2752,6 +2752,27 @@ class OverviewTests(unittest.TestCase):
             chat.ingest(grown)
             self.assertEqual(chat.phase, "working")
 
+
+class ServerStateTests(unittest.TestCase):
+    def test_statuses_give_unread_and_latest(self):
+        client = b"\x18\x02" + b"\x20" + gbot_tui._varint(1793864041547)
+        status = b"\x0a\x03abc" + b"\x1a" + gbot_tui._varint(len(client)) + client
+        data = b"\x0a" + gbot_tui._varint(len(status)) + status
+        self.assertEqual(
+            gbot_tui.parse_agent_statuses(data),
+            {"abc": {"unread": 2, "latest": 1793864041547}},
+        )
+
+    def test_server_state_sorts_and_counts(self):
+        gbot_tui.SERVER.clear()
+        gbot_tui.SERVER.update({"a": {"unread": 0, "latest": 5}, "b": {"unread": 3, "latest": 9}})
+        try:
+            views = gbot_tui.with_activity([{"id": "a", "name": "A"}, {"id": "b", "name": "B"}])
+        finally:
+            gbot_tui.SERVER.clear()
+        ordered = gbot_tui.order_bots(views)
+        self.assertEqual([bot["name"] for bot in ordered], ["B", "A"])
+        self.assertEqual(ordered[0]["activity"]["unread"], 3)
 
 class RouteTests(unittest.TestCase):
     names = ["Chef", "Cursor Cloud Session"]
