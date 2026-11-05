@@ -686,10 +686,28 @@ def gbot_failure(stdout, stderr):
 GBOT_LOCK = threading.Lock()
 
 
+def token_expired(token, now=None):
+    """True when a Cursor JWT's exp is in the past. Unreadable tokens count as live."""
+    try:
+        import base64
+        import json as _json
+
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = _json.loads(base64.urlsafe_b64decode(payload))["exp"]
+        return float(exp) <= (time.time() if now is None else now)
+    except (IndexError, ValueError, KeyError, TypeError):
+        return False
+
+
 def gbot(*args, timeout=60, env_extra=None):
     env = os.environ.copy()
     # gbot 0.12.4 tells Cursor it is Grok Bot 0.20.0, which the server rejects.
     env.setdefault("SAND_CLIENT_VERSION", sand_client_version())
+    # A stale shell token beats the app's live login inside gbot. Drop it so
+    # gbot reads the token the desktop app keeps refreshed.
+    if token_expired(env.get("CURSOR_ACCESS_TOKEN", "")):
+        env.pop("CURSOR_ACCESS_TOKEN")
     if env_extra:
         env.update(env_extra)
     with GBOT_LOCK:
