@@ -41,6 +41,36 @@ class ParseTests(unittest.TestCase):
         self.assertTrue(gbot_tui.is_user({"role": "user", "text": "hi"}))
         self.assertFalse(gbot_tui.is_user({"role": "assistant", "text": "yo"}))
 
+    def test_thinking_is_not_message_text(self):
+        self.assertEqual(gbot_tui.entry_text({"kind": "thinking", "text": "plan the reply"}), "")
+        self.assertEqual(
+            gbot_tui.entry_text({"kind": "tool-call", "name": "thinking", "content": "still planning"}),
+            "",
+        )
+        self.assertEqual(
+            gbot_tui.entry_text({
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "text": "private"},
+                    {"type": "text", "text": "the answer"},
+                ],
+            }),
+            "the answer",
+        )
+        self.assertEqual(
+            gbot_tui.entry_text({
+                "kind": "send-message",
+                "message": {"type": "text", "content": "<thinking>\nhidden\n</thinking>\n\nvisible"},
+            }),
+            "visible",
+        )
+        self.assertEqual(
+            gbot_tui.entry_text({"role": "assistant", "text": "<think>streaming the plan"}),
+            "",
+        )
+        self.assertEqual(gbot_tui.entry_text({"role": "user", "text": "<think>keep this</think> hi"}), "<think>keep this</think> hi")
+        self.assertEqual(gbot_tui.entry_text({"role": "assistant", "text": "yo"}), "yo")
+
     def test_thread_delta(self):
         page = gbot_tui.parse_thread(
             {
@@ -138,6 +168,16 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(phase, "working")
         phase, quiet, saw = gbot_tui.watch_step(phase, [], quiet, saw, False)
         self.assertEqual((phase, quiet, saw), ("done", 0, False))
+
+    def test_thinking_does_not_finish_the_turn(self):
+        phase, quiet, saw = gbot_tui.watch_step(
+            "working",
+            [{"kind": "thinking", "text": "hmm"}],
+            0,
+            False,
+            False,
+        )
+        self.assertEqual((phase, quiet, saw), ("working", 0, False))
 
     def test_pending_approval_blocks(self):
         entries = [
@@ -455,6 +495,43 @@ class LookTests(unittest.TestCase):
         )
         self.assertEqual([kind for kind, _text in rows], ["user", "gap", "text"])
         self.assertGreater(gbot_tui.bubble_column(40, "hi"), 20)
+
+    def test_thinking_stays_off_the_transcript(self):
+        rows = gbot_tui.transcript_rows(
+            [
+                {"role": "user", "text": "hi"},
+                {"kind": "thinking", "text": "plan the reply"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "text": "still planning"},
+                        {"type": "text", "text": "the answer"},
+                    ],
+                },
+            ],
+            40,
+        )
+        texts = [text for kind, text in rows if kind != "gap"]
+        self.assertEqual(texts, ["hi", "the answer"])
+        self.assertNotIn("plan the reply", texts)
+        self.assertNotIn("still planning", texts)
+        marked = gbot_tui.transcript_rows(
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "reasoning", "text": "private plan"},
+                        {"type": "text", "text": "<think>still hidden</think>\n\nSay **hello**"},
+                    ],
+                }
+            ],
+            40,
+        )
+        shown = " ".join(gbot_tui.line_plain(line) for kind, line in marked if kind != "gap")
+        self.assertIn("hello", shown)
+        self.assertNotIn("**", shown)
+        self.assertNotIn("private plan", shown)
+        self.assertNotIn("still hidden", shown)
 
     def test_pending_card_reads_needs_approval(self):
         rows = gbot_tui.transcript_rows(
@@ -872,6 +949,155 @@ class LookTests(unittest.TestCase):
         finally:
             gbot_tui.list_bots = original
             gbot_tui.ROSTER.clear()
+
+
+class MarkdownTests(unittest.TestCase):
+    def _plain(self, text, width=40):
+        rows = gbot_tui.transcript_rows([{"role": "assistant", "text": text}], width)
+        return [gbot_tui.line_plain(line) for kind, line in rows if kind == "text"]
+
+    def _styles(self, text, width=40):
+        rows = gbot_tui.transcript_rows([{"role": "assistant", "text": text}], width)
+        found = []
+        for _kind, line in rows:
+            if isinstance(line, list):
+                found.extend(style for _text, style in line)
+        return found
+
+    def test_plain_text_stays_a_string(self):
+        rows = gbot_tui.transcript_rows([{"role": "assistant", "text": "earlier"}], 40)
+        self.assertIn(("text", "earlier"), rows)
+        self.assertEqual(gbot_tui.render_markdown("2 * 3 = 6", 40), ["2 * 3 = 6"])
+        self.assertEqual(gbot_tui.render_markdown("snake_case stays", 40), ["snake_case stays"])
+        self.assertEqual(gbot_tui.render_markdown("**hello", 40), ["**hello"])
+
+    def test_a_plain_bullet_still_hangs(self):
+        self.assertEqual(
+            [gbot_tui.line_plain(line) for line in gbot_tui.render_markdown("- hello world", 10)],
+            gbot_tui.wrap("- hello world", 10),
+        )
+        self.assertEqual(
+            [gbot_tui.line_plain(line) for line in gbot_tui.render_markdown("**abcdefghijklmnopqrstuvwxyz**", 10)],
+            gbot_tui.wrap("abcdefghijklmnopqrstuvwxyz", 10),
+        )
+
+    def test_emphasis_code_and_links_drop_the_markers(self):
+        text = "A **bold** and *lean* word, plus `code` and [Grok](https://x.ai)."
+        plain = " ".join(self._plain(text, 80))
+        self.assertEqual(plain, "A bold and lean word, plus code and Grok (https://x.ai).")
+        self.assertNotIn("**", plain)
+        self.assertNotIn("`", plain)
+        styles = self._styles(text, 80)
+        self.assertIn("bold", styles)
+        self.assertIn("em", styles)
+        self.assertIn("code", styles)
+        self.assertIn("link", styles)
+        self.assertIn("dim", styles)
+
+    def test_bold_wraps_without_losing_the_style(self):
+        lines = gbot_tui.render_markdown("**hello world**", 8)
+        self.assertEqual([gbot_tui.line_plain(line) for line in lines], ["hello", "world"])
+        self.assertTrue(all(isinstance(line, list) for line in lines))
+        self.assertTrue(all(style == "bold" for line in lines for _text, style in line))
+
+    def test_headings_lists_quotes_code_and_tables(self):
+        text = "\n".join(
+            [
+                "# Title",
+                "",
+                "- one",
+                "- two words here",
+                "",
+                "1. first",
+                "",
+                "> quoted **bit**",
+                "",
+                "```python",
+                "print(1)",
+                "```",
+                "",
+                "| name | role |",
+                "| --- | --- |",
+                "| Ada | cook |",
+                "",
+                "---",
+            ]
+        )
+        plain = self._plain(text, 40)
+        blob = "\n".join(plain)
+        self.assertNotIn("# Title", blob)
+        self.assertNotIn("**", blob)
+        self.assertNotIn("```", blob)
+        self.assertNotIn("| --- |", blob)
+        self.assertIn("Title", plain)
+        self.assertIn("- one", plain)
+        self.assertIn("1. first", plain)
+        self.assertTrue(any(line.endswith("quoted bit") for line in plain))
+        self.assertIn("python", plain)
+        self.assertTrue(any("print(1)" in line for line in plain))
+        self.assertTrue(any("Ada" in line and "cook" in line for line in plain))
+        self.assertTrue(any(set(line) == {"─"} for line in plain))
+        text_w = 36
+        self.assertTrue(all(len(line) <= text_w for line in plain))
+        styles = self._styles(text, 40)
+        self.assertIn("bold", styles)
+        self.assertIn("code", styles)
+
+    def test_a_narrow_table_stays_inside_the_line(self):
+        text = "| name | role |\n| --- | --- |\n| Adelaide | cook |"
+        plain = self._plain(text, 20)
+        self.assertTrue(plain)
+        self.assertTrue(all(len(line) <= 16 for line in plain))
+        self.assertTrue(any("Adel" in line or "…" in line for line in plain))
+        squeezed = gbot_tui.render_markdown(
+            "| a | b | c |\n| --- | --- | --- |\n| 1 | 2 | 3 |",
+            4,
+        )
+        self.assertTrue(squeezed)
+        self.assertTrue(all(len(gbot_tui.line_plain(line)) <= 4 for line in squeezed))
+
+    def test_a_user_bubble_renders_markdown_and_stays_rectangular(self):
+        rows = gbot_tui.transcript_rows([{"role": "user", "text": "say **hi** now"}], 40)
+        lines = [line for kind, line in rows if kind == "user"]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("hi", gbot_tui.line_plain(lines[0]))
+        self.assertNotIn("*", gbot_tui.line_plain(lines[0]))
+        wide = gbot_tui.transcript_rows(
+            [{"role": "user", "text": "**hello**\nworld"}],
+            40,
+        )
+        bubbles = [gbot_tui.line_plain(line) for kind, line in wide if kind == "user"]
+        self.assertGreater(len(bubbles), 1)
+        self.assertEqual(len(set(map(len, bubbles))), 1)
+
+    def test_the_preview_drops_markers(self):
+        entries = [{"role": "assistant", "text": "**lunch** is ready"}]
+        self.assertEqual(gbot_tui.activity_preview(entries, "idle"), "lunch is ready")
+
+    def test_styles_keep_the_bot_color_except_code(self):
+        base = 7
+        bold = gbot_tui.transcript_attr("bold", base)
+        self.assertEqual(bold & gbot_tui.curses.A_BOLD, gbot_tui.curses.A_BOLD)
+        self.assertEqual(bold & ~gbot_tui.curses.A_BOLD, base)
+        self.assertEqual(gbot_tui.transcript_attr("code", base), gbot_tui.ATTR["gray"])
+        self.assertEqual(gbot_tui.transcript_attr("dim", base), gbot_tui.ATTR["gray"])
+        link = gbot_tui.transcript_attr("link", base)
+        self.assertEqual(link & gbot_tui.curses.A_UNDERLINE, gbot_tui.curses.A_UNDERLINE)
+        bubble = gbot_tui.user_attr("code", base)
+        self.assertEqual(bubble & base, base)
+        self.assertEqual(bubble & gbot_tui.curses.A_DIM, gbot_tui.curses.A_DIM)
+
+    def test_a_markdown_reply_draws_without_the_markers(self):
+        chat = gbot_tui.Chat("Researcher")
+        chat.messages = [{"role": "assistant", "text": "Say **hello** and `go`."}]
+        screen = FakeScreen(24, 58)
+        gbot_tui.draw(screen, chat)
+        shown = " ".join(" ".join(row) for row in screen.rows.values())
+        self.assertIn("hello", shown)
+        self.assertIn("go", shown)
+        self.assertNotIn("**", shown)
+        self.assertNotIn("`", shown)
+        self.assertIn("●", shown)
 
 
 class SendTests(unittest.TestCase):
@@ -1681,7 +1907,13 @@ def _reset_overview():
     gbot_tui.SEEN.clear()
     gbot_tui.ACTIVITY_LOADED["done"] = False
     gbot_tui.SEEN_LOADED["done"] = False
-    paths = [gbot_tui.activity_path(), gbot_tui.seen_path(), gbot_tui.thread_cache_path("Chef")]
+    paths = [
+        gbot_tui.activity_path(),
+        gbot_tui.seen_path(),
+        gbot_tui.thread_cache_path("Chef"),
+        gbot_tui.thread_cache_path("Researcher"),
+        gbot_tui.thread_cache_path("Night"),
+    ]
     for path in paths:
         try:
             os.remove(path)
@@ -2272,7 +2504,29 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(snap["state"], "unread")
         self.assertEqual(snap["unread"], 2)
         self.assertEqual(snap["preview"], "and more")
-        self.assertEqual(gbot_tui.status_label("unread", 2), "2 new")
+        self.assertEqual(gbot_tui.status_label("unread", 2), "2 unread")
+        self.assertEqual(gbot_tui.status_label("unread", 1), "unread")
+
+    def test_thinking_is_not_a_new_reply(self):
+        entries = [
+            {"id": "m1", "role": "user", "text": "go"},
+            {"id": "m2", "role": "assistant", "text": "done"},
+            {"id": "m3", "kind": "thinking", "text": "more private"},
+        ]
+        snap = gbot_tui.judge_activity(entries, "m3", "m1")
+        self.assertEqual(snap["state"], "unread")
+        self.assertEqual(snap["unread"], 1)
+        self.assertEqual(snap["preview"], "done")
+        waiting = [
+            {"id": "m1", "role": "user", "text": "go"},
+            {"id": "m2", "kind": "thinking", "text": "private plan"},
+        ]
+        snap = gbot_tui.judge_activity(waiting, "m2", "m1")
+        self.assertEqual(snap["state"], "working")
+        self.assertEqual(snap["unread"], 0)
+        self.assertEqual(snap["preview"], "go")
+        marked = [{"role": "assistant", "text": "<thinking>nope</thinking>\n\n**lunch** is ready"}]
+        self.assertEqual(gbot_tui.activity_preview(marked, "idle"), "lunch is ready")
 
     def test_a_seen_reply_is_idle_and_a_first_look_is_not_all_new(self):
         entries = [{"id": "m2", "role": "assistant", "text": "done"}]
@@ -2289,6 +2543,35 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(gbot_tui.judge_activity(entries, "m2", "m2")["state"], "working")
         # The same partial, not yet on screen, is a new message.
         self.assertEqual(gbot_tui.judge_activity(entries, "m2", "m1")["state"], "unread")
+
+    def test_is_streaming_on_the_latest_entry_is_running(self):
+        entries = [
+            {"id": "m1", "role": "user", "text": "go"},
+            {"id": "m2", "role": "assistant", "text": "partial", "isStreaming": True},
+        ]
+        snap = gbot_tui.judge_activity(entries, "m2", "m2")
+        self.assertEqual(snap["state"], "working")
+        self.assertEqual(snap["unread"], 0)
+        self.assertEqual(gbot_tui.status_label(snap["state"], snap["unread"]), "working")
+        # A partial you have not opened is still unread, not a second running row.
+        self.assertEqual(gbot_tui.judge_activity(entries, "m2", "m1")["state"], "unread")
+        finished = [
+            {"id": "m1", "role": "user", "text": "go"},
+            {"id": "m2", "role": "assistant", "text": "partial", "isStreaming": False},
+        ]
+        idle = gbot_tui.judge_activity(finished, "m2", "m2")
+        self.assertEqual(idle["state"], "idle")
+        text = gbot_tui.format_overview(
+            [
+                {"name": "Kit", "activity": snap},
+                {"name": "Quiet", "activity": idle},
+            ]
+        )
+        kit = next(line for line in text.splitlines() if "Kit" in line)
+        quiet = next(line for line in text.splitlines() if "Quiet" in line)
+        self.assertTrue(kit.startswith("running"))
+        self.assertTrue(quiet.startswith("idle"))
+        self.assertIn("1 running", text.splitlines()[0])
 
     def test_a_seen_id_older_than_this_tail_counts_the_tail(self):
         entries = [{"id": "m9", "role": "assistant", "text": "later"}]
@@ -2309,7 +2592,7 @@ class OverviewTests(unittest.TestCase):
         )
         self.assertEqual(
             gbot_tui.overview_summary(bots[:4]),
-            "1 needs you · 1 new · 1 working",
+            "1 needs you · 1 unread · 1 working",
         )
         self.assertEqual(gbot_tui.overview_summary([], checked=0, total=4), "checking threads")
         self.assertEqual(
@@ -2328,11 +2611,100 @@ class OverviewTests(unittest.TestCase):
         spans = gbot_tui.picker_spans(bot, True, 60)
         self.assertEqual(spans[0], ("→ ", "bold"))
         self.assertEqual(spans[1], ("● ", "bot:violet"))
-        self.assertEqual(spans[2], ("Outfitly", "bold"))
-        self.assertEqual(spans[4], ("needs you ", "yellow"))
+        self.assertEqual(spans[2], ("needs you  ", "yellow"))
+        self.assertEqual(spans[3], ("Outfitly", "bold"))
+        self.assertEqual(spans[4], (" · ", "dim"))
         self.assertEqual(spans[5], ("npm publish", "dim"))
+        self.assertLess(
+            "".join(text for text, _style in spans).index("needs you"),
+            "".join(text for text, _style in spans).index("Outfitly"),
+        )
         narrow = "".join(text for text, _style in gbot_tui.picker_spans(bot, False, 16))
         self.assertIn("Outfitly", narrow)
+
+    def test_the_selection_shows_every_state_in_one_column(self):
+        bots = [
+            {
+                "name": "Ask",
+                "title": "",
+                "avatarColor": "violet",
+                "activity": {"state": "blocked", "unread": 0, "preview": "npm publish", "cursor": "c"},
+            },
+            {
+                "name": "Fresh",
+                "title": "",
+                "avatarColor": "blue",
+                "activity": {"state": "unread", "unread": 3, "preview": "and more", "cursor": "c"},
+            },
+            {
+                "name": "Runner",
+                "title": "",
+                "avatarColor": "orange",
+                "activity": {"state": "working", "unread": 0, "preview": "go", "cursor": "c"},
+            },
+            {
+                "name": "Quiet",
+                "title": "",
+                "avatarColor": "gray",
+                "activity": {"state": "idle", "unread": 0, "preview": "night", "cursor": "c"},
+            },
+            {"name": "Scout", "title": "looks around", "avatarColor": "green"},
+        ]
+        columns = gbot_tui.list_columns(bots, 80)
+        self.assertIsNotNone(columns)
+        words = ["needs you", "3 unread", "working", "idle", "-"]
+        starts = []
+        for bot, word in zip(bots, words):
+            spans = gbot_tui.picker_spans(bot, False, 80, columns)
+            row = "".join(text for text, _style in spans)
+            self.assertIn(word, spans[2][0])
+            self.assertLess(row.index(word), row.index(bot["name"]))
+            self.assertEqual(spans[-1][1], "dim")
+            starts.append(sum(len(text) for text, _style in spans[:-1]))
+        self.assertEqual(len(set(starts)), 1)
+        styles = [
+            gbot_tui.picker_spans(bot, False, 80, columns)[2][1]
+            for bot in bots
+        ]
+        self.assertEqual(styles, ["yellow", "green", "cyan", "dim", "dim"])
+
+    def test_a_saved_thread_shows_its_state_before_the_scan(self):
+        gbot_tui.write_thread_cache("Chef", [{"id": "m1", "role": "user", "text": "cook"}])
+        gbot_tui.write_thread_cache(
+            "Researcher",
+            [
+                {"id": "m1", "role": "user", "text": "go"},
+                {"id": "m2", "role": "assistant", "text": "the paper is out"},
+            ],
+        )
+        gbot_tui.remember_seen("Researcher", "a1", "m1")
+        gbot_tui.store_activity(
+            {"name": "Night", "id": "a9"},
+            {"state": "unread", "unread": 1, "cursor": "m9", "preview": "done"},
+        )
+        gbot_tui.write_thread_cache("Night", [{"id": "m1", "role": "assistant", "text": "old"}])
+        views = gbot_tui.with_activity(
+            [
+                {"name": "Chef", "id": "a2", "title": "what to cook"},
+                {"name": "Researcher", "id": "a1"},
+                {"name": "Night", "id": "a9"},
+                {"name": "Scout", "id": "a3", "title": "looks"},
+            ]
+        )
+        by_name = {bot["name"]: bot for bot in views}
+        self.assertEqual(by_name["Chef"]["activity"]["state"], "working")
+        self.assertEqual(by_name["Researcher"]["activity"]["state"], "unread")
+        self.assertEqual(by_name["Researcher"]["activity"]["preview"], "the paper is out")
+        # A live state already on disk wins over the older saved thread.
+        self.assertEqual(by_name["Night"]["activity"]["state"], "unread")
+        self.assertEqual(by_name["Night"]["activity"]["preview"], "done")
+        self.assertNotIn("activity", by_name["Scout"])
+        running = "".join(text for text, _style in gbot_tui.picker_spans(by_name["Chef"], False, 70))
+        self.assertIn("working", running)
+        self.assertLess(running.index("working"), running.index("Chef"))
+        unread = "".join(text for text, _style in gbot_tui.picker_spans(by_name["Researcher"], False, 70))
+        self.assertIn("unread", unread)
+        self.assertLess(unread.index("unread"), unread.index("Researcher"))
 
     def test_search_matches_the_latest_line(self):
         bots = [
@@ -2377,7 +2749,7 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(views[0]["activity"]["state"], "unread")
         self.assertEqual(views[0]["activity"]["preview"], "lunch is ready")
         text = gbot_tui.format_overview(views)
-        self.assertIn("1 new", text)
+        self.assertIn("1 unread", text)
         self.assertIn("Chef", text)
         self.assertIn("lunch is ready", text)
         self.assertEqual(gbot_tui.lookup_seen(bots[0]), "m1")
@@ -2529,7 +2901,7 @@ class OverviewTests(unittest.TestCase):
             False,
             60,
         )
-        self.assertIn(("working   ", "cyan"), spans)
+        self.assertIn(("working    ", "cyan"), spans)
         self.assertEqual(gbot_tui.STATUS_STYLE["blocked"], "yellow")
         self.assertNotEqual(gbot_tui.STATUS_STYLE["working"], gbot_tui.STATUS_STYLE["blocked"])
 

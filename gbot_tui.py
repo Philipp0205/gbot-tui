@@ -109,9 +109,95 @@ class GbotError(Exception):
     pass
 
 
+# The desktop chat does not show the model's thinking. These names mark a
+# whole entry, a tool, or one part of a message.
+THINKING_NAMES = frozenset({
+    "thinking",
+    "thought",
+    "reasoning",
+    "redacted-thinking",
+    "agent-thought",
+    "agent-thought-chunk",
+})
+_THINKING_BLOCK = re.compile(
+    r"<(?:think|thinking|reasoning)\b[^>]*>.*?</(?:think|thinking|reasoning)>",
+    re.IGNORECASE | re.DOTALL,
+)
+_THINKING_OPEN = re.compile(
+    r"<(?:think|thinking|reasoning)\b[^>]*>.*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+_THINKING_CLOSE = re.compile(r"</(?:think|thinking|reasoning)>", re.IGNORECASE)
+
+
+def _thinking_name(value):
+    if not isinstance(value, str):
+        return False
+    return value.strip().lower().replace("_", "-") in THINKING_NAMES
+
+
+def is_thinking_part(part):
+    if not isinstance(part, dict):
+        return False
+    for key in ("type", "kind", "role", "name"):
+        if _thinking_name(part.get(key)):
+            return True
+    return False
+
+
+def is_thinking(entry):
+    """True when this row is the model's thinking, not a chat message."""
+    if not isinstance(entry, dict) or entry.get("local") or is_user(entry):
+        return False
+    message = entry.get("message")
+    if isinstance(message, dict) and _thinking_name(message.get("type")):
+        return True
+    if entry.get("kind") == "send-message":
+        return False
+    for key in ("kind", "role", "type", "name", "tool", "toolName", "tool_name"):
+        if _thinking_name(entry.get(key)):
+            return True
+    for key in ("toolCall", "tool_call", "function"):
+        nested = entry.get(key)
+        if isinstance(nested, dict) and (
+            _thinking_name(nested.get("name")) or _thinking_name(nested.get("type"))
+        ):
+            return True
+    return False
+
+
+def hide_thinking_markup(text):
+    """Drop <think>, <thinking>, and <reasoning> blocks from a reply."""
+    if not isinstance(text, str) or "<" not in text:
+        return text
+    cleaned = _THINKING_BLOCK.sub("", text)
+    cleaned = _THINKING_OPEN.sub("", cleaned)
+    cleaned = _THINKING_CLOSE.sub("", cleaned)
+    if cleaned == text:
+        return text
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _part_text(part):
+    if isinstance(part, str):
+        return part
+    if isinstance(part, dict) and not is_thinking_part(part):
+        return part.get("text") or part.get("content") or ""
+    return ""
+
+
 def entry_text(entry, picks=(), numbered=True, step_at=0, step_answers=()):
-    if not isinstance(entry, dict):
+    if not isinstance(entry, dict) or is_thinking(entry):
         return ""
+    text = _entry_body(entry, picks, numbered, step_at, step_answers)
+    if is_user(entry):
+        return text
+    return hide_thinking_markup(text)
+
+
+def _entry_body(entry, picks=(), numbered=True, step_at=0, step_answers=()):
     for key in ("text", "prompt"):
         if isinstance(entry.get(key), str) and entry[key]:
             return entry[key]
@@ -122,14 +208,8 @@ def entry_text(entry, picks=(), numbered=True, step_at=0, step_answers=()):
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = []
-        for part in content:
-            if isinstance(part, str):
-                parts.append(part)
-            elif isinstance(part, dict):
-                parts.append(part.get("text") or part.get("content") or "")
-        return "\n".join(p for p in parts if p)
-    if isinstance(content, dict) and isinstance(content.get("text"), str):
+        return "\n".join(piece for piece in (_part_text(part) for part in content) if piece)
+    if isinstance(content, dict) and not is_thinking_part(content) and isinstance(content.get("text"), str):
         return content["text"]
     shown = widget_text(entry, picks, numbered, step_at, step_answers)
     if shown:
@@ -1033,6 +1113,10 @@ OVERVIEW_STATES = ("blocked", "unread", "working", "idle")
 ATTENTION_RANK = {"blocked": 0, "unread": 1, "working": 2, "idle": 4}
 # `working` stays off the yellow used for `needs you`, in the list and the header.
 STATUS_STYLE = {"blocked": "yellow", "unread": "green", "working": "cyan", "idle": "dim"}
+# "needs you" and "80 unread" are 9 wide. Two spaces keep the next column off the word.
+STATE_COLUMN = 11
+# Sits between the name and the latest line, the same mark the tagline uses.
+PREVIEW_MARK = " · "
 # In-progress flags a transcript entry may carry. Absent on a finished line.
 PROGRESS_STATES = {"running", "streaming", "in_progress", "generating", "working"}
 
@@ -1109,13 +1193,16 @@ def _save_locked(path, data):
     write_private(path, data)
 
 
-def store_activity(bot, snap):
+def store_activity(bot, snap, only_if_absent=False):
     clean = _clean_snap(snap)
     keys = activity_keys(bot)
     if not clean or not keys:
         return
     load_activity()
     with STATE_LOCK:
+        # A live read can land while the list is still judging a saved thread.
+        if only_if_absent and any(ACTIVITY.get(key) for key in keys):
+            return
         for key in keys:
             ACTIVITY[key] = clean
         _save_locked(activity_path(), dict(ACTIVITY))
@@ -1132,7 +1219,7 @@ def lookup_activity(bot):
 
 
 def remember_seen(name, bot_id, cursor, only_if_absent=False):
-    """The latest entry this chat had on screen. A later reply is then `new`.
+    """The latest entry this chat had on screen. A later reply is then unread.
 
     `only_if_absent` is the first scan of a bot nobody has opened. It must not
     move a cursor the chat, or an earlier scan, already stored.
@@ -1169,7 +1256,7 @@ def seen_mark(bot):
     The seen file wins. The first look writes it once, and the chat advances
     it when the thread is on screen. A cached thread counts when that file has
     no row, because the thread was on screen. The activity cursor does not:
-    it advances every pass, which cleared `new` on the pass after it appeared.
+    it advances every pass, which cleared unread on the pass after it appeared.
     """
     seen = lookup_seen(bot)
     if seen:
@@ -1283,7 +1370,7 @@ def activity_preview(entries, state):
     for entry in reversed(entries):
         text = entry_text(entry).strip()
         if text:
-            return one_line(text)
+            return one_line(markdown_text(text))
     return ""
 
 
@@ -1349,13 +1436,22 @@ def status_label(state, unread=0, printed=False):
     if state == "unread":
         count = unread if isinstance(unread, int) else 0
         if count > 1:
-            return f"{count} new"
-        return "new"
+            return f"{count} unread"
+        return "unread"
     if state == "working":
         return "running" if printed else "working"
     if state == "idle":
         return "idle"
     return ""
+
+
+def cached_thread_activity(bot):
+    """State from the thread already on disk, before the next `gbot thread` returns."""
+    name = bot.get("name") or ""
+    entries = read_thread_cache(name) if name else []
+    if not entries:
+        return None
+    return judge_activity(entries, last_id(entries), seen_mark(bot))
 
 
 BACKEND = "https://api2.cursor.sh/aiserver.v1.GrokBotService/"
@@ -1501,10 +1597,17 @@ def mark_read_later(agent_id):
 
 
 def with_activity(bots):
+    """Attach a state to each bot. A saved thread counts until the live read lands."""
     views = []
     for bot in bots:
         view = dict(bot)
         snap = lookup_activity(bot)
+        if not snap:
+            snap = cached_thread_activity(bot)
+            if snap:
+                store_activity(bot, snap, only_if_absent=True)
+                # The scan may have stored a newer state while this was judged.
+                snap = lookup_activity(bot) or snap
         with STATE_LOCK:
             server = SERVER.get(bot.get("id") or "")
         if server:
@@ -1560,7 +1663,7 @@ def overview_summary(bots, checked=None, total=None, printed=False):
         phrase
         for phrase in (
             _count_phrase(counts["blocked"], "1 needs you", "need you"),
-            _count_phrase(counts["unread"], "1 new", "new"),
+            _count_phrase(counts["unread"], "1 unread", "unread"),
             _count_phrase(counts["working"], f"1 {working}", working),
         )
         if phrase
@@ -1591,9 +1694,9 @@ def format_overview(bots):
         label = status_label(activity.get("state") or "", activity.get("unread") or 0, printed=True)
         preview = activity.get("preview") or bot.get("title") or bot.get("tagline") or ""
         preview = " ".join(str(preview).split())
-        line = f"{label:<9}  {bot['name']:<{name_width}}"
+        line = f"{label:<{STATE_COLUMN}}{bot['name']:<{name_width}}"
         if preview:
-            line += "  " + preview
+            line += PREVIEW_MARK + preview
         lines.append(line.rstrip())
     return "\n".join(lines)
 
@@ -2556,6 +2659,576 @@ def _wrap_line(raw, width):
     return lines or [""]
 
 
+# A reply is worth parsing when it carries markup. Plain text keeps wrap().
+_MD_HINT = re.compile(
+    r"(?:"
+    r"\*\*|__|~~|`"
+    r"|^\s{0,3}#{1,6}[ \t]+\S"
+    r"|^\s*[-*+][ \t]+\S"
+    r"|^\s*\d{1,4}[.)][ \t]+\S"
+    r"|^\s{0,3}>"
+    r"|^\s*\|.+\|.+"
+    r"|^\s*(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$"
+    r"|\[[^\]\n]+\]\([^)\n]+\)"
+    r"|!\[[^\]]*\]\([^)\n]+\)"
+    r"|\*[^*\s][^*\n]*\S\*"
+    r"|(?<![A-Za-z0-9])_[^_\s][^_\n]*\S_(?![A-Za-z0-9])"
+    r"|https?://"
+    r")",
+    re.M,
+)
+_FENCE_OPEN = re.compile(r"^( {0,3})(`{3,}|~{3,})[ \t]*([^`~]*)$")
+_HEADING_RE = re.compile(r"^(#{1,6})[ \t]+(\S.*?)\s*#*[ \t]*$")
+_RULE_RE = re.compile(r"^(?:\*[ \t]*){3,}$|^(?:-[ \t]*){3,}$|^(?:_[ \t]*){3,}$")
+_BULLET_RE = re.compile(r"^( *)([-*+])[ \t]+(.*)$")
+_NUMBER_RE = re.compile(r"^( *)(\d{1,4})([.)])[ \t]+(.*)$")
+_CHECK_RE = re.compile(r"^\[([ xX])\][ \t]+(.*)$")
+_QUOTE_RE = re.compile(r"^[ \t]{0,3}>[ \t]?(.*)$")
+_SEP_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
+_CODE_RE = re.compile(r"`([^`\n]+)`")
+_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\n]+)\)")
+_LINK_RE = re.compile(r"\[([^\]\n]+)\]\(([^)\n]+)\)")
+_AUTOLINK_RE = re.compile(r"<((?:https?://)[^>\s]+)>")
+_URL_RE = re.compile(r"https?://[^\s<>]+")
+_EM_STAR_RE = re.compile(r"\*(?!\s|\*)(.+?\S)\*(?!\*)")
+_EM_UNDER_RE = re.compile(r"_(?!\s)([^_\n]*?\S)_(?![A-Za-z0-9])")
+
+
+def line_plain(line):
+    """The characters a row occupies. A styled row is a list of (text, style)."""
+    if isinstance(line, str):
+        return line
+    return "".join(text for text, _style in line)
+
+
+def pad_line(line, span):
+    plain = line_plain(line)
+    if len(plain) >= span:
+        return line
+    gap = " " * (span - len(plain))
+    if isinstance(line, str):
+        return line + gap
+    return list(line) + [(gap, "")]
+
+
+def _merge_spans(spans):
+    merged = []
+    for text, style in spans:
+        if not text:
+            continue
+        if merged and merged[-1][1] == style:
+            merged[-1] = (merged[-1][0] + text, style)
+        else:
+            merged.append((text, style))
+    return merged
+
+
+def _as_line(spans):
+    """A row with no style stays a string, so a plain reply draws as before."""
+    merged = _merge_spans(spans)
+    if not merged:
+        return ""
+    if all(style == "" for _text, style in merged):
+        return "".join(text for text, _style in merged)
+    return merged
+
+
+def _slice_spans(spans, start, end):
+    out = []
+    pos = 0
+    for text, style in spans:
+        nxt = pos + len(text)
+        if nxt <= start:
+            pos = nxt
+            continue
+        if pos >= end:
+            break
+        piece = text[max(0, start - pos) : min(len(text), end - pos)]
+        if piece:
+            out.append((piece, style))
+        pos = nxt
+    return out
+
+
+def _join_style(outer, inner):
+    if not outer:
+        return inner
+    if not inner:
+        return outer
+    if "code" in outer.split("+") or "code" in inner.split("+"):
+        return "code"
+    names = []
+    for part in f"{outer}+{inner}".split("+"):
+        if part and part not in names:
+            names.append(part)
+    return "+".join(names)
+
+
+def _with_style(spans, style):
+    return [(text, _join_style(style, inner)) for text, inner in spans]
+
+
+def _fit_spans(spans, room):
+    """Clip or pad one table cell to room columns."""
+    spans = _merge_spans(spans)
+    plain = "".join(text for text, _style in spans)
+    if len(plain) <= room:
+        gap = room - len(plain)
+        if gap and spans:
+            return spans + [(" " * gap, spans[-1][1])]
+        if gap:
+            return [(" " * gap, "")]
+        return spans
+    if room <= 0:
+        return []
+    if room == 1:
+        return [("…", spans[0][1] if spans else "")]
+    body = _slice_spans(spans, 0, room - 1)
+    body.append(("…", body[-1][1] if body else ""))
+    return body
+
+
+def _inline_break(text, index):
+    char = text[index]
+    if char in "`*[<\\~":
+        return True
+    if char == "_" and (index == 0 or not text[index - 1].isalnum()):
+        return True
+    if char == "!" and text.startswith("![", index):
+        return True
+    if text.startswith(("http://", "https://"), index):
+        return True
+    return False
+
+
+def _parse_inlines(text):
+    """Inline markdown. Unclosed markers stay visible, so a stream can grow."""
+    spans = []
+    index = 0
+    limit = len(text)
+    while index < limit:
+        if text[index] == "\\" and index + 1 < limit and text[index + 1] in "\\`*_{}[]()#+-.!|>~":
+            spans.append((text[index + 1], ""))
+            index += 2
+            continue
+        if text[index] == "`":
+            found = _CODE_RE.match(text, index)
+            if found:
+                spans.append((found.group(1), "code"))
+                index = found.end()
+                continue
+        if text.startswith("![", index):
+            found = _IMAGE_RE.match(text, index)
+            if found:
+                alt = found.group(1).strip()
+                spans.append((alt, "") if alt else (found.group(2).strip(), "dim"))
+                index = found.end()
+                continue
+        if text[index] == "[":
+            found = _LINK_RE.match(text, index)
+            if found:
+                label = found.group(1)
+                url = found.group(2).strip()
+                spans.extend(_with_style(_parse_inlines(label), "link"))
+                if url and url != label:
+                    spans.append((f" ({url})", "dim"))
+                index = found.end()
+                continue
+        if text[index] == "<":
+            found = _AUTOLINK_RE.match(text, index)
+            if found:
+                spans.append((found.group(1), "link"))
+                index = found.end()
+                continue
+        if text.startswith(("http://", "https://"), index):
+            found = _URL_RE.match(text, index)
+            if found:
+                url = found.group(0).rstrip(".,;:!?)]")
+                if url:
+                    spans.append((url, "link"))
+                    index += len(url)
+                    continue
+        if text.startswith("~~", index):
+            end = text.find("~~", index + 2)
+            if end > index + 2:
+                spans.extend(_with_style(_parse_inlines(text[index + 2 : end]), "dim"))
+                index = end + 2
+                continue
+        if text.startswith("***", index):
+            end = text.find("***", index + 3)
+            if end > index + 3:
+                spans.extend(_with_style(_parse_inlines(text[index + 3 : end]), "bold+em"))
+                index = end + 3
+                continue
+        if text.startswith(("**", "__"), index):
+            marker = text[index : index + 2]
+            end = text.find(marker, index + 2)
+            if end > index + 2:
+                spans.extend(_with_style(_parse_inlines(text[index + 2 : end]), "bold"))
+                index = end + 2
+                continue
+        if text[index] == "*" and not text.startswith("**", index):
+            found = _EM_STAR_RE.match(text, index)
+            if found:
+                spans.extend(_with_style(_parse_inlines(found.group(1)), "em"))
+                index = found.end()
+                continue
+        if text[index] == "_" and (index == 0 or not text[index - 1].isalnum()):
+            found = _EM_UNDER_RE.match(text, index)
+            if found:
+                spans.extend(_with_style(_parse_inlines(found.group(1)), "em"))
+                index = found.end()
+                continue
+        nxt = index + 1
+        while nxt < limit and not _inline_break(text, nxt):
+            nxt += 1
+        spans.append((text[index:nxt], ""))
+        index = nxt
+    return _merge_spans(spans)
+
+
+def _wrap_styled(spans, width, hang):
+    """Wrap like wrap(), keeping each run's style. hang is the continuation indent."""
+    spans = _merge_spans(spans)
+    raw = "".join(text for text, _style in spans)
+    if raw == "":
+        return [""]
+    width = max(width, 1)
+    if hang < 0 or hang >= width:
+        hang = 0
+    pos = 0
+    first = True
+    lines = []
+    while pos < len(raw):
+        limit = width if first or not hang else width - hang
+        rest = raw[pos:]
+        if len(rest) <= limit:
+            piece = _slice_spans(spans, pos, len(raw))
+            if not first and hang:
+                piece = [(" " * hang, "")] + piece
+            lines.append(_as_line(piece))
+            break
+        window = rest[: limit + 1]
+        cut = window.rfind(" ")
+        # The marker's own space is not a break, or the first line is just "-".
+        if cut > 0 and rest[:cut].strip() and not (first and hang and cut <= hang):
+            piece = _slice_spans(spans, pos, pos + cut)
+            if not first and hang:
+                piece = [(" " * hang, "")] + piece
+            lines.append(_as_line(piece))
+            pos += cut + 1
+        else:
+            piece = _slice_spans(spans, pos, pos + limit)
+            if not first and hang:
+                piece = [(" " * hang, "")] + piece
+            lines.append(_as_line(piece))
+            pos += limit
+        while pos < len(raw) and raw[pos] == " ":
+            pos += 1
+        first = False
+    return lines or [""]
+
+
+def _list_match(line):
+    return _NUMBER_RE.match(line) or _BULLET_RE.match(line)
+
+
+def _split_item(line):
+    numbered = _NUMBER_RE.match(line)
+    if numbered:
+        indent, number, punct, rest = numbered.groups()
+        marker = f"{number}{punct} "
+    else:
+        bullet = _BULLET_RE.match(line)
+        indent, _mark, rest = bullet.groups()
+        marker = "- "
+    box = _CHECK_RE.match(rest)
+    if box:
+        marker += "[x] " if box.group(1).lower() == "x" else "[ ] "
+        rest = box.group(2)
+    prefix = f"{indent}{marker}"
+    return prefix, rest
+
+
+def _render_list(lines, width):
+    out = []
+    index = 0
+    while index < len(lines):
+        if not _list_match(lines[index]):
+            out.extend(_wrap_styled(_parse_inlines(lines[index].strip()), width, 0))
+            index += 1
+            continue
+        prefix, rest = _split_item(lines[index])
+        index += 1
+        extra = []
+        while index < len(lines) and not _list_match(lines[index]):
+            extra.append(lines[index].strip())
+            index += 1
+        more = " ".join(part for part in extra if part)
+        if more:
+            rest = f"{rest} {more}".strip()
+        out.extend(_wrap_styled([(prefix, "")] + _parse_inlines(rest), width, len(prefix)))
+    return out
+
+
+def _take_list(lines, index):
+    start = len(_list_match(lines[index]).group(1))
+    block = []
+    while index < len(lines):
+        line = lines[index]
+        if line.strip() == "":
+            nxt = lines[index + 1] if index + 1 < len(lines) else ""
+            found = _list_match(nxt)
+            if found and len(found.group(1)) >= start:
+                index += 1
+                continue
+            break
+        found = _list_match(line)
+        if found and len(found.group(1)) >= start:
+            block.append(line)
+            index += 1
+            continue
+        if block and (line.startswith(" ") or line.startswith("\t")):
+            block.append(line)
+            index += 1
+            continue
+        break
+    return block, index
+
+
+def _is_sep(line):
+    return bool(_SEP_RE.match(line.strip()))
+
+
+def _pipe_row(line):
+    stripped = line.strip()
+    return (
+        stripped.startswith("|")
+        and stripped.endswith("|")
+        and stripped.count("|") >= 3
+        and not _is_sep(stripped)
+    )
+
+
+def _cells(line):
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _starts_table(lines, index):
+    if not _pipe_row(lines[index]):
+        return False
+    if index + 1 >= len(lines):
+        return False
+    return _is_sep(lines[index + 1]) or _pipe_row(lines[index + 1])
+
+
+def _take_table(lines, index):
+    rows = []
+    header = False
+    while index < len(lines):
+        if _is_sep(lines[index]):
+            if rows:
+                header = True
+                index += 1
+                continue
+            break
+        if not _pipe_row(lines[index]):
+            break
+        rows.append(_cells(lines[index]))
+        index += 1
+    return rows, header, index
+
+
+def _render_table(rows, header, width):
+    if not rows:
+        return []
+    cols = max(len(row) for row in rows)
+    parsed = []
+    for row in rows:
+        cells = [_parse_inlines(cell) for cell in row]
+        cells.extend([] for _ in range(cols - len(cells)))
+        parsed.append(cells)
+    widths = [1] * cols
+    for row in parsed:
+        for col, spans in enumerate(row):
+            widths[col] = max(widths[col], len("".join(text for text, _style in spans)) or 1)
+
+    def total(sizes):
+        return sum(sizes) + 2 * (cols - 1)
+
+    while total(widths) > width and max(widths) > 1:
+        widest = max(range(cols), key=lambda col: widths[col])
+        widths[widest] -= 1
+    out = []
+    for index, row in enumerate(parsed):
+        parts = []
+        for col, spans in enumerate(row):
+            shown = _fit_spans(spans, widths[col])
+            if header and index == 0:
+                shown = _with_style(shown, "bold")
+            if parts:
+                parts.append(("  ", ""))
+            parts.extend(shown)
+        out.append(_as_line(parts))
+    return out
+
+
+def _open_fence(line):
+    found = _FENCE_OPEN.match(line)
+    if not found:
+        return None
+    return found.group(2), found.group(3).strip()
+
+
+def _take_fence(lines, index, opener):
+    marker, lang = opener
+    need = len(marker)
+    char = re.escape(marker[0])
+    close_re = re.compile(rf"^ {{0,3}}({char}{{3,}})[ \t]*$")
+    body = []
+    index += 1
+    while index < len(lines):
+        close = close_re.match(lines[index])
+        if close and len(close.group(1)) >= need:
+            return body, lang, index + 1
+        body.append(lines[index])
+        index += 1
+    return body, lang, index
+
+
+def _code_language(lang, width):
+    token = lang.split()[0].strip("{}") if lang.split() else ""
+    if not token or len(token) > 20 or width < 1:
+        return ""
+    if not all(char.isalnum() or char in "+#.-" for char in token):
+        return ""
+    return token[:width]
+
+
+def _code_lines(body, width):
+    if not body:
+        return []
+    indent = "  " if width > 4 else ""
+    room = max(width - len(indent), 1)
+    out = []
+    for raw in body:
+        if raw == "":
+            out.append("")
+            continue
+        start = 0
+        while start < len(raw):
+            out.append(_as_line([(indent + raw[start : start + room], "code")]))
+            start += room
+    return out
+
+
+def _take_quote(lines, index):
+    block = []
+    while index < len(lines):
+        found = _QUOTE_RE.match(lines[index])
+        if not found:
+            break
+        block.append(found.group(1))
+        index += 1
+    return block, index
+
+
+def _render_quote(block, width):
+    inner_width = max(width - 2, 1)
+    out = []
+    for line in _render_blocks(block, inner_width):
+        if line == "":
+            out.append(_as_line([("│", "dim")]))
+            continue
+        if isinstance(line, str):
+            out.append(_as_line([("│ ", "dim"), (line, "")]))
+        else:
+            out.append(_as_line([("│ ", "dim"), *line]))
+    return out
+
+
+def _render_blocks(lines, width):
+    out = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.strip() == "":
+            out.append("")
+            index += 1
+            continue
+        fence = _open_fence(line)
+        if fence:
+            body, lang, index = _take_fence(lines, index, fence)
+            label = _code_language(lang, width)
+            if body and label:
+                out.append(_as_line([(label, "dim")]))
+            out.extend(_code_lines(body, width))
+            continue
+        if _RULE_RE.match(line.strip()):
+            out.append(_as_line([("─" * min(width, 24), "dim")]))
+            index += 1
+            continue
+        heading = _HEADING_RE.match(line)
+        if heading:
+            out.extend(_wrap_styled(_with_style(_parse_inlines(heading.group(2)), "bold"), width, 0))
+            index += 1
+            continue
+        if _QUOTE_RE.match(line):
+            block, index = _take_quote(lines, index)
+            out.extend(_render_quote(block, width))
+            continue
+        if _list_match(line):
+            block, index = _take_list(lines, index)
+            out.extend(_render_list(block, width))
+            continue
+        if _starts_table(lines, index):
+            rows, header, index = _take_table(lines, index)
+            out.extend(_render_table(rows, header, width))
+            continue
+        out.extend(_wrap_styled(_parse_inlines(line), width, 0))
+        index += 1
+    return out
+
+
+def _clip_row(line, width):
+    if len(line_plain(line)) <= width:
+        return line
+    spans = [(line, "")] if isinstance(line, str) else line
+    return _as_line(_fit_spans(spans, width))
+
+
+def render_markdown(text, width):
+    """Screen lines for one Grok reply.
+
+    Markers such as **bold**, `code`, headings, lists, quotes, links, and
+    tables become styles. A line with no style stays a string. Text with no
+    markup is wrap(), unchanged. A table that cannot shrink to the width is
+    clipped, so a row never draws past the message column.
+    """
+    width = max(int(width) if isinstance(width, int) else 1, 1)
+    if not isinstance(text, str) or text == "":
+        return [""]
+    if not _MD_HINT.search(text):
+        return wrap(text, width)
+    lines = _render_blocks(text.splitlines(), width) or [""]
+    return [_clip_row(line, width) for line in lines]
+
+
+def markdown_text(text):
+    """The words of a reply, for a one-line preview. Markers are left out."""
+    if not isinstance(text, str) or text == "":
+        return ""
+    parts = []
+    for line in render_markdown(text, 400):
+        parts.append(line_plain(line).replace("│", " ").replace("─", " "))
+    return " ".join(parts)
+
+
 class Chat:
     def __init__(self, target):
         self.target = target
@@ -3434,8 +4107,7 @@ def dot_attr(name):
 
 def bubble_column(width, text):
     """Right edge of a user bubble, inset one column, as in the desktop chat."""
-    shown = " " + text + " "
-    return max(width - len(shown) - 1, 0)
+    return max(width - len(line_plain(text)) - 3, 0)
 
 
 def composer_text_width(width):
@@ -3529,7 +4201,8 @@ def card_lines(entry, width):
     for key in DETAIL_KEYS:
         value = card.get(key)
         if isinstance(value, str) and value.strip():
-            lines.extend(wrap(value.strip(), room))
+            for line in render_markdown(value.strip(), room):
+                lines.append(line_plain(line))
     return lines
 
 
@@ -3560,11 +4233,11 @@ def transcript_rows(entries, width, picks=None, progress=None):
             rows.append(("gap", ""))
         if text:
             user = is_user(entry)
-            wrapped = wrap(text, user_w if user else text_w)
+            wrapped = render_markdown(text, user_w if user else text_w)
             if user:
-                span = max(len(line) for line in wrapped)
+                span = max(len(line_plain(line)) for line in wrapped)
                 for line in wrapped:
-                    rows.append(("user", line.ljust(span)))
+                    rows.append(("user", pad_line(line, span)))
             else:
                 for line in wrapped:
                     rows.append(("text", line))
@@ -3755,6 +4428,64 @@ def paint_spans(stdscr, y, x, spans):
         col += len(text)
 
 
+def transcript_attr(style, base):
+    """Bold and italic stay in the bot color. Code, rules, and urls use gray.
+
+    Gray is the readable secondary color. Dimming the bot color itself drops
+    it below the contrast the rest of the line was lifted to.
+    """
+    names = [part for part in (style or "").split("+") if part]
+    if "code" in names or "dim" in names:
+        attr = ATTR["gray"]
+    else:
+        attr = base
+    if "bold" in names:
+        attr |= curses.A_BOLD
+    if "em" in names:
+        attr |= getattr(curses, "A_ITALIC", 0) or curses.A_UNDERLINE
+    if "link" in names:
+        attr |= curses.A_UNDERLINE
+    return attr
+
+
+def user_attr(style, base):
+    """Styles inside a bubble keep the bubble color, or the fill breaks."""
+    attr = base
+    names = [part for part in (style or "").split("+") if part]
+    if "bold" in names:
+        attr |= curses.A_BOLD
+    if "em" in names:
+        attr |= getattr(curses, "A_ITALIC", 0) or curses.A_UNDERLINE
+    if "link" in names or "code" in names:
+        attr |= curses.A_UNDERLINE
+    if "code" in names or "dim" in names:
+        attr |= curses.A_DIM
+    return attr
+
+
+def paint_bot_line(stdscr, y, x, line, base):
+    if isinstance(line, str):
+        put(stdscr, y, x, line, base)
+        return
+    col = x
+    for text, style in line:
+        put(stdscr, y, col, text, transcript_attr(style, base))
+        col += len(text)
+
+
+def paint_user_line(stdscr, y, x, line):
+    base = ATTR["user"]
+    if isinstance(line, str):
+        put(stdscr, y, x, " " + line + " ", base)
+        return
+    put(stdscr, y, x, " ", base)
+    col = x + 1
+    for text, style in line:
+        put(stdscr, y, col, text, user_attr(style, base))
+        col += len(text)
+    put(stdscr, y, col, " ", base)
+
+
 def paint_composer(stdscr, y, width, lines, placeholder=False):
     span = max(width, 0)
     if span < 2:
@@ -3819,12 +4550,11 @@ def draw(stdscr, chat):
         y = header + gap + row
         previous = rows[index - 1][0] if index else ""
         if kind == "user":
-            shown = " " + text + " "
-            put(stdscr, y, bubble_column(width, text), shown, ATTR["user"])
+            paint_user_line(stdscr, y, bubble_column(width, text), text)
         elif kind == "text":
             if previous != "text":
                 put(stdscr, y, 1, "●", dot_attr(color))
-            put(stdscr, y, 3, text, bot_text_attr(color))
+            paint_bot_line(stdscr, y, 3, text, bot_text_attr(color))
         elif kind in CARD_STYLE:
             put(stdscr, y, 1, clip(text, max(width - 2, 0)), ATTR[CARD_STYLE[kind]])
     composer_at = header + body_h
@@ -4387,23 +5117,18 @@ def fuzzy_score(query, name):
     return score
 
 
-STATE_COLUMN = 10
-
-
 def list_columns(bots, width):
-    """Shared name and status widths so every preview starts at the same column.
+    """Shared state and name widths so every preview starts at the same column.
 
     A narrow window gives the name less room before it gives up the grid.
+    Every named bot is in the grid, so a row still waiting on a read keeps the
+    same state column as the ones that already have a word.
     """
     room = max(width - 7, 1)
-    overhead = 1 + STATE_COLUMN
+    overhead = STATE_COLUMN + len(PREVIEW_MARK)
     if room <= overhead + 4:
         return None
-    names = []
-    for bot in bots:
-        activity = bot.get("activity") if isinstance(bot.get("activity"), dict) else None
-        if activity and activity.get("state") in OVERVIEW_STATES and bot.get("name"):
-            names.append(bot["name"])
+    names = [bot["name"] for bot in bots if bot.get("name")]
     if not names:
         return None
     rest = room - overhead
@@ -4423,53 +5148,67 @@ def _pad(text, width):
     return text + (" " * (width - len(text)))
 
 
+def state_field(label, state_w):
+    """The state word plus the gap before the name. A missing state is a dash."""
+    text = label or "-"
+    if len(text) >= state_w:
+        return text + "  "
+    return _pad(text, state_w)
+
+
 def _status_spans(lead, lead_style, mark, name, name_style, activity, title, room, columns=None):
-    label = status_label(activity.get("state"), activity.get("unread") or 0)
+    """State, then name, then the latest line. The state column is what you scan."""
+    label = status_label(activity.get("state") or "", activity.get("unread") or 0)
     preview = " ".join((activity.get("preview") or title or "").split())
     state_w = columns["state"] if columns else STATE_COLUMN
-    field = _pad(label, state_w)[: max(state_w, len(label))]
+    field = state_field(label, state_w)
+    style = STATUS_STYLE.get(activity.get("state"), "dim")
+    sep = PREVIEW_MARK if preview else ""
     if columns:
         name_w = columns["name"]
-        if name_w + 1 + state_w > room:
-            name_w = max(room - 1 - state_w, 1)
+        fixed = len(field) + len(sep)
+        if name_w + fixed > room:
+            name_w = max(room - fixed, 1)
         shown = _pad(clip(name, name_w), name_w)
-        preview_room = room - name_w - 1 - len(field)
+        preview_room = room - len(field) - len(shown) - len(sep)
         spans = [
             (lead, lead_style),
             mark,
+            (field, style),
             (shown, name_style),
-            (" ", "dim"),
-            (field, STATUS_STYLE.get(activity.get("state"), "dim")),
         ]
         if preview and preview_room > 0:
+            spans.append((sep, "dim"))
             spans.append((clip(preview, preview_room), "dim"))
         return spans
-    overhead = 1 + len(field)
-    if room <= overhead:
+    # A very narrow window keeps the name. The state word needs its column.
+    if room < len(field) + 1:
         return [(lead, lead_style), mark, (clip(name, room), name_style)]
-    rest = room - overhead
+    rest = room - len(field)
     name_room = len(name)
+    if preview and name_room + len(sep) > rest and rest >= 12:
+        name_room = max((rest * 2) // 3, 1)
     if name_room > rest:
         name_room = rest
-    elif preview and name_room > (rest * 2) // 3 and rest >= 12:
-        name_room = max((rest * 2) // 3, 1)
-    preview_room = rest - name_room
+    preview_room = rest - name_room - len(sep)
     spans = [
         (lead, lead_style),
         mark,
+        (field, style),
         (clip(name, name_room), name_style),
-        (" ", "dim"),
-        (field, STATUS_STYLE.get(activity.get("state"), "dim")),
     ]
     if preview and preview_room > 0:
+        spans.append((sep, "dim"))
         spans.append((clip(preview, preview_room), "dim"))
     return spans
 
 
 def picker_spans(bot, selected, width, columns=None):
-    """One sidebar row: selection mark, avatar, name, status, and a preview.
+    """One selection row: mark, avatar, state, name, and a preview.
 
-    A row with no activity yet keeps the tagline, the same as before a scan.
+    The state is `needs you`, `unread`, `running`, or `idle`. A row with no
+    reading yet holds that column with a dash so the names still line up.
+    Without a shared grid, a row that has no state yet keeps the tagline.
     """
     title = (bot.get("title") or bot.get("tagline") or "").strip()
     name = bot["name"]
@@ -4485,6 +5224,18 @@ def picker_spans(bot, selected, width, columns=None):
     activity = bot.get("activity") if isinstance(bot.get("activity"), dict) else None
     if activity and activity.get("state") in OVERVIEW_STATES:
         return _status_spans(lead, lead_style, mark, name, name_style, activity, title, room, columns)
+    if columns:
+        return _status_spans(
+            lead,
+            lead_style,
+            mark,
+            name,
+            name_style,
+            {"state": "", "unread": 0, "preview": title},
+            "",
+            room,
+            columns,
+        )
     if not title:
         return [(lead, lead_style), mark, (clip(name, room), name_style)]
     name_room = min(len(name), max(room // 2, 1))
