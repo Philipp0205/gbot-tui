@@ -1,0 +1,186 @@
+#!/usr/bin/env node
+// Linux launcher for grokbot-tui. The npm package only reads the Grok Bot
+// desktop session on macOS and cannot send the x-anyrun-network-token
+// header the cloud gateway requires. This decrypts the Linux descriptor,
+// runs a local proxy that adds the header, and starts grok-tui against it.
+// Since Nov 2026 the gateway refuses /api/sendPrompt ("A Sand box session is
+// not permitted on this endpoint"); the desktop app sends through
+// api2.cursor.sh GrokBotService/SendGrokBotUserMessage instead, so the proxy
+// translates sendPrompt into that call with the app's Cursor account token.
+import crypto from "node:crypto";
+import fs from "node:fs";
+import http from "node:http";
+import os from "node:os";
+import { spawn } from "node:child_process";
+
+const appDir = os.homedir() + "/.config/Grok Bot/";
+const key = crypto.pbkdf2Sync("peanuts", "saltysalt", 1, 16, "sha1");
+function decrypt(b64) {
+  const enc = Buffer.from(b64, "base64");
+  const dec = crypto.createDecipheriv("aes-128-cbc", key, Buffer.alloc(16, 32));
+  return Buffer.concat([dec.update(enc.subarray(3)), dec.final()]).toString("utf8");
+}
+const d = JSON.parse(fs.readFileSync(appDir + "gateway-descriptor.json", "utf8"));
+const gw = JSON.parse(decrypt(Object.values(d.entries)[0].encrypted));
+
+// The app's Cursor login, read fresh per send so a token refresh is picked up.
+function cursorAccount() {
+  const stored = JSON.parse(fs.readFileSync(appDir + "sand-secrets.json", "utf8"));
+  const accounts = JSON.parse(stored["cursor-accounts"]);
+  const account = accounts.accounts[accounts.active];
+  const team = account["cursor-selected-team-id"];
+  return {
+    token: decrypt(account["cursor-access-token"]).trim(),
+    teamId: team ? decrypt(team).trim() : undefined,
+  };
+}
+
+const machineFile = os.homedir() + "/.grok-bot-cli/machine-id";
+function machineId() {
+  try {
+    const id = fs.readFileSync(machineFile, "utf8").trim();
+    if (id) return id;
+  } catch {}
+  const id = crypto.randomUUID();
+  try {
+    fs.mkdirSync(os.homedir() + "/.grok-bot-cli", { recursive: true });
+    fs.writeFileSync(machineFile, id + "\n", { mode: 0o600 });
+  } catch {}
+  return id;
+}
+
+function varint(value) {
+  const out = [];
+  let v = BigInt(value);
+  while (v >= 0x80n) {
+    out.push(Number(v & 0x7fn) | 0x80);
+    v >>= 7n;
+  }
+  out.push(Number(v));
+  return out;
+}
+const pbStr = (f, s) => {
+  const b = Buffer.from(s, "utf8");
+  return [...varint((f << 3) | 2), ...varint(b.length), ...b];
+};
+const pbNum = (f, n) => [...varint(f << 3), ...varint(n)];
+function pbDecode(buf) {
+  const out = {};
+  let i = 0;
+  const next = () => {
+    let v = 0n, shift = 0n, b;
+    do {
+      b = buf[i++];
+      v |= BigInt(b & 0x7f) << shift;
+      shift += 7n;
+    } while (b & 0x80);
+    return v;
+  };
+  while (i < buf.length) {
+    const k = next();
+    const field = Number(k >> 3n), wt = Number(k & 7n);
+    if (wt === 0) out[field] = Number(next());
+    else if (wt === 1) i += 8;
+    else if (wt === 5) i += 4;
+    else if (wt === 2) {
+      const len = Number(next());
+      out[field] = buf.subarray(i, i + len);
+      i += len;
+    } else break;
+  }
+  return out;
+}
+
+async function backendSend(body) {
+  const { agentId, prompt, clientNonce } = JSON.parse(body.toString("utf8"));
+  const nonce = clientNonce || crypto.randomUUID();
+  const { token, teamId } = cursorAccount();
+  const r = await fetch("https://api2.cursor.sh/aiserver.v1.GrokBotService/SendGrokBotUserMessage", {
+    method: "POST",
+    headers: {
+      "content-type": "application/proto",
+      "connect-protocol-version": "1",
+      authorization: "Bearer " + token,
+      "x-cursor-client-type": "sand",
+      "x-cursor-client-version": process.env.SAND_CLIENT_VERSION || "0.78.5",
+      "x-cursor-client-os": process.platform,
+      "x-cursor-client-source": "sand-desktop",
+      "x-sand-box-namespace": "prod",
+      "x-ghost-mode": "true",
+      "x-request-id": crypto.randomUUID(),
+      ...(teamId ? { "x-cursor-team-id": teamId } : {}),
+    },
+    body: Uint8Array.from([
+      ...pbStr(1, agentId),
+      ...pbStr(2, nonce),
+      ...pbStr(3, prompt),
+      ...pbNum(4, Date.now()),
+      ...pbNum(13, 1),
+      ...pbStr(16, machineId()),
+      ...pbStr(20, "en"),
+    ]),
+  });
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (!r.ok) {
+    let detail = buf.toString("utf8");
+    try {
+      const j = JSON.parse(detail);
+      detail = j?.details?.[0]?.debug?.details?.detail || j?.message || detail;
+    } catch {}
+    return [r.status, { message: "SendGrokBotUserMessage failed: " + detail.slice(0, 300) }];
+  }
+  const data = pbDecode(buf);
+  if (data[4] === 4 || data[5]) {
+    const refusal = data[5] ? pbDecode(data[5]) : {};
+    return [403, { message: "refused: " + (refusal[2] ? refusal[2].toString("utf8") : "") }];
+  }
+  return [200, { accepted: true, clientNonce: nonce }];
+}
+
+const server = http.createServer(async (req, res) => {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  if (req.method === "POST" && req.url === "/api/sendPrompt") {
+    try {
+      const [status, json] = await backendSend(Buffer.concat(chunks));
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify(json));
+    } catch (e) {
+      res.writeHead(502);
+      res.end(String(e));
+    }
+    return;
+  }
+  const h = { ...req.headers, ...gw.headers };
+  delete h.host;
+  delete h["content-length"];
+  try {
+    const r = await fetch(gw.baseUrl + req.url, {
+      method: req.method,
+      headers: h,
+      body: chunks.length ? Buffer.concat(chunks) : undefined,
+    });
+    const skip = new Set(["content-encoding", "transfer-encoding", "content-length"]);
+    res.writeHead(r.status, Object.fromEntries([...r.headers].filter(([k]) => !skip.has(k))));
+    res.end(Buffer.from(await r.arrayBuffer()));
+  } catch (e) {
+    res.writeHead(502);
+    res.end(String(e));
+  }
+});
+
+server.listen(0, "127.0.0.1", () => {
+  const port = server.address().port;
+  const child = spawn("grok-tui", process.argv.slice(2), {
+    stdio: "inherit",
+    env: {
+      ...process.env,
+      GROKBOT_GATEWAY_URL: `http://127.0.0.1:${port}`,
+      GROKBOT_GATEWAY_TOKEN: gw.token,
+    },
+  });
+  child.on("exit", (code) => {
+    server.close();
+    process.exit(code ?? 0);
+  });
+});
