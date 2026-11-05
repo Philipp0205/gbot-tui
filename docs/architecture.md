@@ -1,6 +1,6 @@
 # How gbot-tui works
 
-`gbot-tui` is one Python program, `gbot_tui.py`. It chats with one Grok bot in a curses terminal. It does not talk to Grok itself, and it does not attach to the Grok Bot desktop app. Every list, thread read, and send is a subprocess of the third-party `gbot` CLI (`grok-bot-cli`), which then calls the same HTTPS gateway the desktop app uses.
+`gbot-tui` is one Python program. `gbot_tui.py` starts it and the code lives in the `gbottui` package beside that file. It chats with one Grok bot in a curses terminal. It does not talk to Grok itself, and it does not attach to the Grok Bot desktop app. Every list, thread read, and send is a subprocess of the third-party `gbot` CLI (`grok-bot-cli`), which then calls the same HTTPS gateway the desktop app uses.
 
 ```
 terminal
@@ -22,6 +22,29 @@ side channel, only inside Herdr:
   tab rename via hc / herdr-app
   avatar icons in ~/.config/herdr-app
 ```
+
+## Where the code lives
+
+Each module in `gbottui/` does one job. Modules import each other as `from . import herdr` and read `herdr.APP`, `tabs.TAB`, `roster.ROSTER`, or `activity.ACTIVITY` through the module, because those values are rebound at run time and swapped in tests. Run it from this directory, or symlink `gbot_tui.py`: the link resolves to the package next to it. Copying `gbot_tui.py` alone does not run.
+
+| Module | Job |
+|---|---|
+| `app.py` | arguments, the curses session that holds the list and the chat, exit and signals |
+| `picker.py` | the bot list: rows, search, wheel and keys |
+| `chat_screen.py` | the chat screen: keys, the event loop, background jobs |
+| `chat_state.py` | one chat's state: transcript, draft, phase, pending decisions |
+| `chat_view.py` | drawing one chat |
+| `activity.py` | per-bot state (needs you, unread, working, idle), seen cursors, ordering |
+| `backend.py` | Cursor backend calls: login token, per-bot unread state, mark read |
+| `gbot_cli.py` | every call to the `gbot` CLI: reads, sends, approvals, widgets |
+| `transcript.py` | reading thread entries: text, cards, approvals, hiding thinking and progress lines |
+| `widgets.py` | the bot's answer widgets: options, steps, digit keys |
+| `markdown.py` | Markdown rendering into styled rows |
+| `grid.py` | wrapping, rows and the screen layout |
+| `paint.py`, `styles.py`, `colors.py`, `theme.py` | painting, style names, colors and contrast, light or dark |
+| `roster.py`, `cache.py` | the bot roster, `@bot` routing, files under `~/.cache/gbot-tui` |
+| `herdr.py`, `tabs.py`, `icons.py` | Herdr reports, tab names, avatar icons |
+| `terminal.py` | terminal modes, paging and the mouse wheel |
 
 ## Starting a session
 
