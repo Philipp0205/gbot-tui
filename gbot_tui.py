@@ -3656,6 +3656,32 @@ def fast_escape():
         return
 
 
+WHEEL_LINES = 3
+
+
+def enable_wheel():
+    try:
+        curses.mousemask(curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
+        curses.mouseinterval(0)
+    except (AttributeError, curses.error):
+        pass
+
+
+def wheel_direction(key):
+    """-1 for wheel up, 1 for wheel down, None for any other key."""
+    if key != curses.KEY_MOUSE:
+        return None
+    try:
+        state = curses.getmouse()[4]
+    except curses.error:
+        return None
+    if state & curses.BUTTON4_PRESSED:
+        return -1
+    if state & curses.BUTTON5_PRESSED:
+        return 1
+    return None
+
+
 def page_motion(key):
     """(direction, half). Alt-Page is kPRV3/kNXT3; plain Page is KEY_PPAGE/KEY_NPAGE."""
     if key == curses.KEY_PPAGE:
@@ -3806,9 +3832,13 @@ def chat_key(chat, key, stdscr):
         return "back"
     chat.nudge()
     motion = page_motion(key)
+    if motion is None:
+        wheel = wheel_direction(key)
+        if wheel is not None:
+            motion = (wheel, None)
     if motion is not None:
         direction, half = motion
-        step = page_step(curses.LINES, half)
+        step = WHEEL_LINES if half is None else page_step(curses.LINES, half)
         if direction < 0:
             chat.follow = False
             chat.scroll = max(chat.scroll - step, 0)
@@ -3899,6 +3929,7 @@ def chat_loop(stdscr, chat):
     fast_escape()
     place_cursor(True)
     stdscr.keypad(True)
+    enable_wheel()
     # gbot's network calls used to run here, so typing froze until each one returned.
     # Keys are read without waiting; the loop sleeps in select on the tty and a pipe.
     stdscr.timeout(0)
@@ -4300,6 +4331,7 @@ def pick(stdscr, bots, refresh=None):
     fast_escape()
     place_cursor(False)
     stdscr.keypad(True)
+    enable_wheel()
     bots = list(bots)
     loader = Loader(refresh) if refresh else None
     survey = Survey(bots)
@@ -4399,6 +4431,12 @@ def pick(stdscr, bots, refresh=None):
                 selected = 0
                 moved = False
                 chosen = ""
+                continue
+            wheel = wheel_direction(key)
+            if wheel is not None and shown:
+                selected = min(max(selected + wheel, 0), len(shown) - 1)
+                moved = True
+                chosen = shown[selected]["name"]
                 continue
             if key == curses.KEY_UP and selected > 0:
                 selected -= 1
