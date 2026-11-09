@@ -279,6 +279,7 @@ def pick(stdscr, bots, refresh=None):
     # False until Up or Down. The top row then stays the one that needs attention.
     moved = False
     chosen = ""
+    pending = []
     try:
         while True:
             if loader:
@@ -348,13 +349,20 @@ def pick(stdscr, bots, refresh=None):
             wait = 30 if loader else (150 if running else 400)
             if due is not None:
                 wait = min(wait, due)
-            stdscr.timeout(wait)
-            try:
-                key = stdscr.get_wch()
-            except curses.error:
-                if theme.maybe_retheme(lambda: styles.apply_theme(stdscr)):
-                    pass
-                continue
+            if pending:
+                key = pending.pop(0)
+            else:
+                stdscr.timeout(wait)
+                try:
+                    key = stdscr.get_wch()
+                except curses.error:
+                    if theme.maybe_retheme(lambda: styles.apply_theme(stdscr)):
+                        pass
+                    continue
+                if paint.is_escape(key):
+                    # ESC [ D from a terminal not in keypad mode is an arrow, not Esc.
+                    pending = paint.decode_keys([key], paint.follow_up(stdscr, wait))
+                    continue
             if key == curses.KEY_RESIZE:
                 theme.note_appearance()
                 theme.maybe_retheme(lambda: styles.apply_theme(stdscr))

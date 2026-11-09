@@ -36,6 +36,8 @@ PGUP, PGDN, ESC, CTRL_D, CTRL_J = "\x1b[5~", "\x1b[6~", "\x1b", "\x04", "\n"
 # curses turns on keypad (application) mode, so arrows and Home/End are SS3, as in terminfo.
 LEFT, RIGHT, UP, DOWN, HOME, END, DEL = "\x1bOD", "\x1bOC", "\x1bOA", "\x1bOB", "\x1bOH", "\x1bOF", "\x1b[3~"
 CTRL_LEFT, ALT_RIGHT = "\x1b[1;5D", "\x1b[1;3C"
+# The same arrows from a terminal not in keypad mode, or a multiplexer: CSI, not SS3.
+CSI_LEFT, CSI_RIGHT, CSI_UP, CSI_DOWN, CSI_HOME, CSI_END = "\x1b[D", "\x1b[C", "\x1b[A", "\x1b[B", "\x1b[H", "\x1b[F"
 # Variables that could point a child at a real gateway or a Herdr pane.
 SCRUB = (
     "CURSOR_ACCESS_TOKEN",
@@ -493,6 +495,35 @@ def compose_flow():
             t.wait(has("→  Add a follow-up"))
 
         ok &= scenario("18_input_history", term, history)
+
+        def csi_arrows(t):
+            t.send("\x15abc")
+            t.wait(has("→  abc"))
+            # Each key on its own, so a split read cannot hide a stray Esc.
+            for key in (CSI_LEFT, "X", LEFT, "Y", CSI_HOME, "<", CSI_END, ">", CSI_LEFT, CSI_RIGHT, "!"):
+                t.send(key)
+                t.settle(0.08)
+            t.wait(has("→  <abYXc>!"))
+            t.send(CSI_HOME + "\x1b[3~" + "\x1b[1;5C" + "_")
+            t.wait(has("→  abYXc_>!"))
+            assert any("Chef" in line for line in t.lines()[:2]), "left the chat"
+            t.send(CSI_END + "\x15")
+            t.wait(has("→  Add a follow-up"))
+            t.send(ESC)
+            t.wait(has("Grok bots", "type to search"))
+            # The list: CSI and SS3 Down both move the highlight.
+            def marked(lines):
+                return [i for i, line in enumerate(lines) if line.startswith(" → ")]
+
+            t.wait(lambda lines: marked(lines) == [2])
+            t.send(CSI_DOWN)
+            t.wait(lambda lines: marked(lines) == [3])
+            t.send(DOWN)
+            t.wait(lambda lines: marked(lines) == [4])
+            t.send(CSI_UP)
+            t.wait(lambda lines: marked(lines) == [3])
+
+        ok &= scenario("19_csi_arrows", term, csi_arrows)
     finally:
         run.close()
     return ok

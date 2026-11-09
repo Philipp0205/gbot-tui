@@ -3469,5 +3469,86 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(chat.typed, "old")
 
 
+class _KeyFeed:
+    """get_wch over a list; `timeout` is recorded, not slept."""
+
+    def __init__(self, keys):
+        self.keys = list(keys)
+        self.timeouts = []
+
+    def get_wch(self):
+        if not self.keys:
+            raise curses.error("no input")
+        return self.keys.pop(0)
+
+    def timeout(self, ms):
+        self.timeouts.append(ms)
+
+
+class EscapeSequenceTests(unittest.TestCase):
+    def test_csi_and_ss3_arrows_are_arrows(self):
+        for seq, key in (
+            ("\x1b[D", curses.KEY_LEFT),
+            ("\x1b[C", curses.KEY_RIGHT),
+            ("\x1b[A", curses.KEY_UP),
+            ("\x1b[B", curses.KEY_DOWN),
+            ("\x1b[H", curses.KEY_HOME),
+            ("\x1b[F", curses.KEY_END),
+            ("\x1bOD", curses.KEY_LEFT),
+            ("\x1bOH", curses.KEY_HOME),
+            ("\x1b[3~", curses.KEY_DC),
+            ("\x1b[5~", curses.KEY_PPAGE),
+            ("\x1b[6~", curses.KEY_NPAGE),
+            ("\x1b[1~", curses.KEY_HOME),
+            ("\x1b[4~", curses.KEY_END),
+        ):
+            self.assertEqual(paint.decode_keys(list(seq)), [key], seq)
+
+    def test_modified_arrows_use_the_terminfo_names(self):
+        original = curses.keyname
+        names = {601: b"kLFT5", 602: b"kRIT3"}
+        curses.keyname = lambda key: names.get(key, b"KEY_OTHER")
+        paint._NAMED = None
+        try:
+            keys = paint.decode_keys(list("\x1b[1;5D\x1b[1;3C\x1b[1;7Z"))
+            self.assertEqual(keys, [601, 602])
+            self.assertIs(chat_screen.edit_motion(keys[0]), draft.word_left)
+            self.assertIs(chat_screen.edit_motion(keys[1]), draft.word_right)
+            # A modifier terminfo has no name for is the plain arrow.
+            self.assertEqual(paint.decode_keys(list("\x1b[1;2D")), [curses.KEY_LEFT])
+        finally:
+            curses.keyname = original
+            paint._NAMED = None
+
+    def test_a_lone_escape_stays_escape(self):
+        self.assertEqual(paint.decode_keys(["\x1b"]), ["\x1b"])
+        self.assertEqual(paint.decode_keys([27]), ["\x1b"])
+        self.assertEqual(paint.decode_keys(["\x1b", "\x1b"]), ["\x1b", "\x1b"])
+        self.assertEqual(paint.decode_keys(["\x1b", curses.KEY_LEFT]), ["\x1b", curses.KEY_LEFT])
+
+    def test_unknown_or_alt_sequences_are_dropped_not_escape(self):
+        self.assertEqual(paint.decode_keys(list("\x1b[99z")), [])
+        self.assertEqual(paint.decode_keys(list("\x1bx")), [])
+        self.assertEqual(paint.decode_keys(list("\x1b[200~hi")), ["h", "i"])
+
+    def test_keys_around_a_sequence_keep_their_order(self):
+        self.assertEqual(paint.decode_keys(list("ab\x1b[Dc")), ["a", "b", curses.KEY_LEFT, "c"])
+
+    def test_a_split_sequence_reads_the_rest_within_the_delay(self):
+        screen = _KeyFeed(["[", "D"])
+        more = paint.follow_up(screen, 0)
+        self.assertEqual(paint.decode_keys(["\x1b"], more), [curses.KEY_LEFT])
+        self.assertIn(paint.ESC_WAIT_MS, screen.timeouts)
+        self.assertEqual(screen.timeouts[-1], 0)
+
+    def test_read_keys_decodes_csi_and_the_chat_stays_open(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "abc")
+        for key in paint.read_keys(_KeyFeed(list("\x1b[DX"))):
+            self.assertIsNone(chat_screen.chat_key(chat, key, None))
+        self.assertEqual(chat.typed, "abXc")
+        self.assertEqual(chat_screen.chat_key(chat, paint.read_keys(_KeyFeed(["\x1b"]))[0], None), "back")
+
+
 if __name__ == "__main__":
     unittest.main()
