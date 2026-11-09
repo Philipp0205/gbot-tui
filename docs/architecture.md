@@ -64,13 +64,15 @@ A typed name is resolved from `~/.cache/gbot-tui/roster.json` first, so the chat
 
 The picker and the chat share one curses session, so Enter and Esc do not drop back to the shell between screens. Leaving a chat for the list releases the Herdr agent on a thread and reports the list as `gbot-tui`, because Herdr keeps the last app name until the next report. Quitting releases the agent before exit.
 
-## Speed
+## Speed and end-to-end runs
 
 `bench/latency.py` times the TUI in a pseudo-terminal against `bench/mock_gbot.py` (needs `pyte`). Its terminal answers the background probe; `--bg '#FFFFFF'`, `--bg none` (DA1 only), and `--bg mute` change that answer. Each `gbot` call costs a process start plus the gateway, so the work is in not waiting on one:
 
 - The bot list paints from `roster.json`, and a chat paints its last 80 entries from `~/.cache/gbot-tui/threads/<sha1>.json` (mode 0600) while the first `gbot thread` runs. That read replaces the cached rows. Cached cards cannot be answered: y/n are live only after the first read. The overview pass uses that same thread read, one bot at a time, and shares the single `gbot` lock with send and the open chat so a scan cannot pass a send. Status from the last pass is cached in `activity.json` (mode 0600) and shown until the next read returns. A thread saved from the last time that chat was open is judged the same way, so the list can show running, unread, or idle before the pass reaches that bot.
 - Keys are read without waiting. Every key curses already has is applied before one redraw, so a paste is one frame. No key calls `gbot`.
 - The loop sleeps in `select` on the terminal and a pipe the worker writes to, so a finished read draws at once. The sleep is capped at 0.1s, which is how late a resize shows.
+- `bench/e2e_tui.py` drives the whole app in a pseudo-terminal (pyte) against the same mock: picker, filter, open, a streamed reply, long Markdown, PgUp/PgDn, Ctrl-J newlines, an approval, a widget, resize with SIGWINCH, Esc, switching bots, Ctrl-D, `MOCK_FAIL`, and a hanging first read (`MOCK_HANG`). Each run uses a temp HOME and MOCK_STATE, a PATH with only the mock `gbot`, no Cursor or gateway variables, and `GBOT_TUI_THEME=dark`. Each scenario's screen is written to `$GBOT_E2E_ARTIFACTS/<scenario>.txt` (default `/workspace/oc/gbot-tui-artifacts/tui-polish`); the exit code counts failures. `docs/parity.md` maps the desktop chat's features to this TUI.
+- A chat opened with no cached thread shows `Loading conversation…` until the first read lands or fails.
 - Reads are 0.3s apart while waiting for a reply, 1s while new entries arrive, 2s once they stop (so two quiet polls still take about four seconds), 1s while a card is pending, and 2s backing off to 8s in an idle chat. A key press puts an idle chat back on 2s.
 
 `gbot` runs with the app's live login when `CURSOR_ACCESS_TOKEN` in the shell has expired: the expired token is dropped from its environment before it starts.

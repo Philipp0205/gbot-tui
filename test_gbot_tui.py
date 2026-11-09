@@ -954,6 +954,39 @@ class LookTests(unittest.TestCase):
         self.assertEqual(grid.header_gap(2, "", 10), 0)
         self.assertEqual(grid.header_gap(0, "tag", 10), 0)
 
+    def test_an_empty_chat_says_loading_until_the_first_read(self):
+        class Screen:
+            def __init__(self):
+                self.rows = {}
+
+            def getmaxyx(self):
+                return (24, 58)
+
+            def erase(self):
+                self.rows.clear()
+
+            def addnstr(self, y, x, text, n, attr=0):
+                self.rows.setdefault(y, []).append(text[:n])
+
+            def move(self, y, x):
+                pass
+
+            def refresh(self):
+                pass
+
+        def shown(chat):
+            screen = Screen()
+            chat_view.draw(screen, chat)
+            return " ".join(" ".join(parts) for parts in screen.rows.values())
+
+        chat = chat_state.Chat("Chef")
+        self.assertIn(chat_view.LOADING, shown(chat))
+        chat.error = "gateway is down"
+        self.assertNotIn(chat_view.LOADING, shown(chat))
+        chat.error = ""
+        chat.loaded = True
+        self.assertNotIn(chat_view.LOADING, shown(chat))
+
     def test_pick_restores_blocking_input(self):
         class Screen:
             def timeout(self, value):

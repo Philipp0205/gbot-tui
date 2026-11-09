@@ -4,6 +4,8 @@ import curses
 
 from . import grid, paint, styles, terminal, transcript, widgets
 
+LOADING = "Loading conversation…"
+
 
 def paint_composer(stdscr, y, width, lines, placeholder=False):
     span = max(width, 0)
@@ -62,6 +64,9 @@ def draw(stdscr, chat):
     if chat.follow:
         chat.scroll = max(len(rows) - room, 0)
     start = min(chat.scroll, max(len(rows) - room, 0))
+    if not rows and room and not getattr(chat, "loaded", True) and not chat.error:
+        # First open with no cached thread: say the read is out, not an empty chat.
+        paint.put(stdscr, header + gap, 3, grid.clip(LOADING, max(width - 4, 0)), styles.ATTR["dim"])
     for row in range(room):
         index = start + row
         if index >= len(rows):
