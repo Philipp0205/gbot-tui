@@ -213,6 +213,44 @@ def vertical_key(chat, key, stdscr):
     return True
 
 
+SEARCH_KEY = "\x06"  # ctrl-f
+SEARCH_OLDER = ("\r", "\x0e", curses.KEY_ENTER)  # enter, ctrl-n
+SEARCH_NEWER = ("\x10",)  # ctrl-p
+
+
+def search_key(chat, key, stdscr):
+    """A key while the search prompt is open. Esc closes the search, not the chat.
+
+    Typing jumps to the newest match. Enter or ctrl-n step to the next older
+    one and ctrl-p back toward newer, both wrapping. Page keys and the wheel
+    still scroll.
+    """
+    if key in ("\x1b", 27):
+        chat.search = None
+        chat.search_at = None
+        chat.search_jump = False
+        return None
+    if terminal.page_motion(key) is not None or terminal.wheel_direction(key) is not None:
+        return False
+    hits = grid.search_hits(grid.visible_rows(chat, screen_width(stdscr)), chat.search)
+    if key in SEARCH_OLDER or key in SEARCH_NEWER:
+        if hits:
+            at = len(hits) - 1 if chat.search_at is None else chat.search_at
+            at += -1 if key in SEARCH_OLDER else 1
+            chat.search_at = at % len(hits)
+            chat.search_jump = True
+        return None
+    if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+        chat.search = chat.search[:-1]
+    elif isinstance(key, str) and key.isprintable():
+        chat.search += key
+    else:
+        return None
+    chat.search_at = None
+    chat.search_jump = bool(chat.search)
+    return None
+
+
 def chat_key(chat, key, stdscr):
     """Apply one key. Returns "quit", "back", a job tuple, or None."""
     if key == curses.KEY_RESIZE:
@@ -225,6 +263,12 @@ def chat_key(chat, key, stdscr):
         chat.help = False
         if key == "?":
             chat.type_text("?")
+        return None
+    if chat.search is not None and search_key(chat, key, stdscr) is None:
+        return None
+    if key == SEARCH_KEY:
+        chat.search = ""
+        chat.search_at = None
         return None
     if key in ("\x1b", 27):
         return "back"

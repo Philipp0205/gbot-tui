@@ -196,6 +196,44 @@ def visible_rows(chat, width):
     return chat._rows
 
 
+def search_hits(rows, query):
+    """Indexes of the rows whose text holds `query`, case-folded, top to bottom."""
+    needle = (query or "").casefold()
+    if not needle:
+        return []
+    return [index for index, (_kind, text) in enumerate(rows) if needle in markdown.line_plain(text).casefold()]
+
+
+def match_spans(text, query):
+    """(start, end) of each case-folded occurrence of `query` in one row's text."""
+    plain = markdown.line_plain(text).casefold()
+    needle = (query or "").casefold()
+    out = []
+    at = plain.find(needle) if needle else -1
+    while at >= 0:
+        out.append((at, at + len(needle)))
+        at = plain.find(needle, at + len(needle))
+    return out
+
+
+SEARCH_HINT = " · enter/ctrl-n older · ctrl-p newer · esc close"
+
+
+def search_spans(query, hits, at, width=0):
+    """The one-line search prompt that replaces the footer."""
+    if not query:
+        status = ""
+    elif not hits:
+        status = "  no match"
+    else:
+        status = f"  {(at if at is not None else len(hits) - 1) + 1}/{len(hits)}"
+    spans = [("find: ", "bold"), (query, "default"), (status, "dim")]
+    room = max(width - 2, 0) if width else 0
+    if not room or len("find: " + query + status + SEARCH_HINT) <= room:
+        spans.append((SEARCH_HINT, "dim"))
+    return spans
+
+
 def card_lines(entry, width):
     card = transcript.message_card(entry)
     if card is None:

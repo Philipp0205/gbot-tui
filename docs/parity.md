@@ -35,7 +35,7 @@ What the desktop app's chat does, and where gbot-tui stands. The backend is fixe
 | Markdown: headings, lists, emphasis, code blocks | Done | `markdown.py`; fences drop the ``` and indent the code, the language name sits on its own line | 05 |
 | Links (click to open) | Done | `terminal.LINK_HITS`, `open_link_at` | |
 | Key help | Done | `?` on an empty draft or F1 shows `chat_view.HELP` over the transcript, any key closes it; footer says `? keys` | 23 |
-| Search in transcript | Gap | local over `grid.visible_rows`; jump `chat.scroll` to the match | |
+| Search in transcript | Done | Ctrl-F opens a `find:` prompt in the footer (`chat_screen.search_key`); matches over `grid.visible_rows` are reverse video (`grid.search_hits`, `chat_view.paint_matches`); Enter / Ctrl-N older, Ctrl-P newer, wrapping; the view scrolls to the match; Esc closes only the search | 24 |
 | Copy a message | Gap | OSC 52 of the selected message text; Shift-drag works in the terminal today | |
 | Resize | Done | `KEY_RESIZE`, layout per frame, `clearok` on size change (`chat_view.draw`) | 10 |
 | Empty / loading state | Done | picker `loading bots…` / `no match`; chat `Loading conversation…` until the first read when nothing is cached | 15 |

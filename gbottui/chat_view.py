@@ -2,7 +2,7 @@
 
 import curses
 
-from . import grid, paint, styles, terminal, transcript, widgets
+from . import grid, markdown, paint, styles, terminal, transcript, widgets
 
 LOADING = "Loading conversation…"
 HELP = [
@@ -14,6 +14,7 @@ HELP = [
     ("ctrl-w ctrl-u ctrl-k", "delete word / to start / to end"),
     ("up down", "draft rows, then sent history"),
     ("pgup pgdn", "scroll a screen (alt: half)"),
+    ("ctrl-f", "search (enter/ctrl-n older, ctrl-p newer, esc)"),
     ("y n", "answer a pending approval"),
     ("1-9", "pick a widget option"),
     ("@bot text", "send to another bot"),
@@ -29,6 +30,23 @@ def paint_help(stdscr, top, room, width):
     for index, line in enumerate(lines[:room]):
         attr = styles.ATTR["bold"] if index == 0 else styles.ATTR["default"]
         paint.put(stdscr, top + index, 3, grid.clip(line, max(width - 4, 0)), attr)
+
+
+def paint_matches(stdscr, y, x, text, query, current):
+    """Reverse video over each match in one painted row."""
+    plain = markdown.line_plain(text)
+    attr = curses.A_REVERSE | (curses.A_BOLD if current else 0)
+    for start, end in grid.match_spans(plain, query):
+        paint.put(stdscr, y, x + start, plain[start:end], attr)
+
+
+def search_target(rows, chat):
+    """Row index of the current match, or None."""
+    hits = grid.search_hits(rows, chat.search)
+    if not hits:
+        return None, hits
+    at = len(hits) - 1 if chat.search_at is None else min(chat.search_at, len(hits) - 1)
+    return hits[at], hits
 
 
 def paint_composer(stdscr, y, width, lines, placeholder=False, first=0):
@@ -73,6 +91,10 @@ def draw(stdscr, chat):
             entry = widgets.latest_widget(chat.messages)
             hint = widgets.choice_hint(entry, chat.step_at(entry) if entry else 0)
         footer = grid.footer_rows(chat.phase, chat.error, decide=decide, width=width, choice=hint)
+        if getattr(chat, "search", None) is not None:
+            target, hits = search_target(grid.visible_rows(chat, width), chat)
+            at = hits.index(target) if target is not None else None
+            footer = [grid.search_spans(chat.search, hits, at, width)]
         # Error rows come out of the transcript, which keeps at least one row.
         footer = footer[-max(min(len(footer), body_h), 1) :]
         body_h -= len(footer) - 1
@@ -86,6 +108,13 @@ def draw(stdscr, chat):
     gap = grid.header_gap(header, label, body_h)
     room = max(body_h - gap, 0)
     rows = grid.visible_rows(chat, width)
+    searching = getattr(chat, "search", None) is not None
+    target, _hits = search_target(rows, chat) if searching else (None, [])
+    if searching and getattr(chat, "search_jump", False) and target is not None:
+        # Put the match a third of the way down, so the lines under it show.
+        chat.follow = False
+        chat.scroll = min(max(target - room // 3, 0), max(len(rows) - room, 0))
+        chat.search_jump = False
     if chat.follow:
         chat.scroll = max(len(rows) - room, 0)
     start = min(chat.scroll, max(len(rows) - room, 0))
@@ -102,14 +131,21 @@ def draw(stdscr, chat):
         kind, text = rows[index]
         y = header + gap + row
         previous = rows[index - 1][0] if index else ""
+        x = None
         if kind == "user":
             paint.paint_user_line(stdscr, y, grid.bubble_column(width, text), text)
+            x = grid.bubble_column(width, text) + 1
         elif kind == "text":
             if previous != "text":
                 paint.put(stdscr, y, 1, "●", styles.dot_attr(color))
             paint.paint_bot_line(stdscr, y, 3, text, styles.bot_text_attr(color))
+            x = 3
         elif kind in styles.CARD_STYLE:
-            paint.put(stdscr, y, 1, grid.clip(text, max(width - 2, 0)), styles.ATTR[styles.CARD_STYLE[kind]])
+            text = grid.clip(text, max(width - 2, 0))
+            paint.put(stdscr, y, 1, text, styles.ATTR[styles.CARD_STYLE[kind]])
+            x = 1
+        if searching and chat.search and x is not None:
+            paint_matches(stdscr, y, x, text, chat.search, index == target)
     composer_at = header + body_h
     cursor = None
     if composer_h >= 3:
@@ -137,6 +173,9 @@ def draw(stdscr, chat):
         cursor = (composer_at, min(column, max(width - 2, 0)))
     for offset, spans in enumerate(footer):
         paint.paint_spans(stdscr, height - len(footer) + offset, 1, spans)
+    if footer and getattr(chat, "search", None) is not None:
+        # The prompt has the cursor while the search is open.
+        cursor = (height - 1, min(1 + len("find: ") + len(chat.search), max(width - 2, 0)))
     # The footer write leaves the cursor on "scroll". Put it back in the box.
     if cursor:
         try:

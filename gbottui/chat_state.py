@@ -26,6 +26,12 @@ class Chat:
         self.scroll = 0
         self.follow = True
         self.help = False
+        # Transcript search: None is closed, a string is the query being typed.
+        # `search_at` indexes `grid.search_hits`; `search_jump` asks the next
+        # draw to scroll that match into view.
+        self.search = None
+        self.search_at = None
+        self.search_jump = False
         self.typed = ""
         # Cursor index into `typed`. None is the end, so a draft set from
         # outside (a test, a widget reset) keeps typing at the end.

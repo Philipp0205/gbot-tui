@@ -3610,5 +3610,64 @@ class KeyHelpTests(unittest.TestCase):
         self.assertIn("? keys", grid.footer_spans("idle", "")[0][0])
 
 
+def _search_chat(count=30):
+    chat = chat_state.Chat("Researcher")
+    chat.loaded = True
+    chat.messages = [{"id": f"m{i}", "role": "user" if i % 2 else "assistant", "text": f"line {i}" + (" apple" if i in (3, 20) else "")} for i in range(1, count + 1)]
+    chat.touch_rows()
+    return chat
+
+
+class SearchTests(unittest.TestCase):
+    def test_hits_are_case_folded_rows(self):
+        rows = [("text", "An Apple"), ("gap", ""), ("user", [("apple", "bold"), (" pie", "")]), ("text", "pear")]
+        self.assertEqual(grid.search_hits(rows, "APPLE"), [0, 2])
+        self.assertEqual(grid.search_hits(rows, ""), [])
+        self.assertEqual(grid.match_spans("apple Apple", "apple"), [(0, 5), (6, 11)])
+
+    def test_ctrl_f_opens_a_prompt_and_esc_closes_only_the_search(self):
+        chat = _search_chat()
+        self.assertIsNone(chat_screen.chat_key(chat, "\x06", None))
+        self.assertEqual(chat.search, "")
+        _typed(chat, "apple")
+        self.assertEqual((chat.search, chat.typed), ("apple", ""))
+        self.assertIsNone(chat_screen.chat_key(chat, "\x1b", None))
+        self.assertIsNone(chat.search)
+        self.assertEqual(chat_screen.chat_key(chat, "\x1b", None), "back")
+
+    def test_enter_and_ctrl_n_go_older_ctrl_p_newer_and_wrap(self):
+        chat = _search_chat()
+        _typed(chat, "\x06apple")
+        rows = grid.visible_rows(chat, 80)
+        hits = grid.search_hits(rows, "apple")
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(chat_view.search_target(rows, chat)[0], hits[1])
+        chat_screen.chat_key(chat, "\r", None)
+        self.assertEqual(chat_view.search_target(rows, chat)[0], hits[0])
+        chat_screen.chat_key(chat, "\x0e", None)
+        self.assertEqual(chat_view.search_target(rows, chat)[0], hits[1])
+        chat_screen.chat_key(chat, "\x10", None)
+        self.assertEqual(chat_view.search_target(rows, chat)[0], hits[0])
+        # Enter in the search never sends.
+        self.assertEqual(chat.typed, "")
+
+    def test_draw_scrolls_to_the_match_and_shows_the_prompt(self):
+        chat = _search_chat(60)
+        screen = FakeScreen(12, 58)
+        chat_view.draw(screen, chat)
+        self.assertNotIn("apple", " ".join(" ".join(parts) for parts in screen.rows.values()))
+        _typed(chat, "\x06apple")
+        chat_screen.chat_key(chat, "\r", None)
+        chat_view.draw(screen, chat)
+        shown = " ".join(" ".join(parts) for parts in screen.rows.values())
+        self.assertIn("line 3 apple", shown)
+        self.assertIn("find: ", shown)
+        self.assertIn("1/2", shown)
+        self.assertFalse(chat.follow)
+
+    def test_no_match_says_so(self):
+        self.assertIn("  no match", [text for text, _style in grid.search_spans("zzz", [], None)])
+
+
 if __name__ == "__main__":
     unittest.main()

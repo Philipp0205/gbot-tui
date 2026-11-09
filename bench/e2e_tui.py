@@ -586,7 +586,53 @@ def idle_flow():
     return ok
 
 
-FLOWS = {"main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow}
+def reversed_text(t):
+    """Text drawn in reverse video, row by row: the search highlight."""
+    with t.lock:
+        rows = []
+        for y in range(t.screen.lines):
+            line = t.screen.buffer[y]
+            rows.append("".join(line[x].data for x in range(t.screen.columns) if line[x].reverse))
+        return rows
+
+
+def polish_flow():
+    run = Run("Chef")
+    term = run.term
+    ok = True
+    try:
+        def search(t):
+            t.wait(has("Chef", "earlier reply"), timeout=10)
+            t.wait(lacks("earlier line 5 "))
+            t.send("\x06")
+            t.wait(has("find: ", "esc close"))
+            t.send("earlier line 5")
+            t.wait(has("find: earlier line 5", "1/1"))
+            t.wait(has("earlier line 5"))
+            assert any("earlier line 5" in row for row in reversed_text(t)), "match not highlighted"
+            dump("24_search_open", t)
+            t.send("\x1b")
+            t.wait(lacks("find: "))
+            t.wait(has("Chef", "? keys"))
+            t.send("\x06line 2")
+            t.wait(has("find: line 2"))
+            first = [line for line in t.lines() if "/" in line and "find:" in line][0]
+            t.send("\x10")  # ctrl-p wraps from the newest to the oldest
+            t.wait(lambda lines: any("find:" in line and line != first for line in lines))
+            t.send("\r")
+            t.wait(lambda lines: any(line == first for line in lines))
+            assert not any("reply to" in line for line in t.lines()), "enter sent the search"
+            t.send("\x1b")
+            t.wait(lacks("find: "))
+            assert any("Chef" in line for line in t.lines()[:2]), "left the chat"
+
+        ok &= scenario("24_search", term, search)
+    finally:
+        run.close()
+    return ok
+
+
+FLOWS = {"main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow}
 
 
 def main():
