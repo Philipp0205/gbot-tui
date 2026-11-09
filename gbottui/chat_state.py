@@ -122,9 +122,9 @@ class Chat:
             self.cursor = page["cursor"]
             fresh = []
         else:
-            fresh = list(page["entries"])
-            for entry in fresh:
-                self._absorb(entry)
+            # Only new or changed entries count. A gateway that returns the
+            # cursor entry again would otherwise keep the turn `working`.
+            fresh = [entry for entry in page["entries"] if self._absorb(entry)]
             if page["cursor"]:
                 self.cursor = page["cursor"]
         self._stamp_answered()
@@ -153,19 +153,23 @@ class Chat:
         return False
 
     def _absorb(self, entry):
+        """Merge one polled entry. False when it was already on screen unchanged."""
         entry_id = entry.get("id") if isinstance(entry, dict) else None
         if isinstance(entry_id, str) and entry_id:
             for index, existing in enumerate(self.messages):
                 if existing.get("id") == entry_id:
+                    if existing == entry:
+                        return False
                     self.messages[index] = entry
-                    return
+                    return True
         if self._take_local(entry):
-            return
+            return True
         index = next((i for i, local in enumerate(self.messages) if local.get("local")), None)
         if index is None:
             self.messages.append(entry)
         else:
             self.messages.insert(index, entry)
+        return True
 
     def _stamp_answered(self):
         """A poll that still says pending must not undo a decision just sent."""

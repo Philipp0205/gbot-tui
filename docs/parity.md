@@ -16,7 +16,7 @@ What the desktop app's chat does, and where gbot-tui stands. The backend is fixe
 | Switch conversations within a bot | Not possible | `gbot thread` reads one transcript per target; no list-of-threads call is used | |
 | New conversation | Not possible | no new-thread / reset call in `gbot_cli.py` | |
 | Streaming replies | Done | polls at 0.3s; an entry with the same id replaces its row (`Chat._absorb`); `isStreaming` keeps `working` | 04 |
-| Working / generating indicator | Done | header `· working`, footer `Generating` (`paint.title_spans`, `grid.footer_spans`) | 04 |
+| Working / generating indicator | Done | header `· working`, footer `Generating` (`paint.title_spans`, `grid.footer_spans`); a re-sent unchanged cursor entry is a quiet poll (`Chat._absorb`) | 04, 20, 21 |
 | Scrollback (PgUp/PgDn, Alt-Pg half, wheel) | Done | `chat_key`, `terminal.page_motion`, `wheel_direction` | 06 |
 | Long output | Done | word wrap with hanging indent, follow-tail (`grid.wrap`, `chat_view.draw`) | 05 |
 | Older history than the last 80 entries | Gap | `read_thread(limit=…)` takes a larger limit; load more on scroll to top | |

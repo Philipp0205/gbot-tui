@@ -7,6 +7,7 @@ MOCK_REPLY  seconds after a send before the bot's reply is visible (default 1.5)
 MOCK_FAIL   every call but `bots list` prints this as a gbot error
 MOCK_HANG   seconds each `thread` call hangs, for the loading state (default 0)
 MOCK_STREAM seconds a reply keeps growing after it first shows (default 0: whole at once)
+MOCK_INCLUSIVE  1: `thread --after <id>` always returns that entry too, unchanged
 
 The text sent picks the reply, for bench/e2e_tui.py:
   "long ..."     a long Markdown reply with headings, a list and a fenced code block
@@ -29,6 +30,7 @@ REPLY = float(os.environ.get("MOCK_REPLY", "1.5"))
 HANG = float(os.environ.get("MOCK_HANG", "0") or 0)
 STREAM = float(os.environ.get("MOCK_STREAM", "0") or 0)
 GRACE = 3.0
+INCLUSIVE = os.environ.get("MOCK_INCLUSIVE") == "1"
 LONG = """# Trip plan
 
 Here is the plan for the week, with the parts that still need a decision.
@@ -138,7 +140,7 @@ def main(argv):
                 # A reply that grew in the last few seconds comes back once more
                 # with its final text, so the poll after the last word sees it.
                 growing = entries[at].get("stream") and now < entries[at]["at"] + entries[at]["stream"] + GRACE
-                entries = entries[at:] if growing else entries[at + 1 :]
+                entries = entries[at:] if growing or INCLUSIVE else entries[at + 1 :]
         bot = bot_for(target)
         payload = {
             "target": {"id": bot["id"], "name": bot["name"], "avatarColor": bot.get("avatarColor", "")},

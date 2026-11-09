@@ -212,6 +212,26 @@ class WatchTests(unittest.TestCase):
         )
         self.assertEqual((phase, quiet, saw), ("working", 0, False))
 
+    def test_a_cursor_entry_returned_again_does_not_keep_working(self):
+        def page(*entries):
+            return {"entries": list(entries), "cursor": entries[-1]["id"] if entries else "", "gap_reset": False, "name": "", "id": ""}
+
+        chat = chat_state.Chat("Researcher")
+        chat.ingest(page({"id": "m1", "role": "assistant", "text": "old"}), first=True)
+        _typed(chat, "hi")
+        self.assertEqual(chat_screen.chat_key(chat, "\r", None)[0], "send")
+        self.assertEqual(chat.phase, "working")
+        reply = {"id": "m3", "role": "assistant", "text": "the answer"}
+        chat.ingest(page({"id": "m2", "role": "user", "text": "hi"}, reply))
+        # The gateway keeps returning the `--after` entry, unchanged.
+        chat.ingest(page(dict(reply)))
+        self.assertEqual(chat.phase, "working")
+        chat.ingest(page(dict(reply)))
+        self.assertEqual(chat.phase, "done")
+        # A changed copy of the same id is still new text.
+        chat.ingest(page({"id": "m3", "role": "assistant", "text": "the answer, longer"}))
+        self.assertEqual(chat.quiet, 0)
+
     def test_pending_approval_blocks(self):
         entries = [
             {

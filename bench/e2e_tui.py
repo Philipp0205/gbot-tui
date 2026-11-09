@@ -529,7 +529,36 @@ def compose_flow():
     return ok
 
 
-FLOWS = {"main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow}
+def idle_flow():
+    """A gateway that returns the --after entry again: header and footer still go idle."""
+    run = Run("Chef", MOCK_INCLUSIVE=1)
+    term = run.term
+    ok = True
+
+    def settles(final):
+        def check(t):
+            t.wait(has("Chef", "Add a follow-up"), timeout=10)
+            t.wait(lacks("working", "Generating"), timeout=12)
+            t.send(final[0])
+            t.send("\r")
+            t.wait(has("working"))
+            t.wait(has(final[1]), timeout=20)
+            start = time.monotonic()
+            t.wait(lacks("working", "Generating"), timeout=6)
+            assert "enter send" in t.lines()[-1], "footer is not the idle hint"
+            print(f"      idle {time.monotonic() - start:.1f}s after {final[1]!r}", flush=True)
+
+        return check
+
+    try:
+        ok &= scenario("20_idle_after_long_reply", term, settles(("long please", "END OF LONG")))
+        ok &= scenario("21_idle_after_widget", term, settles(("widget", "Pick a city")))
+    finally:
+        run.close()
+    return ok
+
+
+FLOWS = {"main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow}
 
 
 def main():
