@@ -3424,5 +3424,50 @@ class ComposerEditTests(unittest.TestCase):
         self.assertEqual((chat.typed, chat.pos), ("", None))
 
 
+class HistoryTests(unittest.TestCase):
+    def test_up_recalls_sent_messages_and_down_goes_back(self):
+        chat = chat_state.Chat("Researcher")
+        chat.messages = [
+            {"role": "user", "text": "first"},
+            {"role": "assistant", "text": "ok"},
+            {"role": "user", "text": "second"},
+            {"role": "user", "text": "second"},
+        ]
+        screen = FakeScreen(24, 80)
+        _typed(chat, "draft", screen)
+        _typed(chat, [curses.KEY_UP], screen)
+        self.assertEqual(chat.typed, "second")
+        _typed(chat, [curses.KEY_UP], screen)
+        self.assertEqual(chat.typed, "first")
+        _typed(chat, [curses.KEY_UP], screen)
+        self.assertEqual(chat.typed, "first")
+        _typed(chat, ["!"], screen)
+        self.assertEqual(chat.sent_history(), ["first", "second"])
+        _typed(chat, [curses.KEY_DOWN], screen)
+        self.assertEqual(chat.typed, "second")
+        _typed(chat, [curses.KEY_DOWN], screen)
+        self.assertEqual((chat.typed, chat.pos), ("draft", 5))
+        self.assertFalse(chat.recall(1))
+
+    def test_a_sent_message_joins_the_history(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "hello")
+        self.assertEqual(chat_screen.chat_key(chat, "\r", None)[0], "send")
+        _typed(chat, [curses.KEY_UP], FakeScreen(24, 80))
+        self.assertEqual(chat.typed, "hello")
+        self.assertEqual(chat_screen.chat_key(chat, "\r", None)[0], "send")
+        self.assertIsNone(chat.hist_at)
+
+    def test_up_inside_a_multi_line_draft_moves_first(self):
+        chat = chat_state.Chat("Researcher")
+        chat.messages = [{"role": "user", "text": "old"}]
+        screen = FakeScreen(24, 80)
+        _typed(chat, "a\nb", screen)
+        _typed(chat, [curses.KEY_UP], screen)
+        self.assertEqual(chat.typed, "a\nb")
+        _typed(chat, [curses.KEY_UP], screen)
+        self.assertEqual(chat.typed, "old")
+
+
 if __name__ == "__main__":
     unittest.main()

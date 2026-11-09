@@ -203,11 +203,12 @@ def screen_width(stdscr):
 
 
 def vertical_key(chat, key, stdscr):
-    """Up or Down: the row above or below inside the draft. False at the edge."""
+    """Up or Down: the row above or below inside the draft, else the input history."""
     delta = -1 if key == curses.KEY_UP else 1
     pos = grid.draft_vertical(chat.typed, chat.pos, screen_width(stdscr), delta)
     if pos is None:
-        return False
+        # Past the first or last row: earlier or later sent messages.
+        return chat.recall(delta)
     chat.pos = pos
     return True
 

@@ -29,6 +29,10 @@ class Chat:
         # Cursor index into `typed`. None is the end, so a draft set from
         # outside (a test, a widget reset) keeps typing at the end.
         self.pos = None
+        # Input history: index into `sent_history()` while Up/Down browse it,
+        # and the draft that was there before the first Up.
+        self.hist_at = None
+        self.hist_draft = ("", None)
         self.error = ""
         self.resume = herdr.resume_arg(target)
         bot = roster.ROSTER.get(target) or {}
@@ -505,12 +509,48 @@ class Chat:
     def type_text(self, value):
         self.edit(draft.insert, value)
 
+    def sent_history(self):
+        """Your earlier messages in this chat, oldest first, repeats folded.
+
+        Read from the transcript, so it covers what the cache and the server
+        have, and editing a recalled line cannot change it.
+        """
+        out = []
+        for entry in self.messages:
+            if not isinstance(entry, dict) or not transcript.is_user(entry):
+                continue
+            text = transcript.entry_text(entry).strip()
+            if text and (not out or out[-1] != text):
+                out.append(text)
+        return out
+
+    def recall(self, delta):
+        """Up (-1) or Down (1) through the history. False when there is nothing to move to."""
+        past = self.sent_history()
+        if self.hist_at is None:
+            if delta > 0 or not past:
+                return False
+            self.hist_draft = (self.typed, self.pos)
+            at = len(past) - 1
+        else:
+            at = self.hist_at + delta
+            if at < 0:
+                return False
+            if at >= len(past):
+                self.hist_at = None
+                self.typed, self.pos = self.hist_draft
+                return True
+        self.hist_at = at
+        self.typed, self.pos = past[at], None
+        return True
+
     def arm_send(self):
         text = self.typed.strip()
         if not text:
             return ""
         self.typed = ""
         self.pos = None
+        self.hist_at = None
         self.error = ""
         self.saw_other = False
         self.quiet = 0

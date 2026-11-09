@@ -472,6 +472,27 @@ def compose_flow():
             t.wait(has("reply to first line here"), timeout=10)
 
         ok &= scenario("17_composer_wrapped", term, wrapped)
+
+        def history(t):
+            t.wait(lacks("Generating", "working"), timeout=12)
+            t.send("short one")
+            t.send("\r")
+            t.wait(has("reply to short one"), timeout=10)
+            t.wait(has("→  Add a follow-up"))
+            t.send(UP)
+            t.wait(has("→  short one"))
+            t.send(UP)
+            t.wait(has("→  first line here"))
+            t.send(" edited")
+            t.wait(has("edited"))
+            t.send(DOWN)
+            t.wait(has("→  short one"))
+            t.send(UP)
+            t.wait(lambda lines: box_text(lines).startswith("→  first line here\n"))
+            t.send(DOWN + DOWN)
+            t.wait(has("→  Add a follow-up"))
+
+        ok &= scenario("18_input_history", term, history)
     finally:
         run.close()
     return ok
