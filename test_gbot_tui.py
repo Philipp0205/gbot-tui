@@ -3719,5 +3719,53 @@ class NoticeFooterTests(unittest.TestCase):
         self.assertIn("Copied the last reply", " ".join(screen.rows[11]))
 
 
+
+class OfflineTests(unittest.TestCase):
+    def setUp(self):
+        self.now = [50.0]
+        self.original = activity.clock
+        activity.clock = lambda: self.now[0]
+
+    def tearDown(self):
+        activity.clock = self.original
+
+    def test_failed_reads_back_off_and_the_footer_counts_down(self):
+        chat = chat_state.Chat("Chef")
+        delays = [chat.read_failed("gateway is down") for _ in range(7)]
+        self.assertEqual(delays[:5], list(chat_state.RETRY_DELAYS))
+        self.assertEqual(delays[-1], chat_state.RETRY_DELAYS[-1])
+        chat = chat_state.Chat("Chef")
+        chat.error = "gateway is down"
+        chat.read_failed("gateway is down")
+        self.assertEqual(chat.offline_label(), "offline · retrying in 2s")
+        self.now[0] += 1.2
+        self.assertEqual(chat.offline_label(), "offline · retrying in 1s")
+        self.now[0] += 1.0
+        self.assertEqual(chat.offline_label(), "offline · retrying…")
+        self.assertEqual(chat.footer_error(), "offline · retrying… · gateway is down")
+        self.assertEqual(grid.footer_spans("idle", chat.footer_error())[0][1], "red")
+
+    def test_the_next_good_read_says_reconnected_once(self):
+        chat = chat_state.Chat("Chef")
+        page = transcript.parse_thread({"transcript": {"entries": [{"id": "m1", "role": "assistant", "text": "hi"}]}})
+        chat.ingest(page, first=True)
+        self.assertEqual(chat.notice, "")
+        chat.error = "gateway is down"
+        chat.read_failed("gateway is down")
+        chat.ingest(transcript.parse_thread({"transcript": {"entries": []}, "cursor": "m1"}))
+        self.assertEqual((chat.error, chat.offline_label(), chat.notice), ("", "", "reconnected"))
+        self.now[0] += chat_state.NOTICE_SECONDS
+        chat.expire_notice()
+        chat.ingest(transcript.parse_thread({"transcript": {"entries": []}, "cursor": "m1"}))
+        self.assertEqual(chat.notice, "")
+
+    def test_a_send_error_survives_a_good_read(self):
+        chat = chat_state.Chat("Chef")
+        chat.read_failed("gateway is down")
+        chat.error = "send failed"
+        chat.ingest(transcript.parse_thread({"transcript": {"entries": []}}), first=True)
+        self.assertEqual(chat.error, "send failed")
+
+
 if __name__ == "__main__":
     unittest.main()

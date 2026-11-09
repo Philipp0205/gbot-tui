@@ -5,6 +5,7 @@ MOCK_STATE  folder for the thread file and the call log
 MOCK_DELAY  seconds each call takes, like node startup plus the gateway (default 0.4)
 MOCK_REPLY  seconds after a send before the bot's reply is visible (default 1.5)
 MOCK_FAIL   every call but `bots list` prints this as a gbot error
+MOCK_FAIL_FILE  while this file exists, calls but `bots list` fail with its text
 MOCK_HANG   seconds each `thread` call hangs, for the loading state (default 0)
 MOCK_STREAM seconds a reply keeps growing after it first shows (default 0: whole at once)
 MOCK_INCLUSIVE  1: `thread --after <id>` always returns that entry too, unchanged
@@ -120,6 +121,13 @@ def main(argv):
     time.sleep(DELAY)
     args = [arg for arg in argv if arg not in ("--gateway", "--json")]
     fail = os.environ.get("MOCK_FAIL")
+    fail_file = os.environ.get("MOCK_FAIL_FILE")
+    if not fail and fail_file:
+        try:
+            with open(fail_file, encoding="utf-8") as handle:
+                fail = handle.read().strip() or "offline"
+        except OSError:
+            pass
     if fail and args[:1] != ["bots"]:
         print(json.dumps({"error": {"message": fail}}))
         return 1

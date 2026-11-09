@@ -40,8 +40,8 @@ What the desktop app's chat does, and where gbot-tui stands. The backend is fixe
 | Resize | Done | `KEY_RESIZE`, layout per frame, `clearok` on size change (`chat_view.draw`) | 10 |
 | Empty / loading state | Done | picker `loading bots…` / `no match`; chat `Loading conversation…` until the first read when nothing is cached | 15 |
 | Error state | Done | red footer, long errors get up to 3 rows (`grid.footer_rows`); composer stays usable | 14 |
-| Reconnect | Done (implicit) | a failed read retries on the idle cadence (`Chat.read_failed`); no explicit "reconnecting" label | |
-| Explicit reconnecting / offline label | Gap | show the retry countdown in the footer when the last read failed | |
+| Reconnect | Done | a failed read retries with backoff 2, 4, 8, 15, 30s (`Chat.read_failed`, `chat_state.RETRY_DELAYS`) | 27 |
+| Explicit reconnecting / offline label | Done | footer `offline · retrying in Ns` counts down (`Chat.offline_label`, `footer_error`); `reconnected` notice on the next good read (`Chat.read_back`) | 14, 27 |
 | Theme (light / dark) | Done | `theme.py` OSC 11 probe, `GBOT_TUI_THEME` | |
 | Notifications | Partial | Herdr OSC 7501 state and tab name (`herdr.py`); no terminal bell / OSC 9 for a reply in another bot | |
 | Bell / OSC 9 notify on needs-you while in the list | Gap | the survey already knows the state change | |

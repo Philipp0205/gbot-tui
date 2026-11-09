@@ -465,6 +465,7 @@ def chat_loop(stdscr, chat):
     waiting = 1
     next_poll = 0
     dirty = True
+    shown_offline = ""
     try:
         tty = sys.stdin.fileno()
     except (AttributeError, ValueError, OSError):
@@ -493,8 +494,7 @@ def chat_loop(stdscr, chat):
                     if source == "send" and chat.phase == "working":
                         chat.note("idle")
                     if source == "read":
-                        chat.read_failed()
-                        next_poll = time.monotonic() + chat_state.IDLE_DELAYS[0]
+                        next_poll = time.monotonic() + chat.read_failed(message)
                 elif kind == "routed":
                     chat.show_notice(f"Sent to {payload}.")
                 elif kind in {"sent", "decided", "chosen"}:
@@ -527,6 +527,11 @@ def chat_loop(stdscr, chat):
                 dirty = True
             if chat.expire_notice():
                 dirty = True
+            offline = chat.offline_label()
+            if offline != shown_offline:
+                # The countdown ticks once a second.
+                shown_offline = offline
+                dirty = True
             flushed = flush_choice_digit(chat)
             if isinstance(flushed, tuple):
                 chat_view.draw(stdscr, chat)
@@ -537,7 +542,7 @@ def chat_loop(stdscr, chat):
             elif flushed is not None:
                 dirty = True
             now = time.monotonic()
-            if waiting == 0 and now >= next_poll and (chat.loaded or chat.error):
+            if waiting == 0 and now >= next_poll and (chat.loaded or chat.error or chat.read_failures):
                 jobs.put(("read", chat.take_read()))
                 waiting += 1
                 next_poll = now + chat.poll_delay()
@@ -547,7 +552,7 @@ def chat_loop(stdscr, chat):
             keys = paint.read_keys(stdscr)
             if not keys:
                 wait = WAKE_CAP
-                if waiting == 0 and (chat.loaded or chat.error):
+                if waiting == 0 and (chat.loaded or chat.error or chat.read_failures):
                     wait = min(WAKE_CAP, max(next_poll - time.monotonic(), 0))
                 pause = choice_pause(chat)
                 if pause is not None:

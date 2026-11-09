@@ -52,6 +52,7 @@ SCRUB = (
     "HC_TERMINAL_SOCKET",
     "MOCK_FAIL",
     "MOCK_HANG",
+    "MOCK_FAIL_FILE",
 )
 
 
@@ -402,6 +403,33 @@ def error_flow():
         run.close()
 
 
+def offline_flow():
+    flag = os.path.join(tempfile.mkdtemp(prefix="gbot-e2e-flag-"), "down")
+    with open(flag, "w", encoding="utf-8") as handle:
+        handle.write("gateway is down")
+    run = Run("Chef", MOCK_FAIL_FILE=flag)
+    try:
+        def offline(t):
+            t.wait(has("offline · retrying in", "gateway is down"), timeout=10)
+            # Second failure backs off to 4s; the label counts down to it.
+            t.wait(has("offline · retrying in 4s"), timeout=10)
+            t.wait(has("offline · retrying in 3s"), timeout=3)
+            dump("27_offline_countdown", t)
+            check_box(t.lines(), 80)
+            os.unlink(flag)
+            t.wait(has("reconnected"), timeout=15)
+            t.wait(has("earlier reply"))
+            assert not any("offline" in line or "gateway is down" in line for line in t.lines()), "offline label stayed"
+            dump("27_offline_reconnected", t)
+            t.wait(lacks("reconnected"), timeout=8)
+            t.wait(has("? keys"))
+
+        return scenario("27_offline_reconnect", run.term, offline)
+    finally:
+        run.close()
+        shutil.rmtree(os.path.dirname(flag), ignore_errors=True)
+
+
 def loading_flow():
     run = Run("Researcher", MOCK_HANG="4")
     try:
@@ -668,7 +696,7 @@ def polish_flow():
     return ok
 
 
-FLOWS = {"main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow}
+FLOWS = {"main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow}
 
 
 def main():

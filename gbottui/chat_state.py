@@ -1,5 +1,7 @@
 """One chat's state: the transcript, the draft, the phase, and pending decisions."""
 
+import math
+
 from . import activity, backend, draft, herdr, icons, roster, tabs, transcript, widgets
 
 
@@ -9,6 +11,8 @@ STREAM_DELAY = 1.0
 SETTLE_DELAY = 2.0
 BLOCKED_DELAY = 1.0
 IDLE_DELAYS = (2.0, 2.0, 3.0, 5.0, 8.0)
+# Seconds before the next read after 1, 2, 3, … failed reads in a row.
+RETRY_DELAYS = (2.0, 4.0, 8.0, 15.0, 30.0)
 # A notice (copied, sent elsewhere) stays this long, or until the next key.
 NOTICE_SECONDS = 4.0
 
@@ -46,6 +50,10 @@ class Chat:
         # A neutral or success line for the footer, not drawn as an error.
         self.notice = ""
         self.notice_at = None
+        # Failed thread reads in a row, when the next one starts, and its error.
+        self.read_failures = 0
+        self.retry_at = None
+        self.read_error = ""
         self.resume = herdr.resume_arg(target)
         bot = roster.ROSTER.get(target) or {}
         self.avatar_color = bot.get("avatarColor") or bot.get("avatar_color") or ""
@@ -478,12 +486,45 @@ class Chat:
             return (self.target, self.cursor)
         return (self.target,)
 
-    def read_failed(self):
+    def read_failed(self, message=""):
+        """Note a failed read. Returns the seconds until the retry, backing off."""
         if self.replacing:
             self.replacing = False
             self.full_reload = True
+        self.read_failures += 1
+        self.read_error = message
+        delay = RETRY_DELAYS[min(self.read_failures - 1, len(RETRY_DELAYS) - 1)]
+        self.retry_at = activity.clock() + delay
+        return delay
+
+    def offline_label(self):
+        """`offline · retrying in Ns` after a failed read, else ""."""
+        if not self.read_failures:
+            return ""
+        left = math.ceil(max((self.retry_at or 0) - activity.clock(), 0))
+        return f"offline · retrying in {left}s" if left else "offline · retrying…"
+
+    def read_back(self):
+        """A good read after failures: drop the read error and say so briefly."""
+        if not self.read_failures:
+            return False
+        self.read_failures = 0
+        self.retry_at = None
+        if self.error == self.read_error:
+            self.error = ""
+        self.read_error = ""
+        self.show_notice("reconnected")
+        return True
+
+    def footer_error(self):
+        """The red footer text: the offline countdown, then the last error."""
+        label = self.offline_label()
+        if label and self.error:
+            return f"{label} · {self.error}"
+        return label or self.error
 
     def ingest(self, page, first=False):
+        self.read_back()
         replace = first or not self.cursor or page["gap_reset"] or self.replacing
         self.replacing = False
         if replace:

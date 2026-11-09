@@ -91,8 +91,9 @@ def draw(stdscr, chat):
         if getattr(chat, "loaded", False) and not getattr(chat, "widget_busy", False) and not chat.typed:
             entry = widgets.latest_widget(chat.messages)
             hint = widgets.choice_hint(entry, chat.step_at(entry) if entry else 0)
+        error = chat.footer_error() if hasattr(chat, "footer_error") else chat.error
         footer = grid.footer_rows(
-            chat.phase, chat.error, decide=decide, width=width, choice=hint, notice=getattr(chat, "notice", "")
+            chat.phase, error, decide=decide, width=width, choice=hint, notice=getattr(chat, "notice", "")
         )
         if getattr(chat, "search", None) is not None:
             target, hits = search_target(grid.visible_rows(chat, width), chat)
