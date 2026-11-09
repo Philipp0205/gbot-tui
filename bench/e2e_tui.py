@@ -67,6 +67,7 @@ class Term:
         self._winsize(rows, cols)
         self.alive = True
         self.status = None
+        self.raw = bytearray()
         threading.Thread(target=self._read, daemon=True).start()
 
     def _winsize(self, rows, cols):
@@ -83,6 +84,7 @@ class Term:
             if b"\033[c" in data:
                 os.write(self.fd, b"\033[?62;22c")
             with self.lock:
+                self.raw.extend(data)
                 self.stream.feed(data)
 
     def resize(self, rows, cols):
@@ -452,6 +454,37 @@ def offline_flow():
         shutil.rmtree(os.path.dirname(flag), ignore_errors=True)
 
 
+def bell_flow():
+    run = Run("Chef", MOCK_REPLY="2.5", MOCK_STREAM="0")
+    try:
+        def bell(t):
+            notice = b"\x07\x1b]9;Chef needs you\x07"
+            t.wait(has("Chef", "earlier reply"), timeout=10)
+            t.send("approve the cleanup")
+            t.wait(lambda lines: "approve the cleanup" in " ".join(composer_rows(lines)))
+            t.send("\r")
+            t.wait(has("working"))
+            t.send(ESC)  # back to the list before the card lands
+            t.wait(has("Grok bots", "Researcher"))
+            assert notice not in bytes(t.raw), "rang before the card"
+            end = time.monotonic() + 20
+            while notice not in bytes(t.raw) and time.monotonic() < end:
+                t.send("\x12")  # ctrl-r: scan again
+                t.settle(1.0)
+            assert notice in bytes(t.raw), "no BEL + OSC 9 for needs you"
+            t.wait(has("needs you"))
+            dump("29_needs_you_bell_list", t)
+            for _ in range(3):
+                t.send("\x12")
+                t.settle(1.0)
+            count = bytes(t.raw).count(notice)
+            assert count == 1, f"rang {count} times for one transition"
+
+        return scenario("29_needs_you_bell", run.term, bell)
+    finally:
+        run.close()
+
+
 def loading_flow():
     run = Run("Researcher", MOCK_HANG="4")
     try:
@@ -718,7 +751,7 @@ def polish_flow():
     return ok
 
 
-FLOWS = {"main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow}
+FLOWS = {"main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow}
 
 
 def main():

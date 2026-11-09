@@ -304,6 +304,8 @@ def pick(stdscr, bots, refresh=None):
     chosen = ""
     pending = []
     showing_help = False
+    # Each bot's state as last drawn, for the bell when one starts needing you.
+    states = None
     try:
         while True:
             if loader:
@@ -320,6 +322,12 @@ def pick(stdscr, bots, refresh=None):
                         bots = list(fresh)
                         survey.replace(bots)
             views = activity.with_activity(bots)
+            if states is None:
+                _fresh, states = activity.newly_blocked({}, views)
+            else:
+                fresh, states = activity.newly_blocked(states, views)
+                for name in fresh:
+                    terminal.write_tty(terminal.notify(f"{name} needs you"))
             shown = fuzzy_bots(query, views)
             if not query:
                 shown = activity.order_bots(shown)

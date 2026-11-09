@@ -43,8 +43,8 @@ What the desktop app's chat does, and where gbot-tui stands. The backend is fixe
 | Reconnect | Done | a failed read retries with backoff 2, 4, 8, 15, 30s (`Chat.read_failed`, `chat_state.RETRY_DELAYS`) | 27 |
 | Explicit reconnecting / offline label | Done | footer `offline · retrying in Ns` counts down (`Chat.offline_label`, `footer_error`); `reconnected` notice on the next good read (`Chat.read_back`) | 14, 27 |
 | Theme (light / dark) | Done | `theme.py` OSC 11 probe, `GBOT_TUI_THEME` | |
-| Notifications | Partial | Herdr OSC 7501 state and tab name (`herdr.py`); no terminal bell / OSC 9 for a reply in another bot | |
-| Bell / OSC 9 notify on needs-you while in the list | Gap | the survey already knows the state change | |
+| Notifications | Partial | Herdr OSC 7501 state and tab name (`herdr.py`); bell + OSC 9 for needs you (below); no notice for a plain reply in another bot | |
+| Bell / OSC 9 notify on needs-you while in the list | Done | `picker.pick` writes `terminal.notify` (BEL, `ESC ] 9 ; <name> needs you BEL`) for each name `activity.newly_blocked` returns; once per transition, the first look is the baseline | 29 |
 | Settings screen | Not possible | no settings call; theme is env only | |
 | Bot avatar and color | Done | `styles.dot_attr`, `icons.py` for Herdr | |
 | Thinking / progress lines hidden | Done | `transcript.is_thinking`, `hidden_status_ids` | |

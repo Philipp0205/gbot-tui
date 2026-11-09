@@ -3784,6 +3784,31 @@ class ListHelpTests(unittest.TestCase):
         self.assertNotIn("/x", drawn[2])
 
 
+def _views(**states):
+    return [{"name": name, "activity": {"state": state}} for name, state in states.items()]
+
+
+class NeedsYouBellTests(unittest.TestCase):
+    def test_osc9_is_bell_then_esc_9_text_bel(self):
+        self.assertEqual(terminal.notify("Chef needs you"), b"\x07\x1b]9;Chef needs you\x07")
+        # A control byte in a bot name cannot end the sequence early.
+        self.assertEqual(terminal.notify("a\x07b\x1bc"), b"\x07\x1b]9;a b c\x07")
+
+    def test_only_a_new_transition_rings_and_only_once(self):
+        fresh, states = activity.newly_blocked({}, _views(Chef="blocked", Researcher="idle"))
+        self.assertEqual(fresh, [])  # the first look is the baseline
+        fresh, states = activity.newly_blocked(states, _views(Chef="blocked", Researcher="blocked"))
+        self.assertEqual(fresh, ["Researcher"])
+        fresh, states = activity.newly_blocked(states, _views(Chef="blocked", Researcher="blocked"))
+        self.assertEqual(fresh, [])
+        fresh, states = activity.newly_blocked(states, _views(Chef="blocked", Researcher="idle"))
+        fresh, states = activity.newly_blocked(states, _views(Chef="blocked", Researcher="blocked"))
+        self.assertEqual(fresh, ["Researcher"])
+        # A bot new to the list is a baseline too.
+        fresh, states = activity.newly_blocked(states, _views(Chef="blocked", Researcher="blocked", New="blocked"))
+        self.assertEqual(fresh, [])
+
+
 class OfflineTests(unittest.TestCase):
     def setUp(self):
         self.now = [50.0]
