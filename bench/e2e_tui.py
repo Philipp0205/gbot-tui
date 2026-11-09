@@ -627,6 +627,13 @@ def polish_flow():
             assert any("Chef" in line for line in t.lines()[:2]), "left the chat"
 
         ok &= scenario("24_search", term, search)
+
+        def copy(t):
+            t.send("\x0f")
+            t.wait(has("Copied the last reply"))
+            assert any("Chef" in line for line in t.lines()[:2]), "left the chat"
+
+        ok &= scenario("25_copy_osc52", term, copy)
     finally:
         run.close()
     return ok

@@ -251,6 +251,22 @@ def search_key(chat, key, stdscr):
     return None
 
 
+COPY_KEY = "\x0f"  # ctrl-o: ctrl-y and ctrl-n already type y and n
+
+
+def copy_last_reply(chat):
+    """OSC 52 the newest bot message to the terminal clipboard. Footer says so."""
+    for entry in reversed(chat.messages):
+        if isinstance(entry, dict) and not transcript.is_user(entry):
+            text = transcript.entry_text(entry).strip()
+            if text:
+                terminal.write_tty(terminal.osc52(text))
+                chat.error = f"Copied the last reply ({len(text)} chars)."
+                return True
+    chat.error = "No reply to copy."
+    return False
+
+
 def chat_key(chat, key, stdscr):
     """Apply one key. Returns "quit", "back", a job tuple, or None."""
     if key == curses.KEY_RESIZE:
@@ -265,6 +281,9 @@ def chat_key(chat, key, stdscr):
             chat.type_text("?")
         return None
     if chat.search is not None and search_key(chat, key, stdscr) is None:
+        return None
+    if key == COPY_KEY:
+        copy_last_reply(chat)
         return None
     if key == SEARCH_KEY:
         chat.search = ""

@@ -6,6 +6,13 @@ import subprocess
 import sys
 
 
+def osc52(text):
+    """ESC ] 52 ; c ; <base64> BEL: put `text` on the terminal's clipboard."""
+    import base64
+
+    return b"\x1b]52;c;" + base64.b64encode(text.encode("utf-8")) + b"\x07"
+
+
 def write_tty(data):
     try:
         tty = os.open("/dev/tty", os.O_WRONLY)

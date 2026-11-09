@@ -3669,5 +3669,22 @@ class SearchTests(unittest.TestCase):
         self.assertIn("  no match", [text for text, _style in grid.search_spans("zzz", [], None)])
 
 
+class CopyTests(unittest.TestCase):
+    def test_ctrl_o_copies_the_last_bot_reply_with_osc52(self):
+        sent = []
+        original = terminal.write_tty
+        terminal.write_tty = sent.append
+        try:
+            chat = _search_chat(4)
+            chat.messages.append({"id": "u", "role": "user", "text": "mine"})
+            self.assertIsNone(chat_screen.chat_key(chat, "\x0f", None))
+        finally:
+            terminal.write_tty = original
+        self.assertEqual(sent, [b"\x1b]52;c;" + base64.b64encode(b"line 4") + b"\x07"])
+        self.assertIn("Copied", chat.error)
+        self.assertEqual(chat.typed, "")
+        self.assertTrue(any("ctrl-o" in keys for keys, _what in chat_view.HELP))
+
+
 if __name__ == "__main__":
     unittest.main()

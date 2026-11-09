@@ -15,6 +15,7 @@ HELP = [
     ("up down", "draft rows, then sent history"),
     ("pgup pgdn", "scroll a screen (alt: half)"),
     ("ctrl-f", "search (enter/ctrl-n older, ctrl-p newer, esc)"),
+    ("ctrl-o", "copy the last reply (OSC 52)"),
     ("y n", "answer a pending approval"),
     ("1-9", "pick a widget option"),
     ("@bot text", "send to another bot"),
