@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 
-from . import activity, app, cache, chat_state, chat_view, gbot_cli, grid, herdr, paint, roster, styles, terminal, theme, transcript, widgets
+from . import activity, app, cache, chat_state, chat_view, draft, gbot_cli, grid, herdr, paint, roster, styles, terminal, theme, transcript, widgets
 
 
 # The loop sleeps in select, so a finished read wakes it at once. This cap is
@@ -159,14 +159,154 @@ def choice_key(chat, key):
     return "wait"
 
 
+# Ctrl keys that edit the draft, as in readline.
+EDIT_KEYS = {
+    "\x01": draft.line_start,
+    "\x05": draft.line_end,
+    "\x17": draft.kill_word,
+    "\x15": draft.kill_line_start,
+    "\x0b": draft.kill_line_end,
+}
+# Curses keys, and the terminfo names of the modified arrows.
+CURSOR_KEYS = {
+    curses.KEY_LEFT: draft.left,
+    curses.KEY_RIGHT: draft.right,
+    curses.KEY_HOME: draft.line_start,
+    curses.KEY_END: draft.line_end,
+    curses.KEY_DC: draft.delete,
+}
+WORD_KEYS = {b"kLFT5": draft.word_left, b"kLFT3": draft.word_left, b"kRIT5": draft.word_right, b"kRIT3": draft.word_right}
+
+
+def edit_motion(key):
+    """The `draft` function a cursor or edit key runs, or None."""
+    if isinstance(key, str):
+        return EDIT_KEYS.get(key)
+    if not isinstance(key, int):
+        return None
+    if key in CURSOR_KEYS:
+        return CURSOR_KEYS[key]
+    try:
+        name = curses.keyname(key)
+    except (curses.error, ValueError):
+        return None
+    if isinstance(name, str):
+        name = name.encode()
+    return WORD_KEYS.get(name)
+
+
+def screen_width(stdscr):
+    try:
+        return stdscr.getmaxyx()[1]
+    except AttributeError:
+        return 80
+
+
+def vertical_key(chat, key, stdscr):
+    """Up or Down: the row above or below inside the draft, else the input history."""
+    delta = -1 if key == curses.KEY_UP else 1
+    pos = grid.draft_vertical(chat.typed, chat.pos, screen_width(stdscr), delta)
+    if pos is None:
+        # Past the first or last row: earlier or later sent messages.
+        return chat.recall(delta)
+    chat.pos = pos
+    return True
+
+
+SEARCH_KEY = "\x06"  # ctrl-f
+SEARCH_OLDER = ("\r", "\x0e", curses.KEY_ENTER)  # enter, ctrl-n
+SEARCH_NEWER = ("\x10",)  # ctrl-p
+
+
+def search_key(chat, key, stdscr):
+    """A key while the search prompt is open. Esc closes the search, not the chat.
+
+    Typing jumps to the newest match. Enter or ctrl-n step to the next older
+    one and ctrl-p back toward newer, both wrapping. Page keys and the wheel
+    still scroll.
+    """
+    if key in ("\x1b", 27):
+        chat.search = None
+        chat.search_at = None
+        chat.search_jump = False
+        return None
+    if terminal.page_motion(key) is not None or terminal.wheel_direction(key) is not None:
+        return False
+    hits = grid.search_hits(grid.visible_rows(chat, screen_width(stdscr)), chat.search)
+    if key in SEARCH_OLDER or key in SEARCH_NEWER:
+        if hits:
+            at = len(hits) - 1 if chat.search_at is None else chat.search_at
+            at += -1 if key in SEARCH_OLDER else 1
+            chat.search_at = at % len(hits)
+            chat.search_jump = True
+        return None
+    if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+        chat.search = chat.search[:-1]
+    elif isinstance(key, str) and key.isprintable():
+        chat.search += key
+    else:
+        return None
+    chat.search_at = None
+    chat.search_jump = bool(chat.search)
+    return None
+
+
+COPY_KEY = "\x0f"  # ctrl-o: ctrl-y and ctrl-n already type y and n
+
+
+def copy_last_reply(chat):
+    """OSC 52 the newest bot message to the terminal clipboard. Footer says so."""
+    for entry in reversed(chat.messages):
+        if isinstance(entry, dict) and not transcript.is_user(entry):
+            text = transcript.entry_text(entry).strip()
+            if text:
+                terminal.write_tty(terminal.osc52(text))
+                chat.show_notice(f"Copied the last reply ({len(text)} chars).")
+                return True
+    chat.show_notice("No reply to copy.")
+    return False
+
+
+def older_job(chat):
+    """At the top of the transcript, ask for older entries with a larger --limit."""
+    if chat.scroll > 0:
+        return None
+    args = chat.take_older()
+    if args is None:
+        return None
+    chat.show_notice("Loading older messages…")
+    return ("older", args)
+
+
 def chat_key(chat, key, stdscr):
     """Apply one key. Returns "quit", "back", a job tuple, or None."""
     if key == curses.KEY_RESIZE:
         return None
     if key in ("\x03", "\x04"):
         return "quit"
+    # The next key clears a notice; ctrl-o sets a new one below.
+    chat.expire_notice(any_key=True)
+    if getattr(chat, "help", False):
+        # Any key closes the overlay. Esc closes it and stays in the chat;
+        # a second `?` types one, so a message can still start with it.
+        chat.help = False
+        if key == "?":
+            chat.type_text("?")
+        return None
+    if chat.search is not None and search_key(chat, key, stdscr) is None:
+        return None
+    if key == COPY_KEY:
+        copy_last_reply(chat)
+        return None
+    if key == SEARCH_KEY:
+        chat.search = ""
+        chat.search_at = None
+        return None
     if key in ("\x1b", 27):
         return "back"
+    if key == curses.KEY_F1 or (key == "?" and not chat.typed):
+        chat.help = True
+        return None
     chat.nudge()
     motion = terminal.page_motion(key)
     if motion is None:
@@ -183,7 +323,7 @@ def chat_key(chat, key, stdscr):
         if direction < 0:
             chat.follow = False
             chat.scroll = max(chat.scroll - step, 0)
-            return None
+            return older_job(chat)
         chat.scroll += step
         height, width = stdscr.getmaxyx()
         page_header, body_h, _composer, _footer = grid.layout(height, len(grid.draft_lines(chat.typed, width)) or 1)
@@ -194,7 +334,14 @@ def chat_key(chat, key, stdscr):
         return None
     if key == "\n":
         # nonl() makes Enter "\r", so a bare LF is ctrl+enter / ctrl+j.
-        chat.typed += "\n"
+        chat.type_text("\n")
+        return None
+    change = edit_motion(key)
+    if change is not None:
+        chat.edit(change)
+        return None
+    if key in (curses.KEY_UP, curses.KEY_DOWN):
+        vertical_key(chat, key, stdscr)
         return None
     if key in ("\r", curses.KEY_ENTER):
         entry = widgets.latest_widget(chat.messages) if not chat.widget_busy else None
@@ -233,7 +380,7 @@ def chat_key(chat, key, stdscr):
             chat.error = ""
             return ("route", route)
         if route:
-            chat.typed = route[1]
+            chat.typed, chat.pos = route[1], None
         text = chat.arm_send()
         if not text:
             return None
@@ -247,17 +394,17 @@ def chat_key(chat, key, stdscr):
         if action == "decide":
             args = chat.begin_decision(value)
             if not args:
-                chat.typed += "y" if value == "accept" else "n"
+                chat.type_text("y" if value == "accept" else "n")
                 return None
             chat.error = ""
             return ("decide", args)
-        chat.typed += value
+        chat.type_text(value)
         return None
     if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
         if getattr(chat, "digit_buf", "") and not chat.typed:
             clear_choice_digit(chat)
             return None
-        chat.typed = chat.typed[:-1]
+        chat.edit(draft.backspace)
         return None
     picked = choice_key(chat, key)
     if picked in {"ignore", "toggle", "step", "wait"}:
@@ -265,7 +412,7 @@ def chat_key(chat, key, stdscr):
     if isinstance(picked, tuple):
         return picked
     if isinstance(key, str) and key.isprintable():
-        chat.typed += key
+        chat.type_text(key)
     return None
 
 
@@ -277,6 +424,9 @@ def chat_loop(stdscr, chat):
     curses.nonl()
 
     terminal.enable_wheel()
+    # A pasted block arrives between ESC [200~ and ESC [201~, so its newlines stay in the draft.
+    paint.PASTING = False
+    terminal.write_tty(paint.BRACKETED_PASTE_ON)
     # gbot's network calls used to run here, so typing froze until each one returned.
     # Keys are read without waiting; the loop sleeps in select on the tty and a pipe.
     stdscr.timeout(0)
@@ -306,6 +456,8 @@ def chat_loop(stdscr, chat):
             try:
                 if kind == "read":
                     finish(("page", gbot_cli.read_thread(*args)))
+                elif kind == "older":
+                    finish(("older", (gbot_cli.read_thread(*args), args[2])))
                 elif kind == "decide":
                     gbot_cli.respond_approval(*args)
                     finish(("decided", None))
@@ -326,6 +478,7 @@ def chat_loop(stdscr, chat):
     waiting = 1
     next_poll = 0
     dirty = True
+    shown_offline = ""
     try:
         tty = sys.stdin.fileno()
     except (AttributeError, ValueError, OSError):
@@ -353,11 +506,21 @@ def chat_loop(stdscr, chat):
                         chat.fail_choice()
                     if source == "send" and chat.phase == "working":
                         chat.note("idle")
+                    if source == "older":
+                        chat.older_failed()
                     if source == "read":
-                        chat.read_failed()
-                        next_poll = time.monotonic() + chat_state.IDLE_DELAYS[0]
+                        next_poll = time.monotonic() + chat.read_failed(message)
+                elif kind == "older":
+                    page, limit = payload
+                    width = screen_width(stdscr)
+                    rows = len(grid.visible_rows(chat, width))
+                    added = chat.ingest_older(page, limit)
+                    # Keep the rows that were on screen where they were.
+                    chat.scroll += len(grid.visible_rows(chat, width)) - rows
+                    chat.follow = False
+                    chat.show_notice(f"Loaded {added} older messages." if added else "Start of the conversation.")
                 elif kind == "routed":
-                    chat.error = f"Sent to {payload}."
+                    chat.show_notice(f"Sent to {payload}.")
                 elif kind in {"sent", "decided", "chosen"}:
                     if kind == "decided":
                         chat.finish_decision()
@@ -386,6 +549,13 @@ def chat_loop(stdscr, chat):
                     dirty = True
             if chat.expire_working():
                 dirty = True
+            if chat.expire_notice():
+                dirty = True
+            offline = chat.offline_label()
+            if offline != shown_offline:
+                # The countdown ticks once a second.
+                shown_offline = offline
+                dirty = True
             flushed = flush_choice_digit(chat)
             if isinstance(flushed, tuple):
                 chat_view.draw(stdscr, chat)
@@ -396,7 +566,7 @@ def chat_loop(stdscr, chat):
             elif flushed is not None:
                 dirty = True
             now = time.monotonic()
-            if waiting == 0 and now >= next_poll and (chat.loaded or chat.error):
+            if waiting == 0 and now >= next_poll and (chat.loaded or chat.error or chat.read_failures):
                 jobs.put(("read", chat.take_read()))
                 waiting += 1
                 next_poll = now + chat.poll_delay()
@@ -406,7 +576,7 @@ def chat_loop(stdscr, chat):
             keys = paint.read_keys(stdscr)
             if not keys:
                 wait = WAKE_CAP
-                if waiting == 0 and (chat.loaded or chat.error):
+                if waiting == 0 and (chat.loaded or chat.error or chat.read_failures):
                     wait = min(WAKE_CAP, max(next_poll - time.monotonic(), 0))
                 pause = choice_pause(chat)
                 if pause is not None:
@@ -440,6 +610,8 @@ def chat_loop(stdscr, chat):
     except KeyboardInterrupt:
         return None
     finally:
+        terminal.write_tty(paint.BRACKETED_PASTE_OFF)
+        paint.PASTING = False
         jobs.put(None)
         cache.write_thread_cache(chat.target, chat.messages)
         os.close(wake_r)

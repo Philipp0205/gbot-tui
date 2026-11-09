@@ -1,6 +1,8 @@
 """One chat's state: the transcript, the draft, the phase, and pending decisions."""
 
-from . import activity, backend, herdr, icons, roster, tabs, transcript, widgets
+import math
+
+from . import activity, backend, draft, herdr, icons, roster, tabs, transcript, widgets
 
 
 # Poll cadence in seconds. Each read is one gbot process, so idle backs off.
@@ -9,6 +11,15 @@ STREAM_DELAY = 1.0
 SETTLE_DELAY = 2.0
 BLOCKED_DELAY = 1.0
 IDLE_DELAYS = (2.0, 2.0, 3.0, 5.0, 8.0)
+# A thread read returns the newest READ_LIMIT entries. Scrolling to the top
+# asks for HISTORY_STEP more with a larger `--limit`, up to HISTORY_MAX.
+READ_LIMIT = 80
+HISTORY_STEP = 80
+HISTORY_MAX = 800
+# Seconds before the next read after 1, 2, 3, … failed reads in a row.
+RETRY_DELAYS = (2.0, 4.0, 8.0, 15.0, 30.0)
+# A notice (copied, sent elsewhere) stays this long, or until the next key.
+NOTICE_SECONDS = 4.0
 
 
 class Chat:
@@ -25,8 +36,34 @@ class Chat:
         self.saw_other = False
         self.scroll = 0
         self.follow = True
+        self.help = False
+        # Transcript search: None is closed, a string is the query being typed.
+        # `search_at` indexes `grid.search_hits`; `search_jump` asks the next
+        # draw to scroll that match into view.
+        self.search = None
+        self.search_at = None
+        self.search_jump = False
         self.typed = ""
+        # Cursor index into `typed`. None is the end, so a draft set from
+        # outside (a test, a widget reset) keeps typing at the end.
+        self.pos = None
+        # Input history: index into `sent_history()` while Up/Down browse it,
+        # and the draft that was there before the first Up.
+        self.hist_at = None
+        self.hist_draft = ("", None)
         self.error = ""
+        # A neutral or success line for the footer, not drawn as an error.
+        self.notice = ""
+        self.notice_at = None
+        # Failed thread reads in a row, when the next one starts, and its error.
+        self.read_failures = 0
+        self.retry_at = None
+        self.read_error = ""
+        # Entries a full read asks for, whether the last one filled it (so more
+        # may sit before it), and whether an older read is out.
+        self.limit = READ_LIMIT
+        self.more_history = False
+        self.loading_older = False
         self.resume = herdr.resume_arg(target)
         bot = roster.ROSTER.get(target) or {}
         self.avatar_color = bot.get("avatarColor") or bot.get("avatar_color") or ""
@@ -78,6 +115,20 @@ class Chat:
             return STREAM_DELAY if self.quiet == 0 else SETTLE_DELAY
         return IDLE_DELAYS[min(self.idle_polls, len(IDLE_DELAYS) - 1)]
 
+    def show_notice(self, text):
+        self.notice = text
+        self.notice_at = activity.clock()
+
+    def expire_notice(self, any_key=False):
+        """Drop the notice after NOTICE_SECONDS, or at once on a key. True if it went."""
+        if not self.notice:
+            return False
+        if any_key or self.notice_at is None or activity.clock() - self.notice_at >= NOTICE_SECONDS:
+            self.notice = ""
+            self.notice_at = None
+            return True
+        return False
+
     def nudge(self):
         self.idle_polls = 0
 
@@ -115,9 +166,9 @@ class Chat:
             self.cursor = page["cursor"]
             fresh = []
         else:
-            fresh = list(page["entries"])
-            for entry in fresh:
-                self._absorb(entry)
+            # Only new or changed entries count. A gateway that returns the
+            # cursor entry again would otherwise keep the turn `working`.
+            fresh = [entry for entry in page["entries"] if self._absorb(entry)]
             if page["cursor"]:
                 self.cursor = page["cursor"]
         self._stamp_answered()
@@ -146,19 +197,23 @@ class Chat:
         return False
 
     def _absorb(self, entry):
+        """Merge one polled entry. False when it was already on screen unchanged."""
         entry_id = entry.get("id") if isinstance(entry, dict) else None
         if isinstance(entry_id, str) and entry_id:
             for index, existing in enumerate(self.messages):
                 if existing.get("id") == entry_id:
+                    if existing == entry:
+                        return False
                     self.messages[index] = entry
-                    return
+                    return True
         if self._take_local(entry):
-            return
+            return True
         index = next((i for i, local in enumerate(self.messages) if local.get("local")), None)
         if index is None:
             self.messages.append(entry)
         else:
             self.messages.insert(index, entry)
+        return True
 
     def _stamp_answered(self):
         """A poll that still says pending must not undo a decision just sent."""
@@ -436,21 +491,93 @@ class Chat:
         if self.full_reload:
             self.full_reload = False
             self.replacing = True
-            return (self.target,)
+            return self.full_read()
         if self.cursor:
             return (self.target, self.cursor)
+        return self.full_read()
+
+    def full_read(self):
+        # A full read keeps the older entries already loaded.
+        if self.limit > READ_LIMIT:
+            return (self.target, None, self.limit)
         return (self.target,)
 
-    def read_failed(self):
+    def take_older(self):
+        """The `read_thread` args for older entries, or None when there is nothing to ask.
+
+        Only an idle chat whose last full read was full asks, so a reply that
+        lands in the same read is never missed by `watch_step`.
+        """
+        if (
+            not self.loaded
+            or self.loading_older
+            or not self.more_history
+            or self.limit >= HISTORY_MAX
+            or self.phase not in {"idle", "done"}
+            or self.read_failures
+        ):
+            return None
+        self.loading_older = True
+        return (self.target, None, min(self.limit + HISTORY_STEP, HISTORY_MAX))
+
+    def ingest_older(self, page, limit):
+        """A larger full read. Returns how many entries it added at the top."""
+        self.loading_older = False
+        self.read_back()
+        before = len([entry for entry in self.messages if not entry.get("local")])
+        self.apply(page, replace=True)
+        added = max(len(page["entries"]) - before, 0)
+        self.limit = limit
+        self.more_history = added > 0 and len(page["entries"]) >= limit
+        return added
+
+    def older_failed(self):
+        self.loading_older = False
+
+    def read_failed(self, message=""):
+        """Note a failed read. Returns the seconds until the retry, backing off."""
         if self.replacing:
             self.replacing = False
             self.full_reload = True
+        self.read_failures += 1
+        self.read_error = message
+        delay = RETRY_DELAYS[min(self.read_failures - 1, len(RETRY_DELAYS) - 1)]
+        self.retry_at = activity.clock() + delay
+        return delay
+
+    def offline_label(self):
+        """`offline · retrying in Ns` after a failed read, else ""."""
+        if not self.read_failures:
+            return ""
+        left = math.ceil(max((self.retry_at or 0) - activity.clock(), 0))
+        return f"offline · retrying in {left}s" if left else "offline · retrying…"
+
+    def read_back(self):
+        """A good read after failures: drop the read error and say so briefly."""
+        if not self.read_failures:
+            return False
+        self.read_failures = 0
+        self.retry_at = None
+        if self.error == self.read_error:
+            self.error = ""
+        self.read_error = ""
+        self.show_notice("reconnected")
+        return True
+
+    def footer_error(self):
+        """The red footer text: the offline countdown, then the last error."""
+        label = self.offline_label()
+        if label and self.error:
+            return f"{label} · {self.error}"
+        return label or self.error
 
     def ingest(self, page, first=False):
+        self.read_back()
         replace = first or not self.cursor or page["gap_reset"] or self.replacing
         self.replacing = False
         if replace:
             self.apply(page, replace=True)
+            self.more_history = len(page["entries"]) >= self.limit
             fresh = []
             # An older answer is not this turn's reply. Counting it would
             # clear `working` after two quiet polls while the bot is still going.
@@ -495,11 +622,55 @@ class Chat:
         self.note(phase)
         self.sync_activity()
 
+    def edit(self, change, *args):
+        """Apply a `draft` function to the draft and the cursor."""
+        self.typed, self.pos = change(self.typed, self.pos, *args)
+
+    def type_text(self, value):
+        self.edit(draft.insert, value)
+
+    def sent_history(self):
+        """Your earlier messages in this chat, oldest first, repeats folded.
+
+        Read from the transcript, so it covers what the cache and the server
+        have, and editing a recalled line cannot change it.
+        """
+        out = []
+        for entry in self.messages:
+            if not isinstance(entry, dict) or not transcript.is_user(entry):
+                continue
+            text = transcript.entry_text(entry).strip()
+            if text and (not out or out[-1] != text):
+                out.append(text)
+        return out
+
+    def recall(self, delta):
+        """Up (-1) or Down (1) through the history. False when there is nothing to move to."""
+        past = self.sent_history()
+        if self.hist_at is None:
+            if delta > 0 or not past:
+                return False
+            self.hist_draft = (self.typed, self.pos)
+            at = len(past) - 1
+        else:
+            at = self.hist_at + delta
+            if at < 0:
+                return False
+            if at >= len(past):
+                self.hist_at = None
+                self.typed, self.pos = self.hist_draft
+                return True
+        self.hist_at = at
+        self.typed, self.pos = past[at], None
+        return True
+
     def arm_send(self):
         text = self.typed.strip()
         if not text:
             return ""
         self.typed = ""
+        self.pos = None
+        self.hist_at = None
         self.error = ""
         self.saw_other = False
         self.quiet = 0

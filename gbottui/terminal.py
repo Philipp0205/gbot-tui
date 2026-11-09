@@ -6,6 +6,19 @@ import subprocess
 import sys
 
 
+def notify(text):
+    """BEL, then OSC 9 (ESC ] 9 ; text BEL): a desktop notification where the terminal has one."""
+    clean = "".join(ch if ch.isprintable() else " " for ch in str(text)).replace("\x9c", " ")
+    return b"\x07\x1b]9;" + clean[:200].encode("utf-8", "replace") + b"\x07"
+
+
+def osc52(text):
+    """ESC ] 52 ; c ; <base64> BEL: put `text` on the terminal's clipboard."""
+    import base64
+
+    return b"\x1b]52;c;" + base64.b64encode(text.encode("utf-8")) + b"\x07"
+
+
 def write_tty(data):
     try:
         tty = os.open("/dev/tty", os.O_WRONLY)

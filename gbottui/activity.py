@@ -384,6 +384,29 @@ def with_activity(bots):
     return views
 
 
+def newly_blocked(previous, views):
+    """Names that turned `needs you` since `previous` ({name: state}), and the new map.
+
+    A bot first seen in this map is the baseline, so opening the list does not
+    ring for every bot that already needs you. Each transition counts once:
+    the bot has to leave `needs you` before it can ring again.
+    """
+    states = {}
+    fresh = []
+    for bot in views:
+        name = bot.get("name") or ""
+        state = ((bot.get("activity") or {}).get("state")) or ""
+        if not name:
+            continue
+        states[name] = state
+        before = previous.get(name)
+        if state == "blocked" and before is not None and before != "blocked":
+            fresh.append(name)
+    for name, state in previous.items():
+        states.setdefault(name, state)
+    return fresh, states
+
+
 def order_bots(bots):
     """Most recent message first. A search does not use this order."""
     ranked = []

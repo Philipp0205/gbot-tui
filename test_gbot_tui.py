@@ -20,6 +20,7 @@ from gbottui import (
     chat_state,
     chat_view,
     colors,
+    draft,
     gbot_cli,
     grid,
     herdr,
@@ -210,6 +211,26 @@ class WatchTests(unittest.TestCase):
             False,
         )
         self.assertEqual((phase, quiet, saw), ("working", 0, False))
+
+    def test_a_cursor_entry_returned_again_does_not_keep_working(self):
+        def page(*entries):
+            return {"entries": list(entries), "cursor": entries[-1]["id"] if entries else "", "gap_reset": False, "name": "", "id": ""}
+
+        chat = chat_state.Chat("Researcher")
+        chat.ingest(page({"id": "m1", "role": "assistant", "text": "old"}), first=True)
+        _typed(chat, "hi")
+        self.assertEqual(chat_screen.chat_key(chat, "\r", None)[0], "send")
+        self.assertEqual(chat.phase, "working")
+        reply = {"id": "m3", "role": "assistant", "text": "the answer"}
+        chat.ingest(page({"id": "m2", "role": "user", "text": "hi"}, reply))
+        # The gateway keeps returning the `--after` entry, unchanged.
+        chat.ingest(page(dict(reply)))
+        self.assertEqual(chat.phase, "working")
+        chat.ingest(page(dict(reply)))
+        self.assertEqual(chat.phase, "done")
+        # A changed copy of the same id is still new text.
+        chat.ingest(page({"id": "m3", "role": "assistant", "text": "the answer, longer"}))
+        self.assertEqual(chat.quiet, 0)
 
     def test_pending_approval_blocks(self):
         entries = [
@@ -953,6 +974,39 @@ class LookTests(unittest.TestCase):
         self.assertEqual(grid.header_gap(2, "what to cook", 10), 1)
         self.assertEqual(grid.header_gap(2, "", 10), 0)
         self.assertEqual(grid.header_gap(0, "tag", 10), 0)
+
+    def test_an_empty_chat_says_loading_until_the_first_read(self):
+        class Screen:
+            def __init__(self):
+                self.rows = {}
+
+            def getmaxyx(self):
+                return (24, 58)
+
+            def erase(self):
+                self.rows.clear()
+
+            def addnstr(self, y, x, text, n, attr=0):
+                self.rows.setdefault(y, []).append(text[:n])
+
+            def move(self, y, x):
+                pass
+
+            def refresh(self):
+                pass
+
+        def shown(chat):
+            screen = Screen()
+            chat_view.draw(screen, chat)
+            return " ".join(" ".join(parts) for parts in screen.rows.values())
+
+        chat = chat_state.Chat("Chef")
+        self.assertIn(chat_view.LOADING, shown(chat))
+        chat.error = "gateway is down"
+        self.assertNotIn(chat_view.LOADING, shown(chat))
+        chat.error = ""
+        chat.loaded = True
+        self.assertNotIn(chat_view.LOADING, shown(chat))
 
     def test_pick_restores_blocking_input(self):
         class Screen:
@@ -3287,6 +3341,572 @@ class TokenTests(unittest.TestCase):
     def test_garbage_counts_as_live(self):
         self.assertFalse(backend.token_expired(""))
         self.assertFalse(backend.token_expired("not.a.jwt"))
+
+
+class CursorScreen(FakeScreen):
+    def move(self, y, x):
+        self.cursor = (y, x)
+
+
+def _typed(chat, keys, screen=None):
+    for key in keys:
+        chat_screen.chat_key(chat, key, screen)
+
+
+class ComposerEditTests(unittest.TestCase):
+    def test_left_right_insert_and_backspace_at_the_cursor(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "helo")
+        _typed(chat, [curses.KEY_LEFT, "l"])
+        self.assertEqual((chat.typed, chat.pos), ("hello", 4))
+        _typed(chat, [curses.KEY_LEFT, curses.KEY_LEFT, "\x7f"])
+        self.assertEqual((chat.typed, chat.pos), ("hllo", 1))
+        _typed(chat, [curses.KEY_DC])
+        self.assertEqual((chat.typed, chat.pos), ("hlo", 1))
+        _typed(chat, [curses.KEY_RIGHT] * 5 + ["!"])
+        self.assertEqual(chat.typed, "hlo!")
+
+    def test_line_start_end_and_kills(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "one two\nthree four")
+        _typed(chat, ["\x01"])
+        self.assertEqual(chat.pos, len("one two\n"))
+        _typed(chat, [curses.KEY_END])
+        self.assertEqual(chat.pos, len(chat.typed))
+        _typed(chat, ["\x17"])
+        self.assertEqual(chat.typed, "one two\nthree ")
+        _typed(chat, [curses.KEY_HOME, "\x0b"])
+        self.assertEqual(chat.typed, "one two\n")
+        _typed(chat, ["\x7f", "\x05", "\x15"])
+        self.assertEqual((chat.typed, chat.pos), ("", 0))
+
+    def test_word_jumps(self):
+        self.assertEqual(draft.word_left("say hello there", 15), ("say hello there", 10))
+        self.assertEqual(draft.word_left("say hello there", 10), ("say hello there", 4))
+        self.assertEqual(draft.word_right("say hello there", 0), ("say hello there", 3))
+        self.assertEqual(draft.word_right("say hello there", 3), ("say hello there", 9))
+        original = curses.keyname
+        curses.keyname = lambda key: {601: b"kLFT5", 602: b"kRIT3"}.get(key, b"KEY_OTHER")
+        try:
+            chat = chat_state.Chat("Researcher")
+            _typed(chat, "say hello")
+            _typed(chat, [601])
+            self.assertEqual(chat.pos, 4)
+            _typed(chat, [601, 602])
+            self.assertEqual(chat.pos, 3)
+        finally:
+            curses.keyname = original
+
+    def test_kill_line_start_and_end_join_lines_at_an_edge(self):
+        self.assertEqual(draft.kill_line_start("ab\ncd", 3), ("abcd", 2))
+        self.assertEqual(draft.kill_line_end("ab\ncd", 2), ("abcd", 2))
+        self.assertEqual(draft.kill_word("a  b  ", 6), ("a  ", 3))
+
+    def test_cursor_is_drawn_inside_a_wrapped_draft(self):
+        text = "abcdefghij klmnopqrst uvwxyz"
+        rows = grid.draft_rows(text, 20)
+        self.assertEqual([row[0] for row in rows], grid.draft_lines(text, 20))
+        self.assertEqual(grid.draft_cursor(text, len(text), 20)[0], len(rows) - 1)
+        self.assertEqual(grid.draft_cursor(text, 2, 20), (0, 2))
+        chat = chat_state.Chat("Researcher")
+        chat.typed, chat.pos = text, 2
+        screen = CursorScreen(24, 20)
+        chat_view.draw(screen, chat)
+        y, x = screen.cursor
+        _header, body, _box, _footer = grid.layout(24, len(rows))
+        self.assertEqual((y, x), (grid.layout(24, len(rows))[0] + body + 1, 7))
+        chat.pos = None
+        chat_view.draw(screen, chat)
+        self.assertEqual(screen.cursor[0], y + len(rows) - 1)
+
+    def test_draft_row_keeps_the_hanging_pad(self):
+        rows = grid.draft_rows("- one two three four five", 16)
+        self.assertEqual(rows[1][3], "  ")
+        self.assertTrue(rows[1][0].startswith("  "))
+
+    def test_up_down_move_between_draft_lines(self):
+        chat = chat_state.Chat("Researcher")
+        screen = FakeScreen(24, 80)
+        _typed(chat, "first line" + "\n" + "second", screen)
+        _typed(chat, [curses.KEY_UP], screen)
+        self.assertEqual(chat.pos, 6)
+        _typed(chat, ["X"], screen)
+        self.assertEqual(chat.typed, "first Xline\nsecond")
+        _typed(chat, [curses.KEY_DOWN, curses.KEY_END, "!"], screen)
+        self.assertEqual(chat.typed, "first Xline\nsecond!")
+
+    def test_old_keys_still_work_with_a_cursor(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "hi")
+        _typed(chat, [curses.KEY_LEFT, "\n"])
+        self.assertEqual(chat.typed, "h\ni")
+        self.assertEqual(chat_screen.chat_key(chat, "\r", None), ("send", ("Researcher", "h\ni")))
+        self.assertEqual((chat.typed, chat.pos), ("", None))
+
+
+class HistoryTests(unittest.TestCase):
+    def test_up_recalls_sent_messages_and_down_goes_back(self):
+        chat = chat_state.Chat("Researcher")
+        chat.messages = [
+            {"role": "user", "text": "first"},
+            {"role": "assistant", "text": "ok"},
+            {"role": "user", "text": "second"},
+            {"role": "user", "text": "second"},
+        ]
+        screen = FakeScreen(24, 80)
+        _typed(chat, "draft", screen)
+        _typed(chat, [curses.KEY_UP], screen)
+        self.assertEqual(chat.typed, "second")
+        _typed(chat, [curses.KEY_UP], screen)
+        self.assertEqual(chat.typed, "first")
+        _typed(chat, [curses.KEY_UP], screen)
+        self.assertEqual(chat.typed, "first")
+        _typed(chat, ["!"], screen)
+        self.assertEqual(chat.sent_history(), ["first", "second"])
+        _typed(chat, [curses.KEY_DOWN], screen)
+        self.assertEqual(chat.typed, "second")
+        _typed(chat, [curses.KEY_DOWN], screen)
+        self.assertEqual((chat.typed, chat.pos), ("draft", 5))
+        self.assertFalse(chat.recall(1))
+
+    def test_a_sent_message_joins_the_history(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "hello")
+        self.assertEqual(chat_screen.chat_key(chat, "\r", None)[0], "send")
+        _typed(chat, [curses.KEY_UP], FakeScreen(24, 80))
+        self.assertEqual(chat.typed, "hello")
+        self.assertEqual(chat_screen.chat_key(chat, "\r", None)[0], "send")
+        self.assertIsNone(chat.hist_at)
+
+    def test_up_inside_a_multi_line_draft_moves_first(self):
+        chat = chat_state.Chat("Researcher")
+        chat.messages = [{"role": "user", "text": "old"}]
+        screen = FakeScreen(24, 80)
+        _typed(chat, "a\nb", screen)
+        _typed(chat, [curses.KEY_UP], screen)
+        self.assertEqual(chat.typed, "a\nb")
+        _typed(chat, [curses.KEY_UP], screen)
+        self.assertEqual(chat.typed, "old")
+
+
+class _KeyFeed:
+    """get_wch over a list; `timeout` is recorded, not slept."""
+
+    def __init__(self, keys):
+        self.keys = list(keys)
+        self.timeouts = []
+
+    def get_wch(self):
+        if not self.keys:
+            raise curses.error("no input")
+        return self.keys.pop(0)
+
+    def timeout(self, ms):
+        self.timeouts.append(ms)
+
+
+class EscapeSequenceTests(unittest.TestCase):
+    def test_csi_and_ss3_arrows_are_arrows(self):
+        for seq, key in (
+            ("\x1b[D", curses.KEY_LEFT),
+            ("\x1b[C", curses.KEY_RIGHT),
+            ("\x1b[A", curses.KEY_UP),
+            ("\x1b[B", curses.KEY_DOWN),
+            ("\x1b[H", curses.KEY_HOME),
+            ("\x1b[F", curses.KEY_END),
+            ("\x1bOD", curses.KEY_LEFT),
+            ("\x1bOH", curses.KEY_HOME),
+            ("\x1b[3~", curses.KEY_DC),
+            ("\x1b[5~", curses.KEY_PPAGE),
+            ("\x1b[6~", curses.KEY_NPAGE),
+            ("\x1b[1~", curses.KEY_HOME),
+            ("\x1b[4~", curses.KEY_END),
+        ):
+            self.assertEqual(paint.decode_keys(list(seq)), [key], seq)
+
+    def test_modified_arrows_use_the_terminfo_names(self):
+        original = curses.keyname
+        names = {601: b"kLFT5", 602: b"kRIT3"}
+        curses.keyname = lambda key: names.get(key, b"KEY_OTHER")
+        paint._NAMED = None
+        try:
+            keys = paint.decode_keys(list("\x1b[1;5D\x1b[1;3C\x1b[1;7Z"))
+            self.assertEqual(keys, [601, 602])
+            self.assertIs(chat_screen.edit_motion(keys[0]), draft.word_left)
+            self.assertIs(chat_screen.edit_motion(keys[1]), draft.word_right)
+            # A modifier terminfo has no name for is the plain arrow.
+            self.assertEqual(paint.decode_keys(list("\x1b[1;2D")), [curses.KEY_LEFT])
+        finally:
+            curses.keyname = original
+            paint._NAMED = None
+
+    def test_a_lone_escape_stays_escape(self):
+        self.assertEqual(paint.decode_keys(["\x1b"]), ["\x1b"])
+        self.assertEqual(paint.decode_keys([27]), ["\x1b"])
+        self.assertEqual(paint.decode_keys(["\x1b", "\x1b"]), ["\x1b", "\x1b"])
+        self.assertEqual(paint.decode_keys(["\x1b", curses.KEY_LEFT]), ["\x1b", curses.KEY_LEFT])
+
+    def test_unknown_or_alt_sequences_are_dropped_not_escape(self):
+        self.assertEqual(paint.decode_keys(list("\x1b[99z")), [])
+        self.assertEqual(paint.decode_keys(list("\x1bx")), [])
+
+    def test_bracketed_paste_keeps_newlines_in_the_draft(self):
+        paint.PASTING = False
+        try:
+            keys = paint.decode_keys(list("\x1b[200~one\rtwo"))
+            self.assertTrue(paint.PASTING)
+            keys += paint.decode_keys(list("\rthree\x1b[201~\r"))
+            self.assertFalse(paint.PASTING)
+        finally:
+            paint.PASTING = False
+        self.assertEqual(keys, list("one\ntwo\nthree\r"))
+        chat = chat_state.Chat("Researcher")
+        results = [chat_screen.chat_key(chat, key, None) for key in keys[:-1]]
+        self.assertEqual(results, [None] * len(results))
+        self.assertEqual(chat.typed, "one\ntwo\nthree")
+        self.assertEqual(chat_screen.chat_key(chat, keys[-1], None)[0], "send")
+
+    def test_keys_around_a_sequence_keep_their_order(self):
+        self.assertEqual(paint.decode_keys(list("ab\x1b[Dc")), ["a", "b", curses.KEY_LEFT, "c"])
+
+    def test_a_split_sequence_reads_the_rest_within_the_delay(self):
+        screen = _KeyFeed(["[", "D"])
+        more = paint.follow_up(screen, 0)
+        self.assertEqual(paint.decode_keys(["\x1b"], more), [curses.KEY_LEFT])
+        self.assertIn(paint.ESC_WAIT_MS, screen.timeouts)
+        self.assertEqual(screen.timeouts[-1], 0)
+
+    def test_read_keys_decodes_csi_and_the_chat_stays_open(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "abc")
+        for key in paint.read_keys(_KeyFeed(list("\x1b[DX"))):
+            self.assertIsNone(chat_screen.chat_key(chat, key, None))
+        self.assertEqual(chat.typed, "abXc")
+        self.assertEqual(chat_screen.chat_key(chat, paint.read_keys(_KeyFeed(["\x1b"]))[0], None), "back")
+
+
+class KeyHelpTests(unittest.TestCase):
+    def test_question_mark_or_f1_opens_help_and_any_key_closes_it(self):
+        chat = chat_state.Chat("Researcher")
+        self.assertIsNone(chat_screen.chat_key(chat, "?", None))
+        self.assertTrue(chat.help)
+        # Esc closes the overlay and stays in the chat.
+        self.assertIsNone(chat_screen.chat_key(chat, "\x1b", None))
+        self.assertFalse(chat.help)
+        self.assertIsNone(chat_screen.chat_key(chat, curses.KEY_F1, None))
+        self.assertTrue(chat.help)
+        self.assertIsNone(chat_screen.chat_key(chat, "x", None))
+        self.assertEqual((chat.help, chat.typed), (False, ""))
+
+    def test_a_question_mark_in_a_draft_is_text(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "why?")
+        self.assertEqual((chat.help, chat.typed), (False, "why?"))
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "??")
+        self.assertEqual((chat.help, chat.typed), (False, "?"))
+
+    def test_the_idle_footer_names_the_help_key(self):
+        self.assertIn("? keys", grid.footer_spans("idle", "")[0][0])
+
+
+def _search_chat(count=30):
+    chat = chat_state.Chat("Researcher")
+    chat.loaded = True
+    chat.messages = [{"id": f"m{i}", "role": "user" if i % 2 else "assistant", "text": f"line {i}" + (" apple" if i in (3, 20) else "")} for i in range(1, count + 1)]
+    chat.touch_rows()
+    return chat
+
+
+class SearchTests(unittest.TestCase):
+    def test_hits_are_case_folded_rows(self):
+        rows = [("text", "An Apple"), ("gap", ""), ("user", [("apple", "bold"), (" pie", "")]), ("text", "pear")]
+        self.assertEqual(grid.search_hits(rows, "APPLE"), [0, 2])
+        self.assertEqual(grid.search_hits(rows, ""), [])
+        self.assertEqual(grid.match_spans("apple Apple", "apple"), [(0, 5), (6, 11)])
+
+    def test_ctrl_f_opens_a_prompt_and_esc_closes_only_the_search(self):
+        chat = _search_chat()
+        self.assertIsNone(chat_screen.chat_key(chat, "\x06", None))
+        self.assertEqual(chat.search, "")
+        _typed(chat, "apple")
+        self.assertEqual((chat.search, chat.typed), ("apple", ""))
+        self.assertIsNone(chat_screen.chat_key(chat, "\x1b", None))
+        self.assertIsNone(chat.search)
+        self.assertEqual(chat_screen.chat_key(chat, "\x1b", None), "back")
+
+    def test_enter_and_ctrl_n_go_older_ctrl_p_newer_and_wrap(self):
+        chat = _search_chat()
+        _typed(chat, "\x06apple")
+        rows = grid.visible_rows(chat, 80)
+        hits = grid.search_hits(rows, "apple")
+        self.assertEqual(len(hits), 2)
+        self.assertEqual(chat_view.search_target(rows, chat)[0], hits[1])
+        chat_screen.chat_key(chat, "\r", None)
+        self.assertEqual(chat_view.search_target(rows, chat)[0], hits[0])
+        chat_screen.chat_key(chat, "\x0e", None)
+        self.assertEqual(chat_view.search_target(rows, chat)[0], hits[1])
+        chat_screen.chat_key(chat, "\x10", None)
+        self.assertEqual(chat_view.search_target(rows, chat)[0], hits[0])
+        # Enter in the search never sends.
+        self.assertEqual(chat.typed, "")
+
+    def test_draw_scrolls_to_the_match_and_shows_the_prompt(self):
+        chat = _search_chat(60)
+        screen = FakeScreen(12, 58)
+        chat_view.draw(screen, chat)
+        self.assertNotIn("apple", " ".join(" ".join(parts) for parts in screen.rows.values()))
+        _typed(chat, "\x06apple")
+        chat_screen.chat_key(chat, "\r", None)
+        chat_view.draw(screen, chat)
+        shown = " ".join(" ".join(parts) for parts in screen.rows.values())
+        self.assertIn("line 3 apple", shown)
+        self.assertIn("find: ", shown)
+        self.assertIn("1/2", shown)
+        self.assertFalse(chat.follow)
+
+    def test_no_match_says_so(self):
+        self.assertIn("  no match", [text for text, _style in grid.search_spans("zzz", [], None)])
+
+
+class CopyTests(unittest.TestCase):
+    def test_ctrl_o_copies_the_last_bot_reply_with_osc52(self):
+        sent = []
+        original = terminal.write_tty
+        terminal.write_tty = sent.append
+        try:
+            chat = _search_chat(4)
+            chat.messages.append({"id": "u", "role": "user", "text": "mine"})
+            self.assertIsNone(chat_screen.chat_key(chat, "\x0f", None))
+        finally:
+            terminal.write_tty = original
+        self.assertEqual(sent, [b"\x1b]52;c;" + base64.b64encode(b"line 4") + b"\x07"])
+        self.assertIn("Copied", chat.notice)
+        self.assertEqual(chat.error, "")
+        self.assertEqual(chat.typed, "")
+        self.assertTrue(any("ctrl-o" in keys for keys, _what in chat_view.HELP))
+
+
+class NoticeFooterTests(unittest.TestCase):
+    def test_a_notice_is_green_and_an_error_wins_over_it(self):
+        self.assertEqual(grid.footer_spans("idle", "", notice="Copied")[0], ("Copied", "green"))
+        self.assertEqual(grid.footer_spans("idle", "down", notice="Copied")[0], ("down", "red"))
+        self.assertEqual(grid.footer_spans("blocked", "", decide=True, notice="Copied")[0], ("Copied", "green"))
+        self.assertEqual(grid.footer_rows("idle", "", width=58, notice="Copied")[-1][0], ("Copied", "green"))
+
+    def test_a_notice_clears_after_a_few_seconds_or_on_the_next_key(self):
+        now = [100.0]
+        original = activity.clock
+        activity.clock = lambda: now[0]
+        try:
+            chat = _search_chat(4)
+            chat.show_notice("Copied")
+            self.assertFalse(chat.expire_notice())
+            now[0] += chat_state.NOTICE_SECONDS
+            self.assertTrue(chat.expire_notice())
+            self.assertEqual(chat.notice, "")
+            chat.show_notice("Copied")
+            chat_screen.chat_key(chat, "x", None)
+            self.assertEqual((chat.notice, chat.typed), ("", "x"))
+        finally:
+            activity.clock = original
+
+    def test_draw_shows_the_notice_not_the_hint(self):
+        chat = _search_chat(4)
+        chat.show_notice("Copied the last reply (6 chars).")
+        screen = FakeScreen(12, 58)
+        chat_view.draw(screen, chat)
+        self.assertIn("Copied the last reply", " ".join(screen.rows[11]))
+
+
+
+class ListHelpTests(unittest.TestCase):
+    def test_f1_or_question_mark_on_an_empty_search_opens_it(self):
+        self.assertTrue(picker.opens_help(curses.KEY_F1, ""))
+        self.assertTrue(picker.opens_help(curses.KEY_F1, "che"))
+        self.assertTrue(picker.opens_help("?", ""))
+        self.assertFalse(picker.opens_help("?", "che"))
+        self.assertFalse(picker.opens_help("x", ""))
+        self.assertIn("? keys", picker.LIST_HINT)
+
+    def test_the_list_shows_help_and_any_key_closes_it(self):
+        drawn = []
+
+        class Screen(FakeScreen):
+            def __init__(self, keys):
+                super().__init__(24, 80)
+                self.keys = list(keys)
+
+            def timeout(self, _ms):
+                pass
+
+            def keypad(self, _on):
+                pass
+
+            def bkgd(self, *_args):
+                pass
+
+            def get_wch(self):
+                drawn.append(" ".join(" ".join(parts) for parts in self.rows.values()))
+                if not self.keys:
+                    raise KeyboardInterrupt
+                return self.keys.pop(0)
+
+        bots = [{"name": "Chef", "title": "what to cook"}]
+        screen = Screen(["?", "x", "\r"])
+        originals = (activity.Survey, picker.paint.fast_escape, picker.paint.place_cursor, picker.terminal.enable_wheel)
+
+        class Quiet:
+            def __init__(self, _bots):
+                pass
+
+            def status(self):
+                return False, 0, 0, 0
+
+            def problem(self):
+                return ""
+
+            def close(self):
+                pass
+
+        activity.Survey = Quiet
+        picker.paint.fast_escape = picker.paint.place_cursor = picker.terminal.enable_wheel = lambda *a: None
+        try:
+            self.assertEqual(picker.pick(screen, bots), "Chef")
+        finally:
+            activity.Survey, picker.paint.fast_escape, picker.paint.place_cursor, picker.terminal.enable_wheel = originals
+        self.assertNotIn("Keys", drawn[0])
+        self.assertIn("Keys  (any key closes)", drawn[1])
+        self.assertIn("open the bot", drawn[1])
+        self.assertNotIn("what to cook", drawn[1])
+        # "x" closed it and did not start a search.
+        self.assertIn("what to cook", drawn[2])
+        self.assertNotIn("/x", drawn[2])
+
+
+def _views(**states):
+    return [{"name": name, "activity": {"state": state}} for name, state in states.items()]
+
+
+class NeedsYouBellTests(unittest.TestCase):
+    def test_osc9_is_bell_then_esc_9_text_bel(self):
+        self.assertEqual(terminal.notify("Chef needs you"), b"\x07\x1b]9;Chef needs you\x07")
+        # A control byte in a bot name cannot end the sequence early.
+        self.assertEqual(terminal.notify("a\x07b\x1bc"), b"\x07\x1b]9;a b c\x07")
+
+    def test_only_a_new_transition_rings_and_only_once(self):
+        fresh, states = activity.newly_blocked({}, _views(Chef="blocked", Researcher="idle"))
+        self.assertEqual(fresh, [])  # the first look is the baseline
+        fresh, states = activity.newly_blocked(states, _views(Chef="blocked", Researcher="blocked"))
+        self.assertEqual(fresh, ["Researcher"])
+        fresh, states = activity.newly_blocked(states, _views(Chef="blocked", Researcher="blocked"))
+        self.assertEqual(fresh, [])
+        fresh, states = activity.newly_blocked(states, _views(Chef="blocked", Researcher="idle"))
+        fresh, states = activity.newly_blocked(states, _views(Chef="blocked", Researcher="blocked"))
+        self.assertEqual(fresh, ["Researcher"])
+        # A bot new to the list is a baseline too.
+        fresh, states = activity.newly_blocked(states, _views(Chef="blocked", Researcher="blocked", New="blocked"))
+        self.assertEqual(fresh, [])
+
+
+def _thread(first, last):
+    entries = [{"id": f"m{i}", "role": "user" if i % 2 else "assistant", "text": f"line {i}"} for i in range(first, last + 1)]
+    return transcript.parse_thread({"transcript": {"entries": entries}})
+
+
+class OlderHistoryTests(unittest.TestCase):
+    def test_a_full_first_read_offers_older_entries_with_a_larger_limit(self):
+        chat = chat_state.Chat("Chef")
+        chat.ingest(_thread(21, 100), first=True)
+        self.assertTrue(chat.more_history)
+        args = chat.take_older()
+        self.assertEqual(args, ("Chef", None, 160))
+        self.assertIsNone(chat.take_older())  # one at a time
+        self.assertEqual(chat.ingest_older(_thread(1, 100), 160), 20)
+        self.assertEqual(chat.messages[0]["id"], "m1")
+        self.assertFalse(chat.more_history)  # 100 < 160: that was the start
+        self.assertIsNone(chat.take_older())
+        # A later full reload keeps the older rows.
+        chat.full_reload = True
+        self.assertEqual(chat.take_read(), ("Chef", None, 160))
+
+    def test_a_short_thread_or_a_busy_chat_does_not_ask(self):
+        chat = chat_state.Chat("Chef")
+        chat.ingest(_thread(1, 30), first=True)
+        self.assertIsNone(chat.take_older())
+        chat = chat_state.Chat("Chef")
+        chat.ingest(_thread(21, 100), first=True)
+        chat.phase = "working"
+        self.assertIsNone(chat.take_older())
+
+    def test_page_up_at_the_top_queues_the_older_read(self):
+        chat = chat_state.Chat("Chef")
+        chat.ingest(_thread(21, 100), first=True)
+        screen = FakeScreen(12, 58)
+        chat_view.draw(screen, chat)
+        job = None
+        saved = getattr(curses, "LINES", None)
+        curses.LINES = 12
+        try:
+            for _ in range(60):
+                job = chat_screen.chat_key(chat, curses.KEY_PPAGE, screen) or job
+                if job:
+                    break
+        finally:
+            if saved is None:
+                del curses.LINES
+            else:
+                curses.LINES = saved
+        self.assertEqual(job, ("older", ("Chef", None, 160)))
+        self.assertEqual(chat.scroll, 0)
+        self.assertIn("older", chat.notice)
+
+
+class OfflineTests(unittest.TestCase):
+    def setUp(self):
+        self.now = [50.0]
+        self.original = activity.clock
+        activity.clock = lambda: self.now[0]
+
+    def tearDown(self):
+        activity.clock = self.original
+
+    def test_failed_reads_back_off_and_the_footer_counts_down(self):
+        chat = chat_state.Chat("Chef")
+        delays = [chat.read_failed("gateway is down") for _ in range(7)]
+        self.assertEqual(delays[:5], list(chat_state.RETRY_DELAYS))
+        self.assertEqual(delays[-1], chat_state.RETRY_DELAYS[-1])
+        chat = chat_state.Chat("Chef")
+        chat.error = "gateway is down"
+        chat.read_failed("gateway is down")
+        self.assertEqual(chat.offline_label(), "offline · retrying in 2s")
+        self.now[0] += 1.2
+        self.assertEqual(chat.offline_label(), "offline · retrying in 1s")
+        self.now[0] += 1.0
+        self.assertEqual(chat.offline_label(), "offline · retrying…")
+        self.assertEqual(chat.footer_error(), "offline · retrying… · gateway is down")
+        self.assertEqual(grid.footer_spans("idle", chat.footer_error())[0][1], "red")
+
+    def test_the_next_good_read_says_reconnected_once(self):
+        chat = chat_state.Chat("Chef")
+        page = transcript.parse_thread({"transcript": {"entries": [{"id": "m1", "role": "assistant", "text": "hi"}]}})
+        chat.ingest(page, first=True)
+        self.assertEqual(chat.notice, "")
+        chat.error = "gateway is down"
+        chat.read_failed("gateway is down")
+        chat.ingest(transcript.parse_thread({"transcript": {"entries": []}, "cursor": "m1"}))
+        self.assertEqual((chat.error, chat.offline_label(), chat.notice), ("", "", "reconnected"))
+        self.now[0] += chat_state.NOTICE_SECONDS
+        chat.expire_notice()
+        chat.ingest(transcript.parse_thread({"transcript": {"entries": []}, "cursor": "m1"}))
+        self.assertEqual(chat.notice, "")
+
+    def test_a_send_error_survives_a_good_read(self):
+        chat = chat_state.Chat("Chef")
+        chat.read_failed("gateway is down")
+        chat.error = "send failed"
+        chat.ingest(transcript.parse_thread({"transcript": {"entries": []}}), first=True)
+        self.assertEqual(chat.error, "send failed")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,64 @@
+# Parity with the Grok Bot desktop chat
+
+What the desktop app's chat does, and where gbot-tui stands. The backend is fixed: the `gbot` calls in `gbottui/gbot_cli.py` (`bots list`, `thread [--after]`, `send`, `approvals respond`, the opt-in widget hook) and the two Cursor calls in `gbottui/backend.py` (`ListGrokBotAgentStatuses`, `SetGrokBotAgentClientState` mark-read). A Gap is something those calls already allow. Not possible needs a call the repo does not make.
+
+`bench/e2e_tui.py` runs the scenarios named in the last column against `bench/mock_gbot.py`.
+
+| Feature | State | Where / why | e2e |
+|---|---|---|---|
+| Bot list with status (needs you / unread / working / idle) | Done | `picker.py` `pick`, `activity.py` `Survey`, `with_activity` | 01 |
+| Unread counts and order from the server | Done | `backend.refresh_server_state`, `activity.order_bots` | |
+| Mark read on leave | Done | `backend.mark_read_later`, `app.leave_chat` | |
+| Filter the list | Done | `picker.fuzzy_bots`, `preview_score` | 02 |
+| Open a bot, switch bots | Done | `app.screens` (Enter / Esc share one curses session) | 03, 11, 12 |
+| Open by name from the shell | Done | `app.main`, `roster` prefix match | 14, 15 |
+| `@bot task` route from inside a chat | Done | `roster.parse_route`, `chat_key` "route" | |
+| Switch conversations within a bot | Not possible | `gbot thread` reads one transcript per target; no list-of-threads call is used | |
+| New conversation | Not possible | no new-thread / reset call in `gbot_cli.py` | |
+| Streaming replies | Done | polls at 0.3s; an entry with the same id replaces its row (`Chat._absorb`); `isStreaming` keeps `working` | 04 |
+| Working / generating indicator | Done | header `· working`, footer `Generating` (`paint.title_spans`, `grid.footer_spans`); a re-sent unchanged cursor entry is a quiet poll (`Chat._absorb`) | 04, 20, 21 |
+| Scrollback (PgUp/PgDn, Alt-Pg half, wheel) | Done | `chat_key`, `terminal.page_motion`, `wheel_direction` | 06 |
+| Long output | Done | word wrap with hanging indent, follow-tail (`grid.wrap`, `chat_view.draw`) | 05 |
+| Older history than the last 80 entries | Done | scrolling up at the top asks `gbot thread --limit <n+80>` (`Chat.take_older`, `ingest_older`, `chat_screen.older_job`), up to 800; the view keeps its rows; there is no read before the oldest id, so it is a larger tail, not a page | 30 |
+| Multiline composer (Ctrl-Enter / Ctrl-J newline) | Done | `chat_key` `"\n"`; box grows (`grid.layout`) | 07 |
+| Cursor movement within the draft (Left/Right/Up/Down) | Done | `Chat.pos`, `draft.py`, `grid.draft_cursor` / `draft_vertical`, drawn by `chat_view.draw` | 16, 17 |
+| Home/End, Ctrl-A/E, word jumps (Alt/Ctrl-Left/Right), Ctrl-W, Ctrl-U, Ctrl-K, Delete | Done | `chat_screen.edit_motion`, `draft.py` | 16 |
+| Input history (Up on empty draft recalls last sent) | Done | `Chat.sent_history` / `recall` over the user rows in `chat.messages`, in memory | 18 |
+| Arrow keys as CSI (`ESC [ D`) or SS3 (`ESC O D`) | Done | `paint.decode_keys` in `read_keys` and the picker; only a lone Esc goes back | 19 |
+| Paste | Done | `paint.read_keys` drains all keys before one redraw | 22 |
+| Bracketed paste (keep newlines in a paste) | Done | the chat sets `?2004h`; `paint.decode_keys` turns Enter inside `ESC[200~`…`ESC[201~` into a draft newline | 22 |
+| Approvals (y / n) | Done | `transcript.approval_of`, `Chat.begin_decision`, `gbot_cli.respond_approval` | 08 |
+| Widgets / choices (single, multi, steps, custom) | Done | `widgets.py`, `chat_screen.choice_key`; answer is a `send` | 09 |
+| Attachments display | Done (text) | `transcript.attachment_text` shows name and size | |
+| Images inline | Not possible in a plain curses grid | could print the file name and offer open-in-viewer only if the thread carries a URL | |
+| File upload / send attachments | Not possible | `gbot send` takes text only | |
+| Markdown: headings, lists, emphasis, code blocks | Done | `markdown.py`; fences drop the ``` and indent the code, the language name sits on its own line | 05 |
+| Links (click to open) | Done | `terminal.LINK_HITS`, `open_link_at` | |
+| Key help | Done | `?` on an empty draft or F1 shows `chat_view.HELP` over the transcript, any key closes it; footer says `? keys`. In the bot list F1, or `?` on an empty search, shows `picker.LIST_HELP` in place of the rows; any key closes it | 23, 28 |
+| Search in transcript | Done | Ctrl-F opens a `find:` prompt in the footer (`chat_screen.search_key`); matches over `grid.visible_rows` are reverse video (`grid.search_hits`, `chat_view.paint_matches`); Enter / Ctrl-N older, Ctrl-P newer, wrapping; the view scrolls to the match; Esc closes only the search | 24 |
+| Copy a message | Done (last reply) | Ctrl-O writes OSC 52 of the newest bot message (`chat_screen.copy_last_reply`, `terminal.osc52`); footer `Copied the last reply (N chars).` as a green notice (`Chat.notice`, `grid.footer_spans`), cleared after 4s or on the next key; listed in `?` help; Shift-drag still selects | 25, 26 |
+| Resize | Done | `KEY_RESIZE`, layout per frame, `clearok` on size change (`chat_view.draw`) | 10 |
+| Empty / loading state | Done | picker `loading bots…` / `no match`; chat `Loading conversation…` until the first read when nothing is cached | 15 |
+| Error state | Done | red footer, long errors get up to 3 rows (`grid.footer_rows`); composer stays usable | 14 |
+| Reconnect | Done | a failed read retries with backoff 2, 4, 8, 15, 30s (`Chat.read_failed`, `chat_state.RETRY_DELAYS`) | 27 |
+| Explicit reconnecting / offline label | Done | footer `offline · retrying in Ns` counts down (`Chat.offline_label`, `footer_error`); `reconnected` notice on the next good read (`Chat.read_back`) | 14, 27 |
+| Theme (light / dark) | Done | `theme.py` OSC 11 probe, `GBOT_TUI_THEME` | |
+| Notifications | Partial | Herdr OSC 7501 state and tab name (`herdr.py`); bell + OSC 9 for needs you (below); no notice for a plain reply in another bot | |
+| Bell / OSC 9 notify on needs-you while in the list | Done | `picker.pick` writes `terminal.notify` (BEL, `ESC ] 9 ; <name> needs you BEL`) for each name `activity.newly_blocked` returns; once per transition, the first look is the baseline | 29 |
+| Settings screen | Not possible | no settings call; theme is env only | |
+| Bot avatar and color | Done | `styles.dot_attr`, `icons.py` for Herdr | |
+| Thinking / progress lines hidden | Done | `transcript.is_thinking`, `hidden_status_ids` | |
+| Voice input / output | Not possible | no audio path in a terminal or in `gbot` | |
+| Edit / delete / regenerate a message | Not possible | no such `gbot` command | |
+| Stop generation | Not possible | no cancel call in `gbot_cli.py` | |
+
+## Recommended for session 2, in order
+
+1. Composer cursor: Left/Right, Home/End, Ctrl-A/E, word jumps, Ctrl-W/U, Delete. The biggest everyday gap.
+2. Input history on Up/Down with an empty draft (or cursor on the first line).
+3. Bracketed paste so a pasted multi-line block stays in the draft instead of sending at the first line.
+4. Search in transcript (`/` or Ctrl-F) with next/previous.
+5. Load older history when scrolled to the top (larger `--limit`).
+6. Key help overlay on `?` with an empty draft.
+7. Copy the last bot message (OSC 52).
+8. Footer "reconnecting in Ns" after a failed read; bell / OSC 9 when a bot starts needing you.
