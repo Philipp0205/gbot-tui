@@ -137,6 +137,10 @@ TILDE_KEYS = {
 }
 TILDE_FUNCTION = {11: 1, 12: 2, 13: 3, 14: 4, 15: 5, 17: 6, 18: 7, 19: 8, 20: 9, 21: 10, 23: 11, 24: 12}
 _NAMED = None
+# Between ESC [200~ and ESC [201~. A paste can span two reads.
+PASTING = False
+BRACKETED_PASTE_ON = b"\033[?2004h"
+BRACKETED_PASTE_OFF = b"\033[?2004l"
 
 
 def named_key(name, fallback):
@@ -189,6 +193,7 @@ def decode_keys(keys, more=lambda: None):
     Esc with nothing after it stays "\x1b". An unknown sequence, or Esc and a
     plain character (Alt-letter), is dropped instead of reading as Esc.
     """
+    global PASTING
     queue = list(keys)
     out = []
 
@@ -198,7 +203,8 @@ def decode_keys(keys, more=lambda: None):
     while queue:
         key = queue.pop(0)
         if not is_escape(key):
-            out.append(key)
+            # Inside a bracketed paste Enter is a newline in the draft, not send.
+            out.append("\n" if PASTING and key in ("\r", curses.KEY_ENTER) else key)
             continue
         lead = pull()
         if lead is None:
@@ -224,6 +230,9 @@ def decode_keys(keys, more=lambda: None):
                 queue.insert(0, part)
             break
         if final is None:
+            continue
+        if lead == "[" and final == "~" and params in ("200", "201"):
+            PASTING = params == "200"
             continue
         decoded = _csi_key(params, final, ss3=lead == "O")
         if decoded is not None:

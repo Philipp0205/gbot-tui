@@ -553,6 +553,18 @@ def idle_flow():
     try:
         ok &= scenario("20_idle_after_long_reply", term, settles(("long please", "END OF LONG")))
         ok &= scenario("21_idle_after_widget", term, settles(("widget", "Pick a city")))
+
+        def paste(t):
+            t.send(" ")  # text first, so the widget does not take digits
+            t.send("\x1b[200~paste one\rpaste two\rpaste three\x1b[201~")
+            t.wait(lambda lines: composer_rows(lines)[-3:] == ["paste one", "paste two", "paste three"] or composer_rows(lines) == ["→   paste one", "paste two", "paste three"])
+            t.settle(1.0)
+            assert not any("reply to" in line and "paste" in line for line in t.lines()), "the paste was sent"
+            assert "Generating" not in t.lines()[-1], "the paste started a send"
+            t.send("\r")
+            t.wait(has("reply to paste one"), timeout=10)
+
+        ok &= scenario("22_bracketed_paste", term, paste)
     finally:
         run.close()
     return ok

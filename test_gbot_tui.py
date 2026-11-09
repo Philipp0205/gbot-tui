@@ -3549,7 +3549,22 @@ class EscapeSequenceTests(unittest.TestCase):
     def test_unknown_or_alt_sequences_are_dropped_not_escape(self):
         self.assertEqual(paint.decode_keys(list("\x1b[99z")), [])
         self.assertEqual(paint.decode_keys(list("\x1bx")), [])
-        self.assertEqual(paint.decode_keys(list("\x1b[200~hi")), ["h", "i"])
+
+    def test_bracketed_paste_keeps_newlines_in_the_draft(self):
+        paint.PASTING = False
+        try:
+            keys = paint.decode_keys(list("\x1b[200~one\rtwo"))
+            self.assertTrue(paint.PASTING)
+            keys += paint.decode_keys(list("\rthree\x1b[201~\r"))
+            self.assertFalse(paint.PASTING)
+        finally:
+            paint.PASTING = False
+        self.assertEqual(keys, list("one\ntwo\nthree\r"))
+        chat = chat_state.Chat("Researcher")
+        results = [chat_screen.chat_key(chat, key, None) for key in keys[:-1]]
+        self.assertEqual(results, [None] * len(results))
+        self.assertEqual(chat.typed, "one\ntwo\nthree")
+        self.assertEqual(chat_screen.chat_key(chat, keys[-1], None)[0], "send")
 
     def test_keys_around_a_sequence_keep_their_order(self):
         self.assertEqual(paint.decode_keys(list("ab\x1b[Dc")), ["a", "b", curses.KEY_LEFT, "c"])

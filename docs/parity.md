@@ -25,8 +25,8 @@ What the desktop app's chat does, and where gbot-tui stands. The backend is fixe
 | Home/End, Ctrl-A/E, word jumps (Alt/Ctrl-Left/Right), Ctrl-W, Ctrl-U, Ctrl-K, Delete | Done | `chat_screen.edit_motion`, `draft.py` | 16 |
 | Input history (Up on empty draft recalls last sent) | Done | `Chat.sent_history` / `recall` over the user rows in `chat.messages`, in memory | 18 |
 | Arrow keys as CSI (`ESC [ D`) or SS3 (`ESC O D`) | Done | `paint.decode_keys` in `read_keys` and the picker; only a lone Esc goes back | 19 |
-| Paste | Done | `paint.read_keys` drains all keys before one redraw; bracketed paste is not parsed, so a pasted newline is CR and sends | |
-| Bracketed paste (keep newlines in a paste) | Gap | enable `?2004h` and treat the paste block as text | |
+| Paste | Done | `paint.read_keys` drains all keys before one redraw | 22 |
+| Bracketed paste (keep newlines in a paste) | Done | the chat sets `?2004h`; `paint.decode_keys` turns Enter inside `ESC[200~`…`ESC[201~` into a draft newline | 22 |
 | Approvals (y / n) | Done | `transcript.approval_of`, `Chat.begin_decision`, `gbot_cli.respond_approval` | 08 |
 | Widgets / choices (single, multi, steps, custom) | Done | `widgets.py`, `chat_screen.choice_key`; answer is a `send` | 09 |
 | Attachments display | Done (text) | `transcript.attachment_text` shows name and size | |

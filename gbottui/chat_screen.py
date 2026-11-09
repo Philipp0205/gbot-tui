@@ -338,6 +338,9 @@ def chat_loop(stdscr, chat):
     curses.nonl()
 
     terminal.enable_wheel()
+    # A pasted block arrives between ESC [200~ and ESC [201~, so its newlines stay in the draft.
+    paint.PASTING = False
+    terminal.write_tty(paint.BRACKETED_PASTE_ON)
     # gbot's network calls used to run here, so typing froze until each one returned.
     # Keys are read without waiting; the loop sleeps in select on the tty and a pipe.
     stdscr.timeout(0)
@@ -501,6 +504,8 @@ def chat_loop(stdscr, chat):
     except KeyboardInterrupt:
         return None
     finally:
+        terminal.write_tty(paint.BRACKETED_PASTE_OFF)
+        paint.PASTING = False
         jobs.put(None)
         cache.write_thread_cache(chat.target, chat.messages)
         os.close(wake_r)
