@@ -7,7 +7,7 @@ from . import grid, paint, styles, terminal, transcript, widgets
 LOADING = "Loading conversation…"
 
 
-def paint_composer(stdscr, y, width, lines, placeholder=False):
+def paint_composer(stdscr, y, width, lines, placeholder=False, first=0):
     span = max(width, 0)
     if span < 2:
         return
@@ -15,7 +15,7 @@ def paint_composer(stdscr, y, width, lines, placeholder=False):
     attr = styles.ATTR["dim"] if placeholder else styles.ATTR["default"]
     for index, line in enumerate(lines):
         paint.put(stdscr, y + index, 0, "│", styles.ATTR["default"])
-        prefix = " →  " if index == 0 else "    "
+        prefix = " →  " if index + first == 0 else "    "
         paint.put(stdscr, y + index, 1, (prefix + line)[:inner], attr)
         paint.put(stdscr, y + index, span - 1, "│", styles.ATTR["default"])
 
@@ -26,7 +26,9 @@ def draw(stdscr, chat):
     # shifts every line; Herdr can leave a ghost of the old ones unless the
     # next refresh clears the physical screen first.
     rows_now = grid.visible_rows(chat, width)
-    stamp = (len(rows_now), width, height)
+    lines = grid.draft_lines(chat.typed, width)
+    # A taller box shifts the transcript the same way.
+    stamp = (len(rows_now), width, height, len(lines))
     if stamp != getattr(chat, "_drawn_stamp", None):
         try:
             stdscr.clearok(True)
@@ -38,7 +40,6 @@ def draw(stdscr, chat):
     except (AttributeError, curses.error):
         pass
     terminal.LINK_HITS.clear()
-    lines = grid.draft_lines(chat.typed, width)
     header, body_h, composer_h, footer_h = grid.layout(height, len(lines) or 1)
     footer = []
     if footer_h:
@@ -88,12 +89,13 @@ def draw(stdscr, chat):
         top, _mid, bot = grid.composer_lines(width, chat.typed)
         paint.put(stdscr, composer_at, 0, top, styles.ATTR["default"])
         visible = composer_h - 2
-        shown = lines[-visible:] if lines else ["Add a follow-up"]
-        paint_composer(stdscr, composer_at + 1, width, shown, placeholder=not lines)
+        row, col = grid.draft_cursor(chat.typed, getattr(chat, "pos", None), width)
+        first = grid.composer_window(len(lines), row, visible)
+        shown = lines[first : first + visible] if lines else ["Add a follow-up"]
+        paint_composer(stdscr, composer_at + 1, width, shown, placeholder=not lines, first=first)
         paint.put(stdscr, composer_at + composer_h - 1, 0, bot, styles.ATTR["default"])
-        last = "" if not lines else shown[-1]
-        column = grid.composer_cursor_column(last, placeholder=not lines)
-        cursor = (composer_at + len(shown), min(column, max(width - 2, 0)))
+        column = grid.composer_cursor_column("", placeholder=True) if not lines else 5 + col
+        cursor = (composer_at + 1 + (row - first if lines else 0), min(column, max(width - 2, 0)))
     elif composer_h == 1:
         shown = chat.typed or "Add a follow-up"
         paint.put(
@@ -103,7 +105,8 @@ def draw(stdscr, chat):
             grid.clip("→  " + shown, max(width - 1, 0)),
             styles.ATTR["default"] if chat.typed else styles.ATTR["dim"],
         )
-        column = 2 if not chat.typed else 3 + len(chat.typed)
+        pos = len(chat.typed) if getattr(chat, "pos", None) is None else min(chat.pos, len(chat.typed))
+        column = 2 if not chat.typed else 3 + pos
         cursor = (composer_at, min(column, max(width - 2, 0)))
     for offset, spans in enumerate(footer):
         paint.paint_spans(stdscr, height - len(footer) + offset, 1, spans)

@@ -28,32 +28,45 @@ def wrap(text, width):
 
 
 def _wrap_line(raw, width):
+    return [pad + raw[start:end] for start, end, pad in _wrap_spans(raw, width)]
+
+
+def _skip_spaces(raw, at):
+    while at < len(raw) and raw[at] == " ":
+        at += 1
+    return at
+
+
+def _wrap_spans(raw, width):
+    """(start, end, pad) per wrapped line: the line is pad + raw[start:end]."""
     if raw == "":
-        return [""]
+        return [(0, 0, "")]
     pad = "  " if raw.startswith("- ") else ""
     if pad and width <= len(pad):
         pad = ""
-    rest = raw
+    at = 0
     first = True
-    lines = []
-    while rest:
+    spans = []
+    while at < len(raw):
+        rest = raw[at:]
+        lead = "" if first else pad
         limit = width if first or not pad else width - len(pad)
         if len(rest) <= limit:
-            lines.append(rest if first else pad + rest)
+            spans.append((at, len(raw), lead))
             break
         window = rest[: limit + 1]
         cut = window.rfind(" ")
         head = rest[:cut] if cut > 0 else ""
         # The bullet's own space is not a break, or the first line is just "-".
         if cut > 0 and head.strip() and not (first and pad and cut <= len(pad)):
-            lines.append(head if first else pad + head)
-            rest = rest[cut + 1 :].lstrip(" ")
+            spans.append((at, at + cut, lead))
+            at = _skip_spaces(raw, at + cut + 1)
             first = False
             continue
-        lines.append(rest[:limit] if first else pad + rest[:limit])
-        rest = rest[limit:].lstrip(" ")
+        spans.append((at, at + limit, lead))
+        at = _skip_spaces(raw, at + limit)
         first = False
-    return lines or [""]
+    return spans or [(0, 0, "")]
 
 
 def bubble_column(width, text):
@@ -73,13 +86,56 @@ def composer_cursor_column(line, placeholder):
     return 5 + len(line or "")
 
 
-def draft_lines(typed, width):
+def draft_rows(typed, width):
+    """Wrapped draft rows as (text, start, end, pad); start/end index `typed`."""
     if not typed:
         return []
-    lines = wrap(typed, composer_text_width(width))
-    if typed.endswith("\n"):
-        lines.append("")
-    return lines
+    room = composer_text_width(width)
+    rows = []
+    base = 0
+    for raw in typed.split("\n"):
+        for start, end, pad in _wrap_spans(raw, room):
+            rows.append((pad + raw[start:end], base + start, base + end, pad))
+        base += len(raw) + 1
+    return rows
+
+
+def draft_lines(typed, width):
+    return [row[0] for row in draft_rows(typed, width)]
+
+
+def draft_cursor(typed, pos, width):
+    """(row, column) of the cursor inside the wrapped draft, column in text cells."""
+    rows = draft_rows(typed, width)
+    if not rows:
+        return 0, 0
+    pos = len(typed) if pos is None else max(0, min(pos, len(typed)))
+    at = 0
+    for index, (_text, start, _end, _pad) in enumerate(rows):
+        if start <= pos:
+            at = index
+    _text, start, end, pad = rows[at]
+    column = len(pad) + min(pos - start, max(end - start, 0) + 1)
+    return at, min(column, composer_text_width(width))
+
+
+def draft_vertical(typed, pos, width, delta):
+    """The index one wrapped row up (-1) or down (1), or None at the edge."""
+    rows = draft_rows(typed, width)
+    if not rows:
+        return None
+    row, column = draft_cursor(typed, pos, width)
+    target = row + delta
+    if target < 0 or target >= len(rows):
+        return None
+    _text, start, end, pad = rows[target]
+    return start + max(0, min(column - len(pad), end - start))
+
+
+def composer_window(count, cursor_row, visible):
+    """First draft row shown: the tail, unless the cursor is above it."""
+    first = max(count - visible, 0)
+    return min(first, max(cursor_row, 0))
 
 
 def layout(height, text_lines=1):

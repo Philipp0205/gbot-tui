@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 
-from . import activity, app, cache, chat_state, chat_view, gbot_cli, grid, herdr, paint, roster, styles, terminal, theme, transcript, widgets
+from . import activity, app, cache, chat_state, chat_view, draft, gbot_cli, grid, herdr, paint, roster, styles, terminal, theme, transcript, widgets
 
 
 # The loop sleeps in select, so a finished read wakes it at once. This cap is
@@ -159,6 +159,59 @@ def choice_key(chat, key):
     return "wait"
 
 
+# Ctrl keys that edit the draft, as in readline.
+EDIT_KEYS = {
+    "\x01": draft.line_start,
+    "\x05": draft.line_end,
+    "\x17": draft.kill_word,
+    "\x15": draft.kill_line_start,
+    "\x0b": draft.kill_line_end,
+}
+# Curses keys, and the terminfo names of the modified arrows.
+CURSOR_KEYS = {
+    curses.KEY_LEFT: draft.left,
+    curses.KEY_RIGHT: draft.right,
+    curses.KEY_HOME: draft.line_start,
+    curses.KEY_END: draft.line_end,
+    curses.KEY_DC: draft.delete,
+}
+WORD_KEYS = {b"kLFT5": draft.word_left, b"kLFT3": draft.word_left, b"kRIT5": draft.word_right, b"kRIT3": draft.word_right}
+
+
+def edit_motion(key):
+    """The `draft` function a cursor or edit key runs, or None."""
+    if isinstance(key, str):
+        return EDIT_KEYS.get(key)
+    if not isinstance(key, int):
+        return None
+    if key in CURSOR_KEYS:
+        return CURSOR_KEYS[key]
+    try:
+        name = curses.keyname(key)
+    except (curses.error, ValueError):
+        return None
+    if isinstance(name, str):
+        name = name.encode()
+    return WORD_KEYS.get(name)
+
+
+def screen_width(stdscr):
+    try:
+        return stdscr.getmaxyx()[1]
+    except AttributeError:
+        return 80
+
+
+def vertical_key(chat, key, stdscr):
+    """Up or Down: the row above or below inside the draft. False at the edge."""
+    delta = -1 if key == curses.KEY_UP else 1
+    pos = grid.draft_vertical(chat.typed, chat.pos, screen_width(stdscr), delta)
+    if pos is None:
+        return False
+    chat.pos = pos
+    return True
+
+
 def chat_key(chat, key, stdscr):
     """Apply one key. Returns "quit", "back", a job tuple, or None."""
     if key == curses.KEY_RESIZE:
@@ -194,7 +247,14 @@ def chat_key(chat, key, stdscr):
         return None
     if key == "\n":
         # nonl() makes Enter "\r", so a bare LF is ctrl+enter / ctrl+j.
-        chat.typed += "\n"
+        chat.type_text("\n")
+        return None
+    change = edit_motion(key)
+    if change is not None:
+        chat.edit(change)
+        return None
+    if key in (curses.KEY_UP, curses.KEY_DOWN):
+        vertical_key(chat, key, stdscr)
         return None
     if key in ("\r", curses.KEY_ENTER):
         entry = widgets.latest_widget(chat.messages) if not chat.widget_busy else None
@@ -233,7 +293,7 @@ def chat_key(chat, key, stdscr):
             chat.error = ""
             return ("route", route)
         if route:
-            chat.typed = route[1]
+            chat.typed, chat.pos = route[1], None
         text = chat.arm_send()
         if not text:
             return None
@@ -247,17 +307,17 @@ def chat_key(chat, key, stdscr):
         if action == "decide":
             args = chat.begin_decision(value)
             if not args:
-                chat.typed += "y" if value == "accept" else "n"
+                chat.type_text("y" if value == "accept" else "n")
                 return None
             chat.error = ""
             return ("decide", args)
-        chat.typed += value
+        chat.type_text(value)
         return None
     if key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
         if getattr(chat, "digit_buf", "") and not chat.typed:
             clear_choice_digit(chat)
             return None
-        chat.typed = chat.typed[:-1]
+        chat.edit(draft.backspace)
         return None
     picked = choice_key(chat, key)
     if picked in {"ignore", "toggle", "step", "wait"}:
@@ -265,7 +325,7 @@ def chat_key(chat, key, stdscr):
     if isinstance(picked, tuple):
         return picked
     if isinstance(key, str) and key.isprintable():
-        chat.typed += key
+        chat.type_text(key)
     return None
 
 

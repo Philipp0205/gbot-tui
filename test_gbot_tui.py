@@ -20,6 +20,7 @@ from gbottui import (
     chat_state,
     chat_view,
     colors,
+    draft,
     gbot_cli,
     grid,
     herdr,
@@ -3320,6 +3321,107 @@ class TokenTests(unittest.TestCase):
     def test_garbage_counts_as_live(self):
         self.assertFalse(backend.token_expired(""))
         self.assertFalse(backend.token_expired("not.a.jwt"))
+
+
+class CursorScreen(FakeScreen):
+    def move(self, y, x):
+        self.cursor = (y, x)
+
+
+def _typed(chat, keys, screen=None):
+    for key in keys:
+        chat_screen.chat_key(chat, key, screen)
+
+
+class ComposerEditTests(unittest.TestCase):
+    def test_left_right_insert_and_backspace_at_the_cursor(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "helo")
+        _typed(chat, [curses.KEY_LEFT, "l"])
+        self.assertEqual((chat.typed, chat.pos), ("hello", 4))
+        _typed(chat, [curses.KEY_LEFT, curses.KEY_LEFT, "\x7f"])
+        self.assertEqual((chat.typed, chat.pos), ("hllo", 1))
+        _typed(chat, [curses.KEY_DC])
+        self.assertEqual((chat.typed, chat.pos), ("hlo", 1))
+        _typed(chat, [curses.KEY_RIGHT] * 5 + ["!"])
+        self.assertEqual(chat.typed, "hlo!")
+
+    def test_line_start_end_and_kills(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "one two\nthree four")
+        _typed(chat, ["\x01"])
+        self.assertEqual(chat.pos, len("one two\n"))
+        _typed(chat, [curses.KEY_END])
+        self.assertEqual(chat.pos, len(chat.typed))
+        _typed(chat, ["\x17"])
+        self.assertEqual(chat.typed, "one two\nthree ")
+        _typed(chat, [curses.KEY_HOME, "\x0b"])
+        self.assertEqual(chat.typed, "one two\n")
+        _typed(chat, ["\x7f", "\x05", "\x15"])
+        self.assertEqual((chat.typed, chat.pos), ("", 0))
+
+    def test_word_jumps(self):
+        self.assertEqual(draft.word_left("say hello there", 15), ("say hello there", 10))
+        self.assertEqual(draft.word_left("say hello there", 10), ("say hello there", 4))
+        self.assertEqual(draft.word_right("say hello there", 0), ("say hello there", 3))
+        self.assertEqual(draft.word_right("say hello there", 3), ("say hello there", 9))
+        original = curses.keyname
+        curses.keyname = lambda key: {601: b"kLFT5", 602: b"kRIT3"}.get(key, b"KEY_OTHER")
+        try:
+            chat = chat_state.Chat("Researcher")
+            _typed(chat, "say hello")
+            _typed(chat, [601])
+            self.assertEqual(chat.pos, 4)
+            _typed(chat, [601, 602])
+            self.assertEqual(chat.pos, 3)
+        finally:
+            curses.keyname = original
+
+    def test_kill_line_start_and_end_join_lines_at_an_edge(self):
+        self.assertEqual(draft.kill_line_start("ab\ncd", 3), ("abcd", 2))
+        self.assertEqual(draft.kill_line_end("ab\ncd", 2), ("abcd", 2))
+        self.assertEqual(draft.kill_word("a  b  ", 6), ("a  ", 3))
+
+    def test_cursor_is_drawn_inside_a_wrapped_draft(self):
+        text = "abcdefghij klmnopqrst uvwxyz"
+        rows = grid.draft_rows(text, 20)
+        self.assertEqual([row[0] for row in rows], grid.draft_lines(text, 20))
+        self.assertEqual(grid.draft_cursor(text, len(text), 20)[0], len(rows) - 1)
+        self.assertEqual(grid.draft_cursor(text, 2, 20), (0, 2))
+        chat = chat_state.Chat("Researcher")
+        chat.typed, chat.pos = text, 2
+        screen = CursorScreen(24, 20)
+        chat_view.draw(screen, chat)
+        y, x = screen.cursor
+        _header, body, _box, _footer = grid.layout(24, len(rows))
+        self.assertEqual((y, x), (grid.layout(24, len(rows))[0] + body + 1, 7))
+        chat.pos = None
+        chat_view.draw(screen, chat)
+        self.assertEqual(screen.cursor[0], y + len(rows) - 1)
+
+    def test_draft_row_keeps_the_hanging_pad(self):
+        rows = grid.draft_rows("- one two three four five", 16)
+        self.assertEqual(rows[1][3], "  ")
+        self.assertTrue(rows[1][0].startswith("  "))
+
+    def test_up_down_move_between_draft_lines(self):
+        chat = chat_state.Chat("Researcher")
+        screen = FakeScreen(24, 80)
+        _typed(chat, "first line" + "\n" + "second", screen)
+        _typed(chat, [curses.KEY_UP], screen)
+        self.assertEqual(chat.pos, 6)
+        _typed(chat, ["X"], screen)
+        self.assertEqual(chat.typed, "first Xline\nsecond")
+        _typed(chat, [curses.KEY_DOWN, curses.KEY_END, "!"], screen)
+        self.assertEqual(chat.typed, "first Xline\nsecond!")
+
+    def test_old_keys_still_work_with_a_cursor(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "hi")
+        _typed(chat, [curses.KEY_LEFT, "\n"])
+        self.assertEqual(chat.typed, "h\ni")
+        self.assertEqual(chat_screen.chat_key(chat, "\r", None), ("send", ("Researcher", "h\ni")))
+        self.assertEqual((chat.typed, chat.pos), ("", None))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 """One chat's state: the transcript, the draft, the phase, and pending decisions."""
 
-from . import activity, backend, herdr, icons, roster, tabs, transcript, widgets
+from . import activity, backend, draft, herdr, icons, roster, tabs, transcript, widgets
 
 
 # Poll cadence in seconds. Each read is one gbot process, so idle backs off.
@@ -26,6 +26,9 @@ class Chat:
         self.scroll = 0
         self.follow = True
         self.typed = ""
+        # Cursor index into `typed`. None is the end, so a draft set from
+        # outside (a test, a widget reset) keeps typing at the end.
+        self.pos = None
         self.error = ""
         self.resume = herdr.resume_arg(target)
         bot = roster.ROSTER.get(target) or {}
@@ -495,11 +498,19 @@ class Chat:
         self.note(phase)
         self.sync_activity()
 
+    def edit(self, change, *args):
+        """Apply a `draft` function to the draft and the cursor."""
+        self.typed, self.pos = change(self.typed, self.pos, *args)
+
+    def type_text(self, value):
+        self.edit(draft.insert, value)
+
     def arm_send(self):
         text = self.typed.strip()
         if not text:
             return ""
         self.typed = ""
+        self.pos = None
         self.error = ""
         self.saw_other = False
         self.quiet = 0

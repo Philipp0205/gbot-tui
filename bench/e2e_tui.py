@@ -33,6 +33,9 @@ APP = os.path.join(ROOT, "gbot_tui.py")
 ARTIFACTS = os.environ.get("GBOT_E2E_ARTIFACTS") or "/workspace/oc/gbot-tui-artifacts/tui-polish"
 
 PGUP, PGDN, ESC, CTRL_D, CTRL_J = "\x1b[5~", "\x1b[6~", "\x1b", "\x04", "\n"
+# curses turns on keypad (application) mode, so arrows and Home/End are SS3, as in terminfo.
+LEFT, RIGHT, UP, DOWN, HOME, END, DEL = "\x1bOD", "\x1bOC", "\x1bOA", "\x1bOB", "\x1bOH", "\x1bOF", "\x1b[3~"
+CTRL_LEFT, ALT_RIGHT = "\x1b[1;5D", "\x1b[1;3C"
 # Variables that could point a child at a real gateway or a Herdr pane.
 SCRUB = (
     "CURSOR_ACCESS_TOKEN",
@@ -88,6 +91,10 @@ class Term:
     def lines(self):
         with self.lock:
             return list(self.screen.display)
+
+    def cursor(self):
+        with self.lock:
+            return self.screen.cursor.y, self.screen.cursor.x
 
     def text(self):
         return "\n".join(line.rstrip() for line in self.lines())
@@ -409,7 +416,68 @@ def loading_flow():
         run.close()
 
 
-FLOWS = {"main": main_flow, "error": error_flow, "loading": loading_flow}
+def box_text(lines):
+    return "\n".join(composer_rows(lines))
+
+
+def box_row(t):
+    """Screen row of the first text line inside the composer."""
+    for index, line in enumerate(t.lines()):
+        if line.startswith("┌"):
+            return index + 1
+    raise AssertionError("no composer box")
+
+
+def compose_flow():
+    run = Run("Chef")
+    term = run.term
+    ok = True
+    try:
+        def editing(t):
+            t.wait(has("Chef", "earlier reply"), timeout=10)
+            t.send("helo world")
+            t.wait(has("→  helo world"))
+            t.send(LEFT * 7 + "l")
+            t.wait(has("→  hello world"))
+            row = box_row(t)
+            assert t.cursor() == (row, 9), f"cursor at {t.cursor()}, want {(row, 9)}"
+            t.send("\x01>")  # ctrl-a, then type at the start
+            t.send("\x05" + "\x17" + "there")  # ctrl-e, ctrl-w, type
+            t.wait(has("→  >hello there"))
+            t.send(CTRL_LEFT + CTRL_LEFT + DEL)
+            t.wait(has("→  >ello there"))
+            t.send(HOME + DEL)
+            t.wait(has("→  ello there"))
+            t.send(ALT_RIGHT + "\x0b")  # word right, ctrl-k
+            t.wait(has("→  ello"))
+            t.wait(lacks("there"))
+            t.send(HOME + "H" + END + "\x7f" + "o!")
+            t.wait(has("→  Hello!"))
+            assert t.cursor() == (box_row(t), 11), t.cursor()
+
+        ok &= scenario("16_composer_cursor", term, editing)
+
+        def wrapped(t):
+            t.send("\x15")  # ctrl-u clears the line
+            t.wait(has("→  Add a follow-up"))
+            t.send("first line" + CTRL_J + "second line that is long enough to wrap around the right edge of the composer box")
+            t.wait(lambda lines: len(composer_rows(lines)) == 3)
+            t.send(UP + UP)
+            t.wait(lambda lines: t.cursor()[0] == box_row(t))
+            t.send(END + " here")
+            t.wait(has("→  first line here"))
+            t.send(DOWN + DOWN)
+            t.wait(lambda lines: t.cursor()[0] == box_row(t) + 2)
+            t.send("\r")
+            t.wait(has("reply to first line here"), timeout=10)
+
+        ok &= scenario("17_composer_wrapped", term, wrapped)
+    finally:
+        run.close()
+    return ok
+
+
+FLOWS = {"main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow}
 
 
 def main():

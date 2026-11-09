@@ -21,8 +21,8 @@ What the desktop app's chat does, and where gbot-tui stands. The backend is fixe
 | Long output | Done | word wrap with hanging indent, follow-tail (`grid.wrap`, `chat_view.draw`) | 05 |
 | Older history than the last 80 entries | Gap | `read_thread(limit=…)` takes a larger limit; load more on scroll to top | |
 | Multiline composer (Ctrl-Enter / Ctrl-J newline) | Done | `chat_key` `"\n"`; box grows (`grid.layout`) | 07 |
-| Cursor movement within the draft (Left/Right/Up/Down) | Gap | draft is append-only (`chat.typed += …`, backspace trims the end); needs a cursor index in `Chat` and `chat_view` | |
-| Home/End, Ctrl-A/E, word jumps (Alt-B/F, Ctrl-Left/Right), Ctrl-W, Ctrl-U | Gap | same cursor index | |
+| Cursor movement within the draft (Left/Right/Up/Down) | Done | `Chat.pos`, `draft.py`, `grid.draft_cursor` / `draft_vertical`, drawn by `chat_view.draw` | 16, 17 |
+| Home/End, Ctrl-A/E, word jumps (Alt/Ctrl-Left/Right), Ctrl-W, Ctrl-U, Ctrl-K, Delete | Done | `chat_screen.edit_motion`, `draft.py` | 16 |
 | Input history (Up on empty draft recalls last sent) | Gap | local only; user rows are already in `chat.messages` | |
 | Paste | Done | `paint.read_keys` drains all keys before one redraw; bracketed paste is not parsed, so a pasted newline is CR and sends | |
 | Bracketed paste (keep newlines in a paste) | Gap | enable `?2004h` and treat the paste block as text | |
