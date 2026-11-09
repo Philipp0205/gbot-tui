@@ -596,6 +596,18 @@ def reversed_text(t):
         return rows
 
 
+def footer_cell(t, text):
+    """(row, fg color) of the first row holding `text`, from the pyte cells."""
+    with t.lock:
+        for y in range(t.screen.lines):
+            line = t.screen.buffer[y]
+            row = "".join(line[x].data for x in range(t.screen.columns))
+            at = row.find(text)
+            if at >= 0:
+                return y, line[at].fg
+    return None, None
+
+
 def polish_flow():
     run = Run("Chef")
     term = run.term
@@ -634,6 +646,23 @@ def polish_flow():
             assert any("Chef" in line for line in t.lines()[:2]), "left the chat"
 
         ok &= scenario("25_copy_osc52", term, copy)
+
+        def notice(t):
+            # The copy line is a notice, not an error: not red, and it goes away.
+            t.wait(has("Copied the last reply"))
+            row, col = footer_cell(t, "Copied")
+            assert row is not None, "no notice row"
+            assert col != "red", f"notice drawn in {col}"
+            dump("26_copy_notice_shown", t)
+            t.wait(lacks("Copied the last reply"), timeout=8)
+            t.wait(has("? keys"))
+            t.send("\x0f")
+            t.wait(has("Copied the last reply"))
+            t.send("x")
+            t.wait(lacks("Copied the last reply"), timeout=3)
+            t.send("\x7f")
+
+        ok &= scenario("26_copy_notice", term, notice)
     finally:
         run.close()
     return ok

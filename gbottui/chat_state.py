@@ -9,6 +9,8 @@ STREAM_DELAY = 1.0
 SETTLE_DELAY = 2.0
 BLOCKED_DELAY = 1.0
 IDLE_DELAYS = (2.0, 2.0, 3.0, 5.0, 8.0)
+# A notice (copied, sent elsewhere) stays this long, or until the next key.
+NOTICE_SECONDS = 4.0
 
 
 class Chat:
@@ -41,6 +43,9 @@ class Chat:
         self.hist_at = None
         self.hist_draft = ("", None)
         self.error = ""
+        # A neutral or success line for the footer, not drawn as an error.
+        self.notice = ""
+        self.notice_at = None
         self.resume = herdr.resume_arg(target)
         bot = roster.ROSTER.get(target) or {}
         self.avatar_color = bot.get("avatarColor") or bot.get("avatar_color") or ""
@@ -91,6 +96,20 @@ class Chat:
                 return WAITING_DELAY
             return STREAM_DELAY if self.quiet == 0 else SETTLE_DELAY
         return IDLE_DELAYS[min(self.idle_polls, len(IDLE_DELAYS) - 1)]
+
+    def show_notice(self, text):
+        self.notice = text
+        self.notice_at = activity.clock()
+
+    def expire_notice(self, any_key=False):
+        """Drop the notice after NOTICE_SECONDS, or at once on a key. True if it went."""
+        if not self.notice:
+            return False
+        if any_key or self.notice_at is None or activity.clock() - self.notice_at >= NOTICE_SECONDS:
+            self.notice = ""
+            self.notice_at = None
+            return True
+        return False
 
     def nudge(self):
         self.idle_polls = 0

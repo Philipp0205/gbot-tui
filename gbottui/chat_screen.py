@@ -261,9 +261,9 @@ def copy_last_reply(chat):
             text = transcript.entry_text(entry).strip()
             if text:
                 terminal.write_tty(terminal.osc52(text))
-                chat.error = f"Copied the last reply ({len(text)} chars)."
+                chat.show_notice(f"Copied the last reply ({len(text)} chars).")
                 return True
-    chat.error = "No reply to copy."
+    chat.show_notice("No reply to copy.")
     return False
 
 
@@ -273,6 +273,8 @@ def chat_key(chat, key, stdscr):
         return None
     if key in ("\x03", "\x04"):
         return "quit"
+    # The next key clears a notice; ctrl-o sets a new one below.
+    chat.expire_notice(any_key=True)
     if getattr(chat, "help", False):
         # Any key closes the overlay. Esc closes it and stays in the chat;
         # a second `?` types one, so a message can still start with it.
@@ -494,7 +496,7 @@ def chat_loop(stdscr, chat):
                         chat.read_failed()
                         next_poll = time.monotonic() + chat_state.IDLE_DELAYS[0]
                 elif kind == "routed":
-                    chat.error = f"Sent to {payload}."
+                    chat.show_notice(f"Sent to {payload}.")
                 elif kind in {"sent", "decided", "chosen"}:
                     if kind == "decided":
                         chat.finish_decision()
@@ -522,6 +524,8 @@ def chat_loop(stdscr, chat):
                     chat.avatar_color = chat.avatar_color or bot.get("avatarColor") or ""
                     dirty = True
             if chat.expire_working():
+                dirty = True
+            if chat.expire_notice():
                 dirty = True
             flushed = flush_choice_digit(chat)
             if isinstance(flushed, tuple):

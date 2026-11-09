@@ -36,7 +36,7 @@ What the desktop app's chat does, and where gbot-tui stands. The backend is fixe
 | Links (click to open) | Done | `terminal.LINK_HITS`, `open_link_at` | |
 | Key help | Done | `?` on an empty draft or F1 shows `chat_view.HELP` over the transcript, any key closes it; footer says `? keys` | 23 |
 | Search in transcript | Done | Ctrl-F opens a `find:` prompt in the footer (`chat_screen.search_key`); matches over `grid.visible_rows` are reverse video (`grid.search_hits`, `chat_view.paint_matches`); Enter / Ctrl-N older, Ctrl-P newer, wrapping; the view scrolls to the match; Esc closes only the search | 24 |
-| Copy a message | Done (last reply) | Ctrl-O writes OSC 52 of the newest bot message (`chat_screen.copy_last_reply`, `terminal.osc52`); footer `Copied the last reply (N chars).`; listed in `?` help; Shift-drag still selects | 25 |
+| Copy a message | Done (last reply) | Ctrl-O writes OSC 52 of the newest bot message (`chat_screen.copy_last_reply`, `terminal.osc52`); footer `Copied the last reply (N chars).` as a green notice (`Chat.notice`, `grid.footer_spans`), cleared after 4s or on the next key; listed in `?` help; Shift-drag still selects | 25, 26 |
 | Resize | Done | `KEY_RESIZE`, layout per frame, `clearok` on size change (`chat_view.draw`) | 10 |
 | Empty / loading state | Done | picker `loading bots…` / `no match`; chat `Loading conversation…` until the first read when nothing is cached | 15 |
 | Error state | Done | red footer, long errors get up to 3 rows (`grid.footer_rows`); composer stays usable | 14 |

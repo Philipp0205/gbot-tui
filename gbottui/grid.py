@@ -314,13 +314,22 @@ SHORT_HINT = "  y/n"
 ERROR_ROWS = 3
 
 
-def footer_spans(phase, error, decide=False, width=0, choice=""):
-    """One footer line. With a width, the y/n hint shrinks before the error does."""
+def footer_spans(phase, error, decide=False, width=0, choice="", notice=""):
+    """One footer line. With a width, the y/n hint shrinks before the error does.
+
+    An error is red. A notice (copied, sent elsewhere) is green and only shows
+    when there is no error.
+    """
     room = max(width - 2, 0) if width else 0
     if phase == "blocked":
         # The error used to replace this line, so a failed respond hid y/n
         # while the card was pending again.
-        lead = (error, "red") if error else ("Pending decision", "yellow")
+        if error:
+            lead = (error, "red")
+        elif notice:
+            lead = (notice, "green")
+        else:
+            lead = ("Pending decision", "yellow")
         if not decide:
             return [(clip(lead[0], room) if room else lead[0], lead[1])]
         hint = DECIDE_HINT
@@ -331,6 +340,8 @@ def footer_spans(phase, error, decide=False, width=0, choice=""):
         return [lead, (hint, "dim")]
     if error:
         return [(clip(error, room) if room else error, "red")]
+    if notice:
+        return [(clip(notice, room) if room else notice, "green")]
     if phase == "working":
         return [("Generating", "bold"), ("  —  pgup scroll", "dim")]
     rest = "esc bots · ctrl-c quit · pgup scroll · ? keys"
@@ -343,7 +354,7 @@ def footer_spans(phase, error, decide=False, width=0, choice=""):
     return [(hint, "dim")]
 
 
-def footer_rows(phase, error, decide=False, width=0, choice=""):
+def footer_rows(phase, error, decide=False, width=0, choice="", notice=""):
     """Footer lines, bottom last. An error too long for one line gets rows of its own.
 
     A 401 or a gateway message has to stay readable in a 58-column window, so
@@ -352,7 +363,7 @@ def footer_rows(phase, error, decide=False, width=0, choice=""):
     room = max(width - 2, 1)
     hint = len(SHORT_HINT) if phase == "blocked" and decide else 0
     if not error or len(error) + hint <= room:
-        return [footer_spans(phase, error, decide, width, choice)]
+        return [footer_spans(phase, error, decide, width, choice, notice)]
     lines = wrap(error, room)
     if len(lines) > ERROR_ROWS:
         lines = lines[: ERROR_ROWS - 1] + [clip(" ".join(lines[ERROR_ROWS - 1 :]), room)]

@@ -3681,9 +3681,42 @@ class CopyTests(unittest.TestCase):
         finally:
             terminal.write_tty = original
         self.assertEqual(sent, [b"\x1b]52;c;" + base64.b64encode(b"line 4") + b"\x07"])
-        self.assertIn("Copied", chat.error)
+        self.assertIn("Copied", chat.notice)
+        self.assertEqual(chat.error, "")
         self.assertEqual(chat.typed, "")
         self.assertTrue(any("ctrl-o" in keys for keys, _what in chat_view.HELP))
+
+
+class NoticeFooterTests(unittest.TestCase):
+    def test_a_notice_is_green_and_an_error_wins_over_it(self):
+        self.assertEqual(grid.footer_spans("idle", "", notice="Copied")[0], ("Copied", "green"))
+        self.assertEqual(grid.footer_spans("idle", "down", notice="Copied")[0], ("down", "red"))
+        self.assertEqual(grid.footer_spans("blocked", "", decide=True, notice="Copied")[0], ("Copied", "green"))
+        self.assertEqual(grid.footer_rows("idle", "", width=58, notice="Copied")[-1][0], ("Copied", "green"))
+
+    def test_a_notice_clears_after_a_few_seconds_or_on_the_next_key(self):
+        now = [100.0]
+        original = activity.clock
+        activity.clock = lambda: now[0]
+        try:
+            chat = _search_chat(4)
+            chat.show_notice("Copied")
+            self.assertFalse(chat.expire_notice())
+            now[0] += chat_state.NOTICE_SECONDS
+            self.assertTrue(chat.expire_notice())
+            self.assertEqual(chat.notice, "")
+            chat.show_notice("Copied")
+            chat_screen.chat_key(chat, "x", None)
+            self.assertEqual((chat.notice, chat.typed), ("", "x"))
+        finally:
+            activity.clock = original
+
+    def test_draw_shows_the_notice_not_the_hint(self):
+        chat = _search_chat(4)
+        chat.show_notice("Copied the last reply (6 chars).")
+        screen = FakeScreen(12, 58)
+        chat_view.draw(screen, chat)
+        self.assertIn("Copied the last reply", " ".join(screen.rows[11]))
 
 
 if __name__ == "__main__":
