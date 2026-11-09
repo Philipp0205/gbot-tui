@@ -3720,6 +3720,70 @@ class NoticeFooterTests(unittest.TestCase):
 
 
 
+class ListHelpTests(unittest.TestCase):
+    def test_f1_or_question_mark_on_an_empty_search_opens_it(self):
+        self.assertTrue(picker.opens_help(curses.KEY_F1, ""))
+        self.assertTrue(picker.opens_help(curses.KEY_F1, "che"))
+        self.assertTrue(picker.opens_help("?", ""))
+        self.assertFalse(picker.opens_help("?", "che"))
+        self.assertFalse(picker.opens_help("x", ""))
+        self.assertIn("? keys", picker.LIST_HINT)
+
+    def test_the_list_shows_help_and_any_key_closes_it(self):
+        drawn = []
+
+        class Screen(FakeScreen):
+            def __init__(self, keys):
+                super().__init__(24, 80)
+                self.keys = list(keys)
+
+            def timeout(self, _ms):
+                pass
+
+            def keypad(self, _on):
+                pass
+
+            def bkgd(self, *_args):
+                pass
+
+            def get_wch(self):
+                drawn.append(" ".join(" ".join(parts) for parts in self.rows.values()))
+                if not self.keys:
+                    raise KeyboardInterrupt
+                return self.keys.pop(0)
+
+        bots = [{"name": "Chef", "title": "what to cook"}]
+        screen = Screen(["?", "x", "\r"])
+        originals = (activity.Survey, picker.paint.fast_escape, picker.paint.place_cursor, picker.terminal.enable_wheel)
+
+        class Quiet:
+            def __init__(self, _bots):
+                pass
+
+            def status(self):
+                return False, 0, 0, 0
+
+            def problem(self):
+                return ""
+
+            def close(self):
+                pass
+
+        activity.Survey = Quiet
+        picker.paint.fast_escape = picker.paint.place_cursor = picker.terminal.enable_wheel = lambda *a: None
+        try:
+            self.assertEqual(picker.pick(screen, bots), "Chef")
+        finally:
+            activity.Survey, picker.paint.fast_escape, picker.paint.place_cursor, picker.terminal.enable_wheel = originals
+        self.assertNotIn("Keys", drawn[0])
+        self.assertIn("Keys  (any key closes)", drawn[1])
+        self.assertIn("open the bot", drawn[1])
+        self.assertNotIn("what to cook", drawn[1])
+        # "x" closed it and did not start a search.
+        self.assertIn("what to cook", drawn[2])
+        self.assertNotIn("/x", drawn[2])
+
+
 class OfflineTests(unittest.TestCase):
     def setUp(self):
         self.now = [50.0]

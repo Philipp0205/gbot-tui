@@ -252,7 +252,30 @@ class Loader:
             return self.ready, self.result, self.error
 
 
-LIST_HINT = "type to search · enter open · ctrl-r refresh · ctrl-c quit"
+LIST_HINT = "type to search · enter open · ctrl-r refresh · ctrl-c quit · ? keys"
+LIST_HELP = [
+    ("type", "search names, titles and previews"),
+    ("backspace", "delete a search letter"),
+    ("up down / wheel", "move the highlight"),
+    ("enter", "open the bot"),
+    ("esc", "clear the search"),
+    ("ctrl-r", "scan every bot again"),
+    ("ctrl-c ctrl-d", "quit"),
+    ("? f1", "this help (? types when searching)"),
+]
+
+
+def opens_help(key, query):
+    """F1, or `?` while the search is empty. A `?` in a search is a letter."""
+    return key == curses.KEY_F1 or (key == "?" and not query)
+
+
+def paint_list_help(stdscr, top, room, width):
+    """The list keys in place of the rows. Any key closes it."""
+    lines = ["Keys  (any key closes)"] + [f"{keys:<18}{what}" for keys, what in LIST_HELP]
+    for index, line in enumerate(lines[:room]):
+        attr = styles.ATTR["bold"] if index == 0 else styles.ATTR["default"]
+        paint.put(stdscr, top + index, 3, grid.clip(line, max(width - 4, 0)), attr)
 
 
 def pick(stdscr, bots, refresh=None):
@@ -280,6 +303,7 @@ def pick(stdscr, bots, refresh=None):
     moved = False
     chosen = ""
     pending = []
+    showing_help = False
     try:
         while True:
             if loader:
@@ -329,11 +353,13 @@ def pick(stdscr, bots, refresh=None):
             top = 0
             if body_h and selected >= body_h:
                 top = selected - body_h + 1
-            if not shown and body_h:
+            if showing_help:
+                paint_list_help(stdscr, 2, body_h, width)
+            elif not shown and body_h:
                 empty = "  loading bots…" if loader and not bots else "  no match"
                 paint.put(stdscr, 2, 1, grid.clip(empty, max(width - 2, 0)), styles.ATTR["dim"])
             columns = list_columns(shown, width)
-            for index, bot in enumerate(shown[top : top + body_h]):
+            for index, bot in enumerate([] if showing_help else shown[top : top + body_h]):
                 actual = top + index
                 paint.paint_spans(stdscr, 2 + index, 1, picker_spans(bot, actual == selected, width, columns))
             if footer:
@@ -369,6 +395,13 @@ def pick(stdscr, bots, refresh=None):
                 continue
             if key in ("\x03", "\x04"):
                 return None
+            if showing_help:
+                # Any other key, Esc included, only closes the help.
+                showing_help = False
+                continue
+            if opens_help(key, query):
+                showing_help = True
+                continue
             if key == "\x12":
                 survey.nudge()
                 continue

@@ -34,7 +34,7 @@ What the desktop app's chat does, and where gbot-tui stands. The backend is fixe
 | File upload / send attachments | Not possible | `gbot send` takes text only | |
 | Markdown: headings, lists, emphasis, code blocks | Done | `markdown.py`; fences drop the ``` and indent the code, the language name sits on its own line | 05 |
 | Links (click to open) | Done | `terminal.LINK_HITS`, `open_link_at` | |
-| Key help | Done | `?` on an empty draft or F1 shows `chat_view.HELP` over the transcript, any key closes it; footer says `? keys` | 23 |
+| Key help | Done | `?` on an empty draft or F1 shows `chat_view.HELP` over the transcript, any key closes it; footer says `? keys`. In the bot list F1, or `?` on an empty search, shows `picker.LIST_HELP` in place of the rows; any key closes it | 23, 28 |
 | Search in transcript | Done | Ctrl-F opens a `find:` prompt in the footer (`chat_screen.search_key`); matches over `grid.visible_rows` are reverse video (`grid.search_hits`, `chat_view.paint_matches`); Enter / Ctrl-N older, Ctrl-P newer, wrapping; the view scrolls to the match; Esc closes only the search | 24 |
 | Copy a message | Done (last reply) | Ctrl-O writes OSC 52 of the newest bot message (`chat_screen.copy_last_reply`, `terminal.osc52`); footer `Copied the last reply (N chars).` as a green notice (`Chat.notice`, `grid.footer_spans`), cleared after 4s or on the next key; listed in `?` help; Shift-drag still selects | 25, 26 |
 | Resize | Done | `KEY_RESIZE`, layout per frame, `clearok` on size change (`chat_view.draw`) | 10 |

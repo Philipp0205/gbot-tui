@@ -250,6 +250,28 @@ def main_flow():
 
         ok &= scenario("01_picker", term, picker)
 
+        def list_help(t):
+            t.send("?")
+            t.wait(has("Keys  (any key closes)", "scan every bot again"))
+            t.wait(lacks("digs into papers"))
+            t.send("x")
+            t.wait(lacks("Keys  (any key closes)"))
+            t.wait(has("digs into papers", "? keys"))
+            assert not any("/x" in line for line in t.lines()), "the closing key searched"
+            t.send("\x1bOP")  # F1
+            t.wait(has("Keys  (any key closes)"))
+            dump("28_list_help_open", t)
+            t.send(ESC)
+            t.wait(has("Researcher", "Travel Agent", "Chef"))
+            t.wait(lacks("Keys  (any key closes)"))
+            t.send("c?")  # a ? inside a search is a letter, not help
+            t.wait(has("/c?"))
+            assert not any("Keys  (any key closes)" in line for line in t.lines()), "? in a search opened help"
+            t.send("\x7f\x7f")
+            t.wait(lacks("/c"))
+
+        ok &= scenario("28_list_help", term, list_help)
+
         def filter_(t):
             t.send("trav")
             t.wait(has("trav"))
