@@ -3809,6 +3809,59 @@ class NeedsYouBellTests(unittest.TestCase):
         self.assertEqual(fresh, [])
 
 
+def _thread(first, last):
+    entries = [{"id": f"m{i}", "role": "user" if i % 2 else "assistant", "text": f"line {i}"} for i in range(first, last + 1)]
+    return transcript.parse_thread({"transcript": {"entries": entries}})
+
+
+class OlderHistoryTests(unittest.TestCase):
+    def test_a_full_first_read_offers_older_entries_with_a_larger_limit(self):
+        chat = chat_state.Chat("Chef")
+        chat.ingest(_thread(21, 100), first=True)
+        self.assertTrue(chat.more_history)
+        args = chat.take_older()
+        self.assertEqual(args, ("Chef", None, 160))
+        self.assertIsNone(chat.take_older())  # one at a time
+        self.assertEqual(chat.ingest_older(_thread(1, 100), 160), 20)
+        self.assertEqual(chat.messages[0]["id"], "m1")
+        self.assertFalse(chat.more_history)  # 100 < 160: that was the start
+        self.assertIsNone(chat.take_older())
+        # A later full reload keeps the older rows.
+        chat.full_reload = True
+        self.assertEqual(chat.take_read(), ("Chef", None, 160))
+
+    def test_a_short_thread_or_a_busy_chat_does_not_ask(self):
+        chat = chat_state.Chat("Chef")
+        chat.ingest(_thread(1, 30), first=True)
+        self.assertIsNone(chat.take_older())
+        chat = chat_state.Chat("Chef")
+        chat.ingest(_thread(21, 100), first=True)
+        chat.phase = "working"
+        self.assertIsNone(chat.take_older())
+
+    def test_page_up_at_the_top_queues_the_older_read(self):
+        chat = chat_state.Chat("Chef")
+        chat.ingest(_thread(21, 100), first=True)
+        screen = FakeScreen(12, 58)
+        chat_view.draw(screen, chat)
+        job = None
+        saved = getattr(curses, "LINES", None)
+        curses.LINES = 12
+        try:
+            for _ in range(60):
+                job = chat_screen.chat_key(chat, curses.KEY_PPAGE, screen) or job
+                if job:
+                    break
+        finally:
+            if saved is None:
+                del curses.LINES
+            else:
+                curses.LINES = saved
+        self.assertEqual(job, ("older", ("Chef", None, 160)))
+        self.assertEqual(chat.scroll, 0)
+        self.assertIn("older", chat.notice)
+
+
 class OfflineTests(unittest.TestCase):
     def setUp(self):
         self.now = [50.0]

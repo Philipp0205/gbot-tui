@@ -6,6 +6,7 @@ MOCK_DELAY  seconds each call takes, like node startup plus the gateway (default
 MOCK_REPLY  seconds after a send before the bot's reply is visible (default 1.5)
 MOCK_FAIL   every call but `bots list` prints this as a gbot error
 MOCK_FAIL_FILE  while this file exists, calls but `bots list` fail with its text
+MOCK_HISTORY  entries in a new thread (default 30); `thread --limit N` returns the newest N
 MOCK_HANG   seconds each `thread` call hangs, for the loading state (default 0)
 MOCK_STREAM seconds a reply keeps growing after it first shows (default 0: whole at once)
 MOCK_INCLUSIVE  1: `thread --after <id>` always returns that entry too, unchanged
@@ -100,7 +101,8 @@ def load(target):
         with open(thread_path(target), encoding="utf-8") as handle:
             return json.load(handle)
     except OSError:
-        entries = [{"id": f"m{i}", "role": "user" if i % 2 else "assistant", "text": f"earlier line {i}", "at": 0} for i in range(1, 31)]
+        count = int(os.environ.get("MOCK_HISTORY", "30") or 30)
+        entries = [{"id": f"m{i}", "role": "user" if i % 2 else "assistant", "text": f"earlier line {i}", "at": 0} for i in range(1, count + 1)]
         entries[-1]["text"] = "earlier reply"
         return entries
 
@@ -138,6 +140,7 @@ def main(argv):
         if HANG:
             time.sleep(HANG)
         after = args[args.index("--after") + 1] if "--after" in args else None
+        limit = int(args[args.index("--limit") + 1]) if "--limit" in args else 80
         target = args[-1]
         now = time.time()
         entries = [entry for entry in load(target) if entry.get("at", 0) <= now]
@@ -152,7 +155,7 @@ def main(argv):
         bot = bot_for(target)
         payload = {
             "target": {"id": bot["id"], "name": bot["name"], "avatarColor": bot.get("avatarColor", "")},
-            "transcript": {"entries": [shown(e, now) for e in entries][-80:]},
+            "transcript": {"entries": [shown(e, now) for e in entries][-limit:]},
         }
         print(json.dumps(payload))
         return 0

@@ -11,6 +11,11 @@ STREAM_DELAY = 1.0
 SETTLE_DELAY = 2.0
 BLOCKED_DELAY = 1.0
 IDLE_DELAYS = (2.0, 2.0, 3.0, 5.0, 8.0)
+# A thread read returns the newest READ_LIMIT entries. Scrolling to the top
+# asks for HISTORY_STEP more with a larger `--limit`, up to HISTORY_MAX.
+READ_LIMIT = 80
+HISTORY_STEP = 80
+HISTORY_MAX = 800
 # Seconds before the next read after 1, 2, 3, … failed reads in a row.
 RETRY_DELAYS = (2.0, 4.0, 8.0, 15.0, 30.0)
 # A notice (copied, sent elsewhere) stays this long, or until the next key.
@@ -54,6 +59,11 @@ class Chat:
         self.read_failures = 0
         self.retry_at = None
         self.read_error = ""
+        # Entries a full read asks for, whether the last one filled it (so more
+        # may sit before it), and whether an older read is out.
+        self.limit = READ_LIMIT
+        self.more_history = False
+        self.loading_older = False
         self.resume = herdr.resume_arg(target)
         bot = roster.ROSTER.get(target) or {}
         self.avatar_color = bot.get("avatarColor") or bot.get("avatar_color") or ""
@@ -481,10 +491,48 @@ class Chat:
         if self.full_reload:
             self.full_reload = False
             self.replacing = True
-            return (self.target,)
+            return self.full_read()
         if self.cursor:
             return (self.target, self.cursor)
+        return self.full_read()
+
+    def full_read(self):
+        # A full read keeps the older entries already loaded.
+        if self.limit > READ_LIMIT:
+            return (self.target, None, self.limit)
         return (self.target,)
+
+    def take_older(self):
+        """The `read_thread` args for older entries, or None when there is nothing to ask.
+
+        Only an idle chat whose last full read was full asks, so a reply that
+        lands in the same read is never missed by `watch_step`.
+        """
+        if (
+            not self.loaded
+            or self.loading_older
+            or not self.more_history
+            or self.limit >= HISTORY_MAX
+            or self.phase not in {"idle", "done"}
+            or self.read_failures
+        ):
+            return None
+        self.loading_older = True
+        return (self.target, None, min(self.limit + HISTORY_STEP, HISTORY_MAX))
+
+    def ingest_older(self, page, limit):
+        """A larger full read. Returns how many entries it added at the top."""
+        self.loading_older = False
+        self.read_back()
+        before = len([entry for entry in self.messages if not entry.get("local")])
+        self.apply(page, replace=True)
+        added = max(len(page["entries"]) - before, 0)
+        self.limit = limit
+        self.more_history = added > 0 and len(page["entries"]) >= limit
+        return added
+
+    def older_failed(self):
+        self.loading_older = False
 
     def read_failed(self, message=""):
         """Note a failed read. Returns the seconds until the retry, backing off."""
@@ -529,6 +577,7 @@ class Chat:
         self.replacing = False
         if replace:
             self.apply(page, replace=True)
+            self.more_history = len(page["entries"]) >= self.limit
             fresh = []
             # An older answer is not this turn's reply. Counting it would
             # clear `working` after two quiet polls while the bot is still going.

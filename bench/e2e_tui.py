@@ -53,6 +53,7 @@ SCRUB = (
     "MOCK_FAIL",
     "MOCK_HANG",
     "MOCK_FAIL_FILE",
+    "MOCK_HISTORY",
 )
 
 
@@ -485,6 +486,39 @@ def bell_flow():
         run.close()
 
 
+def ends_with(text):
+    return lambda lines: any(line.rstrip().endswith(text) for line in lines)
+
+
+def history_flow():
+    run = Run("Chef", MOCK_HISTORY="120")
+    try:
+        def older(t):
+            t.wait(has("Chef", "earlier reply"), timeout=10)
+            t.wait(has("? keys"))
+            for _ in range(30):
+                t.send(PGUP)
+                t.settle(0.15)
+                if any("older messages" in line for line in t.lines()):
+                    break
+            t.wait(has("Loaded 40 older messages."), timeout=10)
+            # The rows that were on screen stay put; the new ones sit above.
+            assert ends_with("earlier line 41")(t.lines()) or ends_with("earlier line 42")(t.lines()), "view jumped"
+            for _ in range(30):
+                t.send(PGUP)
+                t.settle(0.1)
+                if ends_with("earlier line 1")(t.lines()):
+                    break
+            t.wait(ends_with("earlier line 1"))
+            dump("30_older_history_top", t)
+            t.send(PGDN * 40)
+            t.wait(has("earlier reply"))
+
+        return scenario("30_older_history", run.term, older)
+    finally:
+        run.close()
+
+
 def loading_flow():
     run = Run("Researcher", MOCK_HANG="4")
     try:
@@ -751,7 +785,7 @@ def polish_flow():
     return ok
 
 
-FLOWS = {"main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow}
+FLOWS = {"main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow}
 
 
 def main():

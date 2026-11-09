@@ -19,7 +19,7 @@ What the desktop app's chat does, and where gbot-tui stands. The backend is fixe
 | Working / generating indicator | Done | header `· working`, footer `Generating` (`paint.title_spans`, `grid.footer_spans`); a re-sent unchanged cursor entry is a quiet poll (`Chat._absorb`) | 04, 20, 21 |
 | Scrollback (PgUp/PgDn, Alt-Pg half, wheel) | Done | `chat_key`, `terminal.page_motion`, `wheel_direction` | 06 |
 | Long output | Done | word wrap with hanging indent, follow-tail (`grid.wrap`, `chat_view.draw`) | 05 |
-| Older history than the last 80 entries | Gap | `read_thread(limit=…)` takes a larger limit; load more on scroll to top | |
+| Older history than the last 80 entries | Done | scrolling up at the top asks `gbot thread --limit <n+80>` (`Chat.take_older`, `ingest_older`, `chat_screen.older_job`), up to 800; the view keeps its rows; there is no read before the oldest id, so it is a larger tail, not a page | 30 |
 | Multiline composer (Ctrl-Enter / Ctrl-J newline) | Done | `chat_key` `"\n"`; box grows (`grid.layout`) | 07 |
 | Cursor movement within the draft (Left/Right/Up/Down) | Done | `Chat.pos`, `draft.py`, `grid.draft_cursor` / `draft_vertical`, drawn by `chat_view.draw` | 16, 17 |
 | Home/End, Ctrl-A/E, word jumps (Alt/Ctrl-Left/Right), Ctrl-W, Ctrl-U, Ctrl-K, Delete | Done | `chat_screen.edit_motion`, `draft.py` | 16 |

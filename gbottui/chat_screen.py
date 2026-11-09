@@ -267,6 +267,17 @@ def copy_last_reply(chat):
     return False
 
 
+def older_job(chat):
+    """At the top of the transcript, ask for older entries with a larger --limit."""
+    if chat.scroll > 0:
+        return None
+    args = chat.take_older()
+    if args is None:
+        return None
+    chat.show_notice("Loading older messages…")
+    return ("older", args)
+
+
 def chat_key(chat, key, stdscr):
     """Apply one key. Returns "quit", "back", a job tuple, or None."""
     if key == curses.KEY_RESIZE:
@@ -312,7 +323,7 @@ def chat_key(chat, key, stdscr):
         if direction < 0:
             chat.follow = False
             chat.scroll = max(chat.scroll - step, 0)
-            return None
+            return older_job(chat)
         chat.scroll += step
         height, width = stdscr.getmaxyx()
         page_header, body_h, _composer, _footer = grid.layout(height, len(grid.draft_lines(chat.typed, width)) or 1)
@@ -445,6 +456,8 @@ def chat_loop(stdscr, chat):
             try:
                 if kind == "read":
                     finish(("page", gbot_cli.read_thread(*args)))
+                elif kind == "older":
+                    finish(("older", (gbot_cli.read_thread(*args), args[2])))
                 elif kind == "decide":
                     gbot_cli.respond_approval(*args)
                     finish(("decided", None))
@@ -493,8 +506,19 @@ def chat_loop(stdscr, chat):
                         chat.fail_choice()
                     if source == "send" and chat.phase == "working":
                         chat.note("idle")
+                    if source == "older":
+                        chat.older_failed()
                     if source == "read":
                         next_poll = time.monotonic() + chat.read_failed(message)
+                elif kind == "older":
+                    page, limit = payload
+                    width = screen_width(stdscr)
+                    rows = len(grid.visible_rows(chat, width))
+                    added = chat.ingest_older(page, limit)
+                    # Keep the rows that were on screen where they were.
+                    chat.scroll += len(grid.visible_rows(chat, width)) - rows
+                    chat.follow = False
+                    chat.show_notice(f"Loaded {added} older messages." if added else "Start of the conversation.")
                 elif kind == "routed":
                     chat.show_notice(f"Sent to {payload}.")
                 elif kind in {"sent", "decided", "chosen"}:
