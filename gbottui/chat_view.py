@@ -5,6 +5,30 @@ import curses
 from . import grid, paint, styles, terminal, transcript, widgets
 
 LOADING = "Loading conversation…"
+HELP = [
+    ("enter", "send"),
+    ("ctrl-j / ctrl-enter", "new line"),
+    ("left right home end", "move in the draft"),
+    ("ctrl/alt-left right", "jump a word"),
+    ("ctrl-a ctrl-e", "line start / end"),
+    ("ctrl-w ctrl-u ctrl-k", "delete word / to start / to end"),
+    ("up down", "draft rows, then sent history"),
+    ("pgup pgdn", "scroll a screen (alt: half)"),
+    ("y n", "answer a pending approval"),
+    ("1-9", "pick a widget option"),
+    ("@bot text", "send to another bot"),
+    ("esc", "back to the bot list"),
+    ("ctrl-c ctrl-d", "quit"),
+    ("? f1", "this help (?? types a ?)"),
+]
+
+
+def paint_help(stdscr, top, room, width):
+    """The key list over the transcript. Any key closes it."""
+    lines = ["Keys  (any key closes)"] + [f"{keys:<22}{what}" for keys, what in HELP]
+    for index, line in enumerate(lines[:room]):
+        attr = styles.ATTR["bold"] if index == 0 else styles.ATTR["default"]
+        paint.put(stdscr, top + index, 3, grid.clip(line, max(width - 4, 0)), attr)
 
 
 def paint_composer(stdscr, y, width, lines, placeholder=False, first=0):
@@ -68,6 +92,9 @@ def draw(stdscr, chat):
     if not rows and room and not getattr(chat, "loaded", True) and not chat.error:
         # First open with no cached thread: say the read is out, not an empty chat.
         paint.put(stdscr, header + gap, 3, grid.clip(LOADING, max(width - 4, 0)), styles.ATTR["dim"])
+    if getattr(chat, "help", False):
+        paint_help(stdscr, header + gap, room, width)
+        rows = []
     for row in range(room):
         index = start + row
         if index >= len(rows):

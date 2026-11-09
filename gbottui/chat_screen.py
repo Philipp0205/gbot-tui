@@ -219,8 +219,18 @@ def chat_key(chat, key, stdscr):
         return None
     if key in ("\x03", "\x04"):
         return "quit"
+    if getattr(chat, "help", False):
+        # Any key closes the overlay. Esc closes it and stays in the chat;
+        # a second `?` types one, so a message can still start with it.
+        chat.help = False
+        if key == "?":
+            chat.type_text("?")
+        return None
     if key in ("\x1b", 27):
         return "back"
+    if key == curses.KEY_F1 or (key == "?" and not chat.typed):
+        chat.help = True
+        return None
     chat.nudge()
     motion = terminal.page_motion(key)
     if motion is None:

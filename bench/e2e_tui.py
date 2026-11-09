@@ -565,6 +565,22 @@ def idle_flow():
             t.wait(has("reply to paste one"), timeout=10)
 
         ok &= scenario("22_bracketed_paste", term, paste)
+
+        def key_help(t):
+            t.wait(lacks("Generating", "working"), timeout=12)
+            t.send("?")
+            t.wait(has("Keys  (any key closes)", "back to the bot list"))
+            t.send(ESC)
+            t.wait(lacks("Keys  (any key closes)"))
+            t.wait(has("Chef", "? keys"))
+            t.send("\x1bOP")  # F1
+            t.wait(has("Keys  (any key closes)"))
+            dump("23_key_help_open", t)
+            t.send("x")
+            t.wait(lacks("Keys  (any key closes)"))
+            t.wait(has("→  Add a follow-up"))
+
+        ok &= scenario("23_key_help", term, key_help)
     finally:
         run.close()
     return ok

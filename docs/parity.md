@@ -34,7 +34,7 @@ What the desktop app's chat does, and where gbot-tui stands. The backend is fixe
 | File upload / send attachments | Not possible | `gbot send` takes text only | |
 | Markdown: headings, lists, emphasis, code blocks | Done | `markdown.py`; fences drop the ``` and indent the code, the language name sits on its own line | 05 |
 | Links (click to open) | Done | `terminal.LINK_HITS`, `open_link_at` | |
-| Key help | Partial | one-line footer hints (`grid.footer_spans`, `picker.LIST_HINT`); no `?` overlay | |
+| Key help | Done | `?` on an empty draft or F1 shows `chat_view.HELP` over the transcript, any key closes it; footer says `? keys` | 23 |
 | Search in transcript | Gap | local over `grid.visible_rows`; jump `chat.scroll` to the match | |
 | Copy a message | Gap | OSC 52 of the selected message text; Shift-drag works in the terminal today | |
 | Resize | Done | `KEY_RESIZE`, layout per frame, `clearok` on size change (`chat_view.draw`) | 10 |

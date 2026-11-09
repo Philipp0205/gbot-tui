@@ -25,6 +25,7 @@ class Chat:
         self.saw_other = False
         self.scroll = 0
         self.follow = True
+        self.help = False
         self.typed = ""
         # Cursor index into `typed`. None is the end, so a draft set from
         # outside (a test, a widget reset) keeps typing at the end.

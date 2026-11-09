@@ -3585,5 +3585,30 @@ class EscapeSequenceTests(unittest.TestCase):
         self.assertEqual(chat_screen.chat_key(chat, paint.read_keys(_KeyFeed(["\x1b"]))[0], None), "back")
 
 
+class KeyHelpTests(unittest.TestCase):
+    def test_question_mark_or_f1_opens_help_and_any_key_closes_it(self):
+        chat = chat_state.Chat("Researcher")
+        self.assertIsNone(chat_screen.chat_key(chat, "?", None))
+        self.assertTrue(chat.help)
+        # Esc closes the overlay and stays in the chat.
+        self.assertIsNone(chat_screen.chat_key(chat, "\x1b", None))
+        self.assertFalse(chat.help)
+        self.assertIsNone(chat_screen.chat_key(chat, curses.KEY_F1, None))
+        self.assertTrue(chat.help)
+        self.assertIsNone(chat_screen.chat_key(chat, "x", None))
+        self.assertEqual((chat.help, chat.typed), (False, ""))
+
+    def test_a_question_mark_in_a_draft_is_text(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "why?")
+        self.assertEqual((chat.help, chat.typed), (False, "why?"))
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "??")
+        self.assertEqual((chat.help, chat.typed), (False, "?"))
+
+    def test_the_idle_footer_names_the_help_key(self):
+        self.assertIn("? keys", grid.footer_spans("idle", "")[0][0])
+
+
 if __name__ == "__main__":
     unittest.main()
