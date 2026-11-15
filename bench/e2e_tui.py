@@ -13,9 +13,12 @@ The exit code is the number of failures.
 """
 
 import argparse
+import base64
 import fcntl
+import json
 import os
 import pty
+import re
 import shutil
 import signal
 import struct
@@ -171,7 +174,26 @@ def composer_rows(lines):
     return out
 
 
-def environment(home, **mock):
+HERDR_PANE = "pane-e2e-1"
+HERDR_DESKTOP_ID = "term-e2e-1"
+
+
+def fake_herdr(bindir, log):
+    """A `herdr` that appends its argv as one JSON line to `log` and exits 0."""
+    path = os.path.join(bindir, "herdr")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(
+            f"#!{sys.executable}\n"
+            "import json, sys\n"
+            f"with open({log!r}, 'a', encoding='utf-8') as out:\n"
+            "    out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        )
+    os.chmod(path, 0o755)
+    return path
+
+
+def environment(home, herdr=None, **mock):
+    """`herdr` is None (scrubbed, the default), "cli" (HERDR_* set) or "desktop" (only HC_TERMINAL_ID)."""
     bindir = os.path.join(home, "bin")
     os.makedirs(bindir, exist_ok=True)
     shim = os.path.join(bindir, "gbot")
@@ -179,6 +201,13 @@ def environment(home, **mock):
         handle.write(f"#!/bin/sh\nexec {sys.executable} {os.path.join(HERE, 'mock_gbot.py')} \"$@\"\n")
     os.chmod(shim, 0o755)
     env = {key: value for key, value in os.environ.items() if key not in SCRUB}
+    if herdr:
+        # On PATH in both cases, so a call the app should not make still shows in the log.
+        binary = fake_herdr(bindir, os.path.join(home, "herdr.log"))
+        if herdr == "cli":
+            env.update(HERDR_ENV="1", HERDR_PANE_ID=HERDR_PANE, HERDR_BIN_PATH=binary)
+        else:
+            env.update(HC_TERMINAL_ID=HERDR_DESKTOP_ID)
     env.update(
         HOME=home,
         XDG_CONFIG_HOME=os.path.join(home, ".config"),
@@ -201,9 +230,9 @@ def environment(home, **mock):
 class Run:
     """One app process in its own HOME. Scenarios share it and run in order."""
 
-    def __init__(self, *argv, rows=24, cols=80, **mock):
+    def __init__(self, *argv, rows=24, cols=80, herdr=None, **mock):
         self.home = tempfile.mkdtemp(prefix="gbot-e2e-")
-        self.env = environment(self.home, **mock)
+        self.env = environment(self.home, herdr=herdr, **mock)
         self.term = Term([sys.executable, APP, *argv], self.env, rows, cols)
 
     def close(self):
@@ -785,7 +814,163 @@ def polish_flow():
     return ok
 
 
-FLOWS = {"main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow}
+OSC_7501 = re.compile(rb"\x1b\]7501;([^\x1b]*)\x1b\\")
+
+
+def osc_reports(raw):
+    """Every OSC 7501 report in the pty bytes, as dicts: state, app, title (decoded), kind."""
+    out = []
+    for body in OSC_7501.findall(bytes(raw)):
+        fields = dict(part.split("=", 1) for part in body.decode().split(":") if "=" in part)
+        if "title" in fields:
+            fields["title"] = base64.b64decode(fields["title"]).decode()
+        out.append(fields)
+    return out
+
+
+def herdr_calls(home):
+    """argv (without the program name) of every call the fake herdr logged."""
+    try:
+        with open(os.path.join(home, "herdr.log"), encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+    except OSError:
+        return []
+
+
+def flag(argv, name):
+    return argv[argv.index(name) + 1] if name in argv else None
+
+
+def expect_osc(t, since, timeout=15, **want):
+    """Wait for an OSC 7501 report after index `since` that has the wanted fields. Returns the next index."""
+    end = time.monotonic() + timeout
+    while True:
+        reports = osc_reports(t.raw)
+        for index in range(since, len(reports)):
+            if all(reports[index].get(key) == value for key, value in want.items()):
+                return index + 1
+        if time.monotonic() >= end:
+            raise AssertionError(f"no OSC 7501 {want} after #{since}; saw {reports[since:]}")
+        time.sleep(0.05)
+
+
+def expect_call(home, since, verb, state=None, timeout=15):
+    """Wait for a fake-herdr `pane <verb>` call after index `since`; check pane, source, agent. Returns the next index."""
+    end = time.monotonic() + timeout
+    while True:
+        calls = herdr_calls(home)
+        for index in range(since, len(calls)):
+            argv = calls[index]
+            if argv[:3] == ["pane", verb, HERDR_PANE] and (state is None or flag(argv, "--state") == state):
+                assert flag(argv, "--source") == "gbot-tui", argv
+                assert flag(argv, "--agent") == "Chef", argv
+                assert flag(argv, "--seq").isdigit(), argv
+                return index + 1
+        if time.monotonic() >= end:
+            raise AssertionError(f"no herdr pane {verb} {state or ''} after #{since}; saw {calls[since:]}")
+        time.sleep(0.05)
+
+
+def herdr_flow():
+    run = Run("Chef", herdr="cli", MOCK_REPLY="1.0", MOCK_STREAM="0")
+    term, home = run.term, run.home
+    ok = True
+    mark = {"osc": 0, "cli": 0}
+    try:
+        def send(t, text):
+            t.send(text)
+            t.wait(lambda lines: text in " ".join(composer_rows(lines)))
+            t.send("\r")
+
+        def opened(t):
+            t.wait(has("Chef", "earlier reply"), timeout=10)
+            mark["osc"] = expect_osc(t, 0, state="idle", app="Chef", title="Chef")
+            mark["cli"] = expect_call(home, 0, "report-agent", "idle")
+            calls = herdr_calls(home)
+            assert calls[0][:3] == ["pane", "report-agent", HERDR_PANE], calls[0]
+            assert all(argv[1] == "report-agent" for argv in calls), calls
+            assert calls[0][calls[0].index("--") + 1 :] == ["gbot-tui", "Chef"], calls[0]
+
+        ok &= scenario("31_herdr_open_idle", term, opened)
+
+        def working(t):
+            send(t, "hello there")
+            mark["osc"] = expect_osc(t, mark["osc"], state="working", app="Chef", title="Chef")
+            mark["cli"] = expect_call(home, mark["cli"], "report-agent", "working")
+            # The reply lands: the report is idle again (done is reported to Herdr as idle).
+            t.wait(has("reply to hello there"), timeout=10)
+            mark["cli"] = expect_call(home, mark["cli"], "report-agent", "idle")
+            last = osc_reports(t.raw)[-1]
+            assert last["state"] in ("idle", "done"), f"after the reply the last OSC state is {last['state']}"
+
+        ok &= scenario("32_herdr_send_working_then_idle", term, working)
+
+        def blocked(t):
+            t.wait(lacks("working"), timeout=12)
+            send(t, "approve the cleanup")
+            mark["osc"] = expect_osc(t, mark["osc"], state="blocked", kind="permission", app="Chef", title="Chef")
+            mark["cli"] = expect_call(home, mark["cli"], "report-agent", "blocked")
+            t.wait(has("Needs approval", "rm -rf build"), timeout=10)
+            t.send("y")
+            t.wait(has("Approved"), timeout=10)
+            mark["osc"] = expect_osc(t, mark["osc"], state="idle", app="Chef")
+            mark["cli"] = expect_call(home, mark["cli"], "report-agent", "idle")
+
+        ok &= scenario("33_herdr_approval_blocked", term, blocked)
+
+        def reply_done(t):
+            t.wait(lacks("working", "Generating"), timeout=12)
+            before = len(osc_reports(t.raw))
+            send(t, "one more")
+            mark["osc"] = expect_osc(t, before, state="working", app="Chef")
+            t.wait(has("reply to one more"), timeout=10)
+            end = time.monotonic() + 15
+            while osc_reports(t.raw)[-1]["state"] not in ("idle", "done") and time.monotonic() < end:
+                time.sleep(0.05)
+            assert osc_reports(t.raw)[-1]["state"] in ("idle", "done"), osc_reports(t.raw)[-3:]
+            mark["cli"] = expect_call(home, mark["cli"], "report-agent", "idle")
+
+        ok &= scenario("34_herdr_reply_done_idle", term, reply_done)
+
+        def quit_(t):
+            t.send(CTRL_D)
+            assert t.exited(5), "still running 5s after ctrl-d"
+            assert os.WIFEXITED(t.status) and os.WEXITSTATUS(t.status) == 0, f"exit status {t.status}"
+            clear = [report for report in osc_reports(t.raw) if report["state"] == "clear"]
+            assert clear and clear[0]["app"] == "Chef", f"no OSC clear for Chef: {clear}"
+            index = expect_call(home, mark["cli"], "release-agent", timeout=3)
+            release = herdr_calls(home)[index - 1]
+            assert release[0:3] == ["pane", "release-agent", HERDR_PANE], release
+            assert herdr_calls(home)[-1] == release, "a report landed after the release"
+
+        ok &= scenario("35_herdr_quit_releases", term, quit_)
+    finally:
+        run.close()
+
+    # Herdr Desktop: no HERDR_BIN_PATH or pane id, only HC_TERMINAL_ID. OSC 7501 yes, CLI no.
+    run = Run("Chef", herdr="desktop", MOCK_REPLY="0.4", MOCK_STREAM="0")
+    try:
+        def desktop(t):
+            t.wait(has("Chef", "earlier reply"), timeout=10)
+            nxt = expect_osc(t, 0, state="idle", app="Chef", title="Chef")
+            t.send("hello desktop")
+            t.wait(lambda lines: "hello desktop" in " ".join(composer_rows(lines)))
+            t.send("\r")
+            expect_osc(t, nxt, state="working", app="Chef")
+            t.wait(has("reply to hello desktop"), timeout=10)
+            t.send(CTRL_D)
+            assert t.exited(5), "still running 5s after ctrl-d"
+            assert any(report["state"] == "clear" for report in osc_reports(t.raw)), "no OSC clear"
+            t.settle(0.3)
+            assert herdr_calls(run.home) == [], f"herdr was called: {herdr_calls(run.home)}"
+
+        ok &= scenario("36_herdr_desktop_osc_only", run.term, desktop)
+    finally:
+        run.close()
+    return ok
+
+
+FLOWS = {"main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow}
 
 
 def main():
