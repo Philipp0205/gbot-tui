@@ -16,6 +16,8 @@ The text sent picks the reply, for bench/e2e_tui.py:
   "long ..."     a long Markdown reply with headings, a list and a fenced code block
   "approve ..."  a pending approval card
   "widget ..."   a widget with three options
+  "steps ..."    one widget with three `steps` (the second allows custom text)
+  "multi ..."    three separate widget messages in a row (the second allows custom text)
   anything else  "reply to <text>"
 While a reply grows it is an `isStreaming` entry, and a `thread --after <its id>`
 still returns it, so the poll sees the new text under the same id. It keeps
@@ -73,6 +75,31 @@ def reply_entries(ident, text, at):
             "message": {"type": "widget", "widget": {"prompt": "Pick a city", "options": [
                 {"label": "Berlin", "value": "Berlin"}, {"label": "Paris", "value": "Paris"}, {"label": "Rome", "value": "Rome"}]}},
         }]
+    if text.startswith("steps"):
+        # One widget, three questions. The second takes typed text.
+        return [{
+            "id": ident, "kind": "send-message", "at": at,
+            "message": {"type": "widget", "widget": {"steps": [
+                {"prompt": "Pick a city", "options": [
+                    {"label": "Berlin", "value": "Berlin"}, {"label": "Paris", "value": "Paris"}, {"label": "Rome", "value": "Rome"}]},
+                {"prompt": "Name the hotel", "allowCustom": True, "options": [
+                    {"label": "Ritz", "value": "Ritz"}, {"label": "Plaza", "value": "Plaza"}]},
+                {"prompt": "Pick a day", "options": [
+                    {"label": "Monday", "value": "Monday"}, {"label": "Friday", "value": "Friday"}]},
+            ]}},
+        }]
+    if text.startswith("multi"):
+        # Three separate widget messages in a row, each open.
+        asks = [
+            ("Pick a city", [("Berlin", "Berlin"), ("Paris", "Paris"), ("Rome", "Rome")], False),
+            ("Name the hotel", [("Ritz", "Ritz"), ("Plaza", "Plaza")], True),
+            ("Pick a day", [("Monday", "Monday"), ("Friday", "Friday")], False),
+        ]
+        return [{
+            "id": f"{ident}-{n}", "kind": "send-message", "at": at,
+            "message": {"type": "widget", "widget": {"prompt": prompt, "allowCustom": custom,
+                "options": [{"label": label, "value": value} for label, value in options]}},
+        } for n, (prompt, options, custom) in enumerate(asks, 1)]
     body = LONG if text.startswith("long") else "reply to " + text
     return [{"id": ident, "role": "assistant", "text": body, "at": at, "stream": STREAM}]
 

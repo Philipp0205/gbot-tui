@@ -80,11 +80,12 @@ class Chat:
         self.pending_request = ""
         self.widget_picks = {}
         self.widget_sent = {}
-        self.widget_steps = {}
+        # The open card's paging: {"first": key of page 1, "at": page, "answers": {key: value}}.
+        self.widget_card = {}
         self.widget_busy = False
         self.widget_entry = ""
+        self.widget_group = []
         self.widget_phase = "idle"
-        self._held_steps = None
         self.choice_wait = False
         self.content_token = ""
         self.content_at = None
@@ -338,10 +339,36 @@ class Chat:
             return ""
         return self.session_id
 
-    def step_at(self, entry):
-        if not isinstance(entry, dict):
-            return 0
-        return (self.widget_steps.get(entry.get("id")) or {}).get("at", 0)
+    def card(self):
+        """(pages, current index, answers) of the open card. See widgets.card_view."""
+        return widgets.card_view(self.messages, self.widget_card)
+
+    def page(self):
+        """The question the number keys answer, or None when nothing is open."""
+        found, at, _answers = self.card()
+        return found[at] if found else None
+
+    def _card_state(self, found):
+        """The paging state for this card. A different card starts over."""
+        if self.widget_card.get("first") != found[0]["key"]:
+            self.widget_card = {"first": found[0]["key"], "at": 0, "answers": {}}
+        return self.widget_card
+
+    def page_picks(self, page):
+        """The toggled values on a multi-select page. A saved answer counts until toggled."""
+        _found, _at, answers = self.card()
+        return widgets.page_picks(page, self.widget_picks, answers)
+
+    def turn_page(self, delta):
+        """Move a paged card back or forward. False when the card is one question."""
+        found, at, _answers = self.card()
+        if len(found) < 2:
+            return False
+        state = self._card_state(found)
+        state["at"] = min(max(at + delta, 0), len(found) - 1)
+        self.error = ""
+        self.touch_rows()
+        return True
 
     def note_content(self):
         """Restart the quiet-turn clock when anything in the thread changes.
@@ -390,25 +417,31 @@ class Chat:
         self.sync_activity()
         return True
 
-    def begin_choice(self, value):
-        """Mark the newest open widget answered and return the gateway arguments.
+    def begin_choice(self, text, marks=None):
+        """Mark the open card answered and return the gateway arguments.
 
-        The mark shows immediately. The value is what `gbot send` will carry.
-        `agent_id` is empty when the thread only had a session id.
+        `marks` is [(entry, answer)] for every widget the message answers; it
+        defaults to the newest open widget with `text`. The mark shows
+        immediately. `text` is what `gbot send` will carry. `agent_id` is empty
+        when the thread only had a session id.
         """
         if self.widget_busy or not self.loaded or not (self.agent_id or self.session_id):
             return None
-        entry = widgets.latest_widget(self.messages)
-        if entry is None:
+        if marks is None:
+            entry = widgets.latest_widget(self.messages)
+            marks = [(entry, text)] if entry is not None else []
+        ids = [entry.get("id") for entry, _answer in marks]
+        if not marks or not text or not all(isinstance(ident, str) and ident for ident in ids):
             return None
-        entry_id = entry.get("id") if isinstance(entry.get("id"), str) else ""
-        if not entry_id or not value:
-            return None
-        self.widget_sent[entry_id] = value
-        entry["respondedValue"] = value
-        self.widget_picks.pop(entry_id, None)
-        self.messages.append({"role": "user", "text": value, "local": True, "widget_answer": entry_id})
+        entry_id = ids[-1]
+        for page in self.card()[0]:
+            self.widget_picks.pop(page["key"], None)
+        for entry, answer in marks:
+            self.widget_sent[entry["id"]] = answer
+            entry["respondedValue"] = answer
+        self.messages.append({"role": "user", "text": text, "local": True, "widget_answer": entry_id})
         self.widget_entry = entry_id
+        self.widget_group = ids
         self.widget_busy = True
         self.widget_phase = self.phase
         self.choice_wait = True
@@ -418,61 +451,65 @@ class Chat:
         self.note_content()
         self.note("working")
         self.sync_activity()
-        return (self.target, self.choice_agent_id(), entry_id, value)
+        return (self.target, self.choice_agent_id(), entry_id, text)
 
     def commit_choice(self, value):
-        """Record one answer. A finished card returns the gateway arguments.
+        """Record the answer to the open question. A finished card returns the gateway arguments.
 
-        A `steps` card advances one question at a time and sends once, with a
-        blank line between answers. "step" means another question is waiting.
+        A card of several questions (one widget with `steps`, or widgets in a
+        row) keeps every answer and moves to the next unanswered question. The
+        last answer sends one message, an answer per question with a blank line
+        between. "step" means the card is still open.
         """
-        if not value:
+        if not value or self.widget_busy:
             return None
-        entry = widgets.latest_widget(self.messages)
-        if entry is None:
+        found, at, _answers = self.card()
+        if not found:
             return None
-        steps = widgets.step_questions(entry)
-        if not steps:
+        if len(found) == 1:
             return self.begin_choice(value)
-        entry_id = entry.get("id") if isinstance(entry.get("id"), str) else ""
-        if not entry_id:
-            return None
-        state = self.widget_steps.get(entry_id) or {"at": 0, "answers": []}
-        answers = list(state.get("answers") or [])
-        at = int(state.get("at") or 0)
-        if at >= len(steps):
-            return None
-        answers.append(value)
-        at += 1
-        self.widget_picks.pop(entry_id, None)
-        if at < len(steps):
-            self.widget_steps[entry_id] = {"at": at, "answers": answers}
-            self.touch_rows()
-            return "step"
-        self._held_steps = (entry_id, {"at": len(steps) - 1, "answers": answers[:-1]})
-        self.widget_steps.pop(entry_id, None)
-        return self.begin_choice("\n\n".join(answers))
+        state = self._card_state(found)
+        answers = state["answers"]
+        answers[found[at]["key"]] = value
+        self.widget_picks.pop(found[at]["key"], None)
+        if all(page["key"] in answers for page in found):
+            return self._send_card(found, answers)
+        # On to the next question without an answer, wrapping to an earlier one.
+        order = list(range(at + 1, len(found))) + list(range(at))
+        state["at"] = next(i for i in order if found[i]["key"] not in answers)
+        self.touch_rows()
+        return "step"
+
+    def _send_card(self, found, answers):
+        entries = []
+        for page in found:
+            if page["entry"] not in entries:
+                entries.append(page["entry"])
+        text = widgets.page_answer(found, answers)
+        if found[0]["step"] is not None:
+            marks = [(entries[0], text)]
+        else:
+            marks = [(page["entry"], answers[page["key"]]) for page in found]
+        return self.begin_choice(text, marks)
+
+    def saved_answer(self, page):
+        """What this question was answered with so far, or ""."""
+        return str(self.card()[2].get(page["key"], ""))
 
     def toggle_choice(self, index):
-        entry = widgets.latest_widget(self.messages)
-        if entry is None:
+        page = self.page()
+        if page is None or not page["multi"]:
             return False
-        _prompt, options, multi, _custom = widgets.current_question(entry, self.step_at(entry))
-        if not multi:
+        if index < 0 or index >= len(page["options"]):
             return False
-        if index < 0 or index >= len(options):
-            return False
-        entry_id = entry.get("id")
-        value = options[index][1]
-        picks = list(self.widget_picks.get(entry_id) or [])
+        value = page["options"][index][1]
+        picks = self.page_picks(page)
         if value in picks:
             picks.remove(value)
         else:
             picks.append(value)
-        if picks:
-            self.widget_picks[entry_id] = picks
-        else:
-            self.widget_picks.pop(entry_id, None)
+        # An empty list stays: all unticked is not the saved answer.
+        self.widget_picks[page["key"]] = picks
         self.touch_rows()
         return True
 
@@ -480,14 +517,20 @@ class Chat:
         """The widget call returned. The next read is the whole thread."""
         self.widget_busy = False
         self.widget_entry = ""
+        self.widget_group = []
         self.full_reload = True
 
     def fail_choice(self):
-        """The widget call failed. Put the options back so they can be picked again."""
+        """The widget call failed. Put the options back so they can be picked again.
+
+        The card keeps its answers, on its last question, so one more answer sends again.
+        """
         entry_id = self.widget_entry
-        value = self.widget_sent.pop(entry_id, None)
+        group = self.widget_group or [entry_id]
+        values = {ident: self.widget_sent.pop(ident, None) for ident in group}
         self.widget_busy = False
         self.widget_entry = ""
+        self.widget_group = []
         self.choice_wait = False
         self.messages = [
             entry
@@ -495,11 +538,11 @@ class Chat:
             if not (entry.get("local") and entry.get("widget_answer") == entry_id)
         ]
         for entry in self.messages:
-            if entry.get("id") == entry_id and entry.get("respondedValue") == value:
+            if entry.get("id") in values and entry.get("respondedValue") == values[entry.get("id")]:
                 entry.pop("respondedValue", None)
-        if self._held_steps and self._held_steps[0] == entry_id:
-            self.widget_steps[entry_id] = self._held_steps[1]
-        self._held_steps = None
+        found = self.card()[0]
+        if len(found) > 1:
+            self._card_state(found)["at"] = len(found) - 1
         self.touch_rows()
         self.note_content()
         phase = self.widget_phase if self.widget_phase in {"working", "blocked"} else "idle"

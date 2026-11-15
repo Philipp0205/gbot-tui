@@ -176,7 +176,7 @@ def visible_rows(chat, width):
     # Wrapping the whole thread on every keystroke is what made typing feel late.
     last = chat.messages[-1] if chat.messages else None
     picks = getattr(chat, "widget_picks", None) or {}
-    progress = getattr(chat, "widget_steps", None) or {}
+    card = getattr(chat, "widget_card", None) or {}
     key = (
         id(chat.messages),
         len(chat.messages),
@@ -184,14 +184,10 @@ def visible_rows(chat, width):
         transcript.entry_text(last) if last else "",
         chat.rows_rev,
         tuple((name, tuple(values)) for name, values in picks.items()),
-        tuple(
-            (name, state.get("at"), tuple(state.get("answers") or ()))
-            for name, state in progress.items()
-            if isinstance(state, dict)
-        ),
+        (card.get("first"), card.get("at"), tuple((card.get("answers") or {}).items())),
     )
     if getattr(chat, "_rows_key", None) != key:
-        chat._rows = transcript_rows(chat.messages, width, picks, progress)
+        chat._rows = transcript_rows(chat.messages, width, picks, card)
         chat._rows_key = key
     return chat._rows
 
@@ -251,27 +247,34 @@ def card_lines(entry, width):
     return lines
 
 
-def transcript_rows(entries, width, picks=None, progress=None):
+def transcript_rows(entries, width, picks=None, card=None):
     rows = []
     user_w = max(width - 8, 1)
     text_w = max(width - 4, 1)
     picks = picks or {}
-    progress = progress or {}
-    current = widgets.latest_widget(entries)
-    current_id = current.get("id") if current else None
+    found, at, answers = widgets.card_view(entries, card)
+    # An open card of several questions is one page, drawn where its newest widget is.
+    paged = len(found) > 1
+    paged_ids = {id(page["entry"]) for page in found} if paged else set()
+    page_entry = found[-1]["entry"] if paged else None
+    # A single open question is numbered, and only that one.
+    current = found[0]["entry"] if found and not paged else None
     hidden = transcript.hidden_status_ids(entries)
     for entry in entries:
         if isinstance(entry, dict) and transcript._row_key(entry) in hidden:
             continue
         lines = card_lines(entry, width)
-        chosen = picks.get(entry.get("id")) if isinstance(entry, dict) else None
-        # No open widget means nothing is numbered, including a stale one
-        # that still has options because a later user message closed it.
-        numbered = bool(current_id) and isinstance(entry, dict) and entry.get("id") == current_id
-        state = progress.get(entry.get("id")) if isinstance(entry, dict) else None
-        step_at = (state or {}).get("at", 0) if isinstance(state, dict) else 0
-        step_answers = (state or {}).get("answers") or () if isinstance(state, dict) else ()
-        text = transcript.entry_text(entry, chosen or (), numbered, step_at, step_answers).strip()
+        if id(entry) in paged_ids:
+            page = found[at]
+            text = (
+                widgets.page_text(page, at, len(found), widgets.page_picks(page, picks, answers), answers.get(page["key"], ""))
+                if entry is page_entry
+                else ""
+            )
+        else:
+            numbered = current is not None and entry is current
+            name = found[0]["key"] if numbered else entry.get("id") if isinstance(entry, dict) else None
+            text = transcript.entry_text(entry, picks.get(name) or (), numbered).strip()
         if not text and not lines:
             continue
         if rows:

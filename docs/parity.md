@@ -30,6 +30,7 @@ What the desktop app's chat does, and where gbot-tui stands. The backend is fixe
 | Bracketed paste (keep newlines in a paste) | Done | the chat sets `?2004h`; `paint.decode_keys` turns Enter inside `ESC[200~`…`ESC[201~` into a draft newline | 22 |
 | Approvals (y / n) | Done | `transcript.approval_of`, `Chat.begin_decision`, `gbot_cli.respond_approval` | 08 |
 | Widgets / choices (single, multi, steps, custom) | Done | `widgets.py`, `chat_screen.choice_key`; answer is a `send` | 09 |
+| Several questions at once: paged card, back/forward, one submit (one widget with `steps`, or widgets in a row) | Done | `widgets.pages`, `chat_screen.page_key`, `Chat.widget_card`; Left/Right or `[` `]`; one `send` with every answer | 39, 40 |
 | Attachments display | Done (text) | `transcript.attachment_text` shows name and size | |
 | Images inline | Not possible in a plain curses grid | could print the file name and offer open-in-viewer only if the thread carries a URL | |
 | File upload / send attachments | Not possible | `gbot send` takes text only | |

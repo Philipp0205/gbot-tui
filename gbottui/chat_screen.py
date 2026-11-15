@@ -43,10 +43,13 @@ def composer_key(chat, key):
     return ("type", key)
 
 
-def picked_lines(entry, picks, step_at=0):
-    _prompt, options, _multi, _custom = widgets.current_question(entry, step_at)
-    chosen = set(picks or ())
-    return "\n".join(value for _label, value in options if value in chosen)
+def picked_lines(chat):
+    """The toggled values of the open multi-select page, in option order."""
+    page = chat.page()
+    if page is None:
+        return ""
+    chosen = set(chat.page_picks(page))
+    return "\n".join(value for _label, value in page["options"] if value in chosen)
 
 
 def clear_choice_digit(chat):
@@ -60,16 +63,41 @@ def _digit_fresh(chat):
     return activity.clock() - chat.digit_at <= widgets.DIGIT_WINDOW
 
 
+PAGE_BACK = (curses.KEY_LEFT, "[")
+PAGE_FORWARD = (curses.KEY_RIGHT, "]")
+
+
+def page_key(chat, key):
+    """Left/Right or [ ] turn the open card's pages, while the composer is empty.
+
+    With text typed the same keys move the cursor or type a bracket. A paste
+    never turns a page. False when the key is not a page key or the card is
+    one question.
+    """
+    if chat.typed or chat.widget_busy or isinstance(key, paint.Pasted):
+        return False
+    if key in PAGE_BACK:
+        delta = -1
+    elif key in PAGE_FORWARD:
+        delta = 1
+    else:
+        return False
+    if not chat.loaded:
+        return False
+    clear_choice_digit(chat)
+    return chat.turn_page(delta)
+
+
 def _activate_option(chat, number):
     """1-based option. A tuple is the send job. "toggle", "step", or "ignore"."""
-    entry = widgets.latest_widget(chat.messages)
-    if entry is None or not chat.loaded or not (chat.agent_id or chat.session_id):
+    page = chat.page()
+    if page is None or not chat.loaded or not (chat.agent_id or chat.session_id):
         return "ignore"
-    _prompt, options, multi, _custom = widgets.current_question(entry, chat.step_at(entry))
+    options = page["options"]
     if number < 1 or number > len(options):
         return "ignore"
     index = number - 1
-    if multi:
+    if page["multi"]:
         chat.toggle_choice(index)
         return "toggle"
     result = chat.commit_choice(options[index][1])
@@ -95,11 +123,10 @@ def flush_choice_digit(chat):
     clear_choice_digit(chat)
     if len(buf) != 1 or buf == "0":
         return None
-    entry = widgets.latest_widget(chat.messages)
-    if entry is None:
+    page = chat.page()
+    if page is None:
         return None
-    _prompt, options, _multi, _custom = widgets.current_question(entry, chat.step_at(entry))
-    if len(options) <= widgets.OPTION_DIGITS:
+    if len(page["options"]) <= widgets.OPTION_DIGITS:
         return None
     return _activate_option(chat, int(buf))
 
@@ -129,15 +156,15 @@ def choice_key(chat, key):
         if key.isdigit():
             return "ignore"
         return None
-    entry = widgets.latest_widget(chat.messages)
-    if entry is None:
+    page = chat.page()
+    if page is None:
         clear_choice_digit(chat)
         return None
     if not chat.loaded or not (chat.agent_id or chat.session_id):
         if key.isdigit():
             return "ignore"
         return None
-    _prompt, options, _multi, _custom = widgets.current_question(entry, chat.step_at(entry))
+    options = page["options"]
     if not options or not key.isdigit():
         return None
     if len(options) <= widgets.OPTION_DIGITS:
@@ -409,6 +436,8 @@ def composer_key_press(chat, key, stdscr):
         # nonl() makes Enter "\r", so a bare LF is ctrl+enter / ctrl+j.
         chat.type_text("\n")
         return None
+    if page_key(chat, key):
+        return None
     change = edit_motion(key)
     if change is not None:
         chat.edit(change)
@@ -417,32 +446,29 @@ def composer_key_press(chat, key, stdscr):
         vertical_key(chat, key, stdscr)
         return None
     if key in ("\r", curses.KEY_ENTER):
-        entry = widgets.latest_widget(chat.messages) if not chat.widget_busy else None
-        if entry is not None and chat.typed.strip():
-            _prompt, _options, _multi, custom = widgets.current_question(entry, chat.step_at(entry))
-            if custom:
-                text = chat.typed.strip()
-                chat.typed = ""
+        page = chat.page() if not chat.widget_busy else None
+        if page is not None and chat.typed.strip() and page["custom"]:
+            text = chat.typed.strip()
+            chat.typed = ""
+            chat.error = ""
+            result = chat.commit_choice(text)
+            if result == "step":
+                chat.follow = True
+                return None
+            if result:
+                chat.follow = True
+                return ("choice", result)
+        if page is not None and not chat.typed and page["multi"]:
+            value = picked_lines(chat)
+            result = chat.commit_choice(value) if value else None
+            if result == "step":
                 chat.error = ""
-                result = chat.commit_choice(text)
-                if result == "step":
-                    return None
-                if result:
-                    chat.follow = True
-                    return ("choice", result)
-        if entry is not None and not chat.typed:
-            _prompt, _options, multi, _custom = widgets.current_question(entry, chat.step_at(entry))
-            if multi:
-                value = picked_lines(entry, chat.widget_picks.get(entry.get("id")), chat.step_at(entry))
-                result = chat.commit_choice(value) if value else None
-                if result == "step":
-                    chat.error = ""
-                    chat.follow = True
-                    return None
-                if result:
-                    chat.error = ""
-                    chat.follow = True
-                    return ("choice", result)
+                chat.follow = True
+                return None
+            if result:
+                chat.error = ""
+                chat.follow = True
+                return ("choice", result)
         try:
             route = roster.parse_route(chat.typed.strip(), [bot["name"] for bot in cache.read_roster()])
         except gbot_cli.GbotError as error:

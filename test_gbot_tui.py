@@ -2099,7 +2099,8 @@ class WidgetTests(unittest.TestCase):
         rows = [line for kind, line in grid.transcript_rows([entry], 80) if kind == "text"]
         self.assertIn("1  Sign in and request the export", rows)
         older = _widget("Older?", [{"label": "Old", "value": "old"}], id="old")
-        both = [line for _kind, line in grid.transcript_rows([older, entry], 80)]
+        reply = {"id": "u", "role": "user", "text": "later"}
+        both = [line for _kind, line in grid.transcript_rows([older, reply, entry], 80)]
         self.assertIn("   Old", both)
         self.assertNotIn("1  Old", both)
         self.assertIn("1  Sign in and request the export", both)
@@ -2296,14 +2297,13 @@ class WidgetTests(unittest.TestCase):
         chat = self._chat(entry)
         self.assertIsNone(chat_screen.chat_key(chat, "1", None))
         self.assertEqual(chat.phase, "idle")
-        shown = [
-            line
-            for kind, line in grid.transcript_rows(chat.messages, 80, chat.widget_picks, chat.widget_steps)
-            if kind == "text"
-        ]
-        self.assertIn("●  Berlin", shown)
-        self.assertIn("1  One", "\n".join(shown))
+        shown = self._shown(chat)
+        self.assertIn("question 2/2", shown[0])
+        self.assertIn("Days?", shown)
+        self.assertNotIn("City?", shown)
+        self.assertIn("  1  One", shown)
         self.assertIsNone(chat_screen.chat_key(chat, "2", None))
+        self.assertIn("● 2  Two", self._shown(chat))
         job = chat_screen.chat_key(chat, "\r", None)
         self.assertEqual(job[0], "choice")
         self.assertEqual(job[1][-1], "Berlin\n\n2")
@@ -2311,13 +2311,169 @@ class WidgetTests(unittest.TestCase):
         chat.fail_choice()
         self.assertFalse(widgets.widget_answered(chat.messages[0]))
         self.assertEqual(chat.phase, "idle")
-        restored = transcript.entry_text(
-            chat.messages[0],
-            step_at=chat.step_at(chat.messages[0]),
-            step_answers=chat.widget_steps["w1"]["answers"],
-        )
-        self.assertIn("●  Berlin", restored)
-        self.assertIn("1  One", restored)
+        # The answers survive a failed send, on the last question.
+        restored = self._shown(chat)
+        self.assertIn("question 2/2", restored[0])
+        self.assertIn("● 2  Two", restored)
+        self.assertIsNone(chat_screen.chat_key(chat, "[", None))
+        self.assertIn("● 1  Berlin", self._shown(chat))
+
+    def _shown(self, chat, width=80):
+        return [line for kind, line in grid.transcript_rows(chat.messages, width, chat.widget_picks, chat.widget_card) if kind == "text"]
+
+    def _steps_entry(self, **extra):
+        steps = [
+            {"prompt": "City?", "options": [{"label": "Berlin", "value": "Berlin"}, {"label": "Paris", "value": "Paris"}]},
+            {"prompt": "Hotel?", "allowCustom": True, "options": [{"label": "Ritz", "value": "Ritz"}]},
+            {"prompt": "Days?", "multiSelect": True, "options": [{"label": "One", "value": "1"}, {"label": "Two", "value": "2"}]},
+        ]
+        entry = {"kind": "send-message", "id": "w1", "message": {"type": "widget", "widget": {"steps": steps}}}
+        entry.update(extra)
+        return entry
+
+    def _row(self):
+        asks = [
+            ("City?", [("Berlin", "Berlin"), ("Paris", "Paris")], False),
+            ("Hotel?", [("Ritz", "Ritz")], True),
+            ("Day?", [("Mon", "Monday"), ("Fri", "Friday")], False),
+        ]
+        out = []
+        for n, (prompt, options, custom) in enumerate(asks, 1):
+            entry = _widget(prompt, [{"label": label, "value": value} for label, value in options], id=f"r{n}")
+            if custom:
+                entry["message"]["widget"]["allowCustom"] = True
+            out.append(entry)
+        return out
+
+    def test_a_paged_card_shows_one_question_and_pages_back_and_forth(self):
+        chat = self._chat(self._steps_entry())
+        first = self._shown(chat)
+        self.assertIn("question 1/3", first[0])
+        self.assertEqual(first[1:], ["City?", "  1  Berlin", "  2  Paris"])
+        self.assertEqual(widgets.page_hint(chat.page()), "1-2 answer")
+        self.assertIsNone(chat_screen.chat_key(chat, "2", None))
+        self.assertIn("question 2/3", self._shown(chat)[0])
+        self.assertNotIn("City?", self._shown(chat))
+        # Right and `]` page forward without an answer, Left and `[` back, and answers stay.
+        self.assertIsNone(chat_screen.chat_key(chat, curses.KEY_RIGHT, None))
+        self.assertIn("question 3/3", self._shown(chat)[0])
+        self.assertIsNone(chat_screen.chat_key(chat, curses.KEY_RIGHT, None))
+        self.assertIn("question 3/3", self._shown(chat)[0])
+        self.assertIsNone(chat_screen.chat_key(chat, "[", None))
+        self.assertIsNone(chat_screen.chat_key(chat, curses.KEY_LEFT, None))
+        back = self._shown(chat)
+        self.assertIn("question 1/3", back[0])
+        self.assertIn("● 2  Paris", back)
+        self.assertEqual(chat.typed, "")
+        self.assertIsNone(chat_screen.chat_key(chat, "]", None))
+        self.assertIn("question 2/3", self._shown(chat)[0])
+        self.assertEqual(chat.phase, "idle")
+
+    def test_a_paged_card_sends_once_with_every_answer(self):
+        chat = self._chat(self._steps_entry())
+        chat_screen.chat_key(chat, "1", None)
+        chat.typed = "Grand"
+        self.assertIsNone(chat_screen.chat_key(chat, "\r", None))
+        self.assertEqual(chat.typed, "")
+        self.assertIn("question 3/3", self._shown(chat)[0])
+        # Toggling a multi-select, paging away and back keeps the toggle.
+        chat_screen.chat_key(chat, "2", None)
+        chat_screen.chat_key(chat, "[", None)
+        chat_screen.chat_key(chat, "]", None)
+        self.assertIn("● 2  Two", self._shown(chat))
+        self.assertIn("  1  One", self._shown(chat))
+        job = chat_screen.chat_key(chat, "\r", None)
+        self.assertEqual(job, ("choice", ("Researcher", "agent", "w1", "Berlin\n\nGrand\n\n2")))
+        self.assertEqual(chat.messages[0]["respondedValue"], "Berlin\n\nGrand\n\n2")
+        shown = self._shown(chat)
+        self.assertFalse(any(line.startswith("question") for line in shown))
+        self.assertFalse(any(line.lstrip().startswith(("1  ", "2  ")) for line in shown), shown)
+
+    def test_a_paged_card_waits_until_every_question_has_an_answer(self):
+        chat = self._chat(self._steps_entry())
+        chat_screen.chat_key(chat, curses.KEY_RIGHT, None)
+        chat_screen.chat_key(chat, curses.KEY_RIGHT, None)
+        chat_screen.chat_key(chat, "1", None)
+        chat_screen.chat_key(chat, "2", None)
+        self.assertIsNone(chat_screen.chat_key(chat, "\r", None))
+        # The last question is answered, so it goes to the first one still open.
+        self.assertIn("question 1/3", self._shown(chat)[0])
+        self.assertEqual(chat.phase, "idle")
+        job = chat_screen.chat_key(chat, "2", None)
+        self.assertIn("question 2/3", self._shown(chat)[0])
+        self.assertIsNone(job)
+        chat.typed = "Grand"
+        job = chat_screen.chat_key(chat, "\r", None)
+        self.assertEqual(job[1][-1], "Paris\n\nGrand\n\n1\n2")
+
+    def test_widgets_in_a_row_are_one_paged_card(self):
+        first, second, third = self._row()
+        user = {"id": "u0", "role": "user", "text": "plan"}
+        chat = self._chat(first)
+        chat.messages = [user, first, second, third]
+        self.assertEqual([page["prompt"] for page in widgets.pages(chat.messages)], ["City?", "Hotel?", "Day?"])
+        shown = self._shown(chat)
+        self.assertIn("question 1/3", shown[0])
+        self.assertIn("City?", shown)
+        self.assertNotIn("Hotel?", shown)
+        self.assertNotIn("Day?", shown)
+        chat_screen.chat_key(chat, "1", None)
+        self.assertIn("Hotel?", self._shown(chat))
+        chat.typed = "Grand"
+        chat_screen.chat_key(chat, "\r", None)
+        self.assertEqual(chat.typed, "")
+        self.assertIn("question 3/3", self._shown(chat)[0])
+        job = chat_screen.chat_key(chat, "2", None)
+        want = "City?: Berlin\n\nHotel?: Grand\n\nDay?: Friday"
+        self.assertEqual(job, ("choice", ("Researcher", "agent", "r3", want)))
+        self.assertEqual([entry.get("respondedValue") for entry in chat.messages[1:4]], ["Berlin", "Grand", "Friday"])
+        self.assertEqual(widgets.pages(chat.messages), [])
+        shown = self._shown(chat)
+        self.assertFalse(any(line.startswith("question") for line in shown))
+        self.assertFalse(any(line.lstrip().startswith(("1  ", "2  ")) for line in shown), shown)
+        # A failed send gives every card back, answers kept, on the last question.
+        chat.fail_choice()
+        self.assertEqual(len(widgets.pages(chat.messages)), 3)
+        self.assertFalse(any(widgets.widget_answered(entry) for entry in chat.messages[1:4]))
+        self.assertIn("question 3/3", self._shown(chat)[0])
+        chat_screen.chat_key(chat, "[", None)
+        chat_screen.chat_key(chat, "[", None)
+        self.assertIn("● 1  Berlin", self._shown(chat))
+
+    def test_widgets_before_your_reply_are_not_paged(self):
+        first, second, third = self._row()
+        user = {"id": "u0", "role": "user", "text": "plan"}
+        reply = {"id": "u1", "role": "user", "text": "later"}
+        chat = self._chat(first)
+        chat.messages = [first, second, user, third]
+        self.assertEqual([page["prompt"] for page in widgets.pages(chat.messages)], ["Day?"])
+        self.assertFalse(any(line.startswith("question") for line in self._shown(chat)))
+        chat.messages = [first, second, third, reply]
+        self.assertEqual(widgets.pages(chat.messages), [])
+        self.assertFalse(any(line.startswith("question") for line in self._shown(chat)))
+
+    def test_page_keys_are_text_or_cursor_keys_when_there_is_nothing_to_page(self):
+        single = _widget("Send?", [{"label": "Yes", "value": "yes"}, {"label": "No", "value": "no"}])
+        chat = self._chat(single)
+        self.assertIsNone(chat_screen.chat_key(chat, "[", None))
+        self.assertEqual(chat.typed, "[")
+        self.assertIsNone(chat_screen.chat_key(chat, curses.KEY_LEFT, None))
+        self.assertEqual(chat.pos, 0)
+        self.assertNotIn("question", "\n".join(self._shown(chat)))
+        # With a paged card open, text in the composer keeps the arrows and brackets.
+        paged = self._chat(self._steps_entry())
+        paged.typed = "ab"
+        chat_screen.chat_key(paged, curses.KEY_LEFT, None)
+        self.assertEqual(paged.pos, 1)
+        chat_screen.chat_key(paged, "[", None)
+        self.assertEqual(paged.typed, "a[b")
+        self.assertIn("question 1/3", self._shown(paged)[0])
+
+    def test_a_paged_card_does_not_page_while_the_thread_is_loading(self):
+        chat = self._chat(self._steps_entry())
+        chat.loaded = False
+        chat_screen.chat_key(chat, curses.KEY_RIGHT, None)
+        self.assertIn("question 1/3", self._shown(chat)[0])
 
     def test_a_step_without_a_way_to_answer_says_so(self):
         entry = {
