@@ -1027,7 +1027,90 @@ def herdr_flow():
     return ok
 
 
-FLOWS = {"main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow, "unread": unread_flow}
+def sent_texts(run, bot):
+    """What the mock's thread file holds as the user's messages, whole and in order."""
+    name = "thread-" + "".join(ch for ch in bot if ch.isalnum()) + ".json"
+    with open(os.path.join(run.home, "mock", name), encoding="utf-8") as handle:
+        return [entry["text"] for entry in json.load(handle) if entry.get("role") == "user"]
+
+
+def paged_flow():
+    """Several questions at once: one card with `steps`, and widgets in a row."""
+    # A: one widget, three steps, the second takes typed text.
+    run = Run("Chef")
+    try:
+        def steps(t):
+            t.wait(has("Chef", "earlier reply"), timeout=10)
+            t.settle(0.5)
+            t.send("steps for the trip")
+            t.send("\r")
+            t.wait(has("question 1/3", "Pick a city", "1  Berlin"), timeout=6)
+            t.wait(lacks("Name the hotel", "Pick a day"), timeout=2)
+            t.wait(has("1-3 answer"), timeout=2)
+            dump("39_steps_first_page", t)
+            t.send("2")
+            t.wait(has("question 2/3", "Name the hotel", "1  Ritz"), timeout=4)
+            t.wait(lacks("Pick a city", "Pick a day"), timeout=2)
+            t.send(LEFT)
+            t.wait(has("question 1/3", "Pick a city", "● 2  Paris"), timeout=4)
+            t.send(RIGHT)
+            t.wait(has("question 2/3", "Name the hotel"), timeout=4)
+            t.send("Grand")
+            t.wait(lambda lines: "Grand" in " ".join(composer_rows(lines)))
+            t.send("\r")
+            t.wait(has("question 3/3", "Pick a day", "1  Monday"), timeout=4)
+            t.send("[")
+            t.wait(has("question 2/3", "●  Grand"), timeout=4)
+            assert composer_rows(t.lines()) == ["→  Add a follow-up"], composer_rows(t.lines())
+            t.send("]")
+            t.wait(has("question 3/3"), timeout=4)
+            t.send("2")
+            t.wait(has("reply to Paris", "Friday"), timeout=10)
+            assert sent_texts(run, "Chef")[-1] == "Paris\n\nGrand\n\nFriday", sent_texts(run, "Chef")[-1]
+            t.wait(lacks("question"), timeout=2)
+            assert not any(line.lstrip().startswith(("1  ", "2  ")) for line in t.lines()), "an answered card is numbered"
+
+        ok = scenario("39_steps_paged_card", run.term, steps)
+    finally:
+        run.close()
+
+    # B: three separate widget messages after the last user message.
+    run = Run("Chef")
+    try:
+        def several(t):
+            t.wait(has("Chef", "earlier reply"), timeout=10)
+            t.settle(0.5)
+            t.send("multi for the trip")
+            t.send("\r")
+            t.wait(has("question 1/3", "Pick a city", "1  Berlin"), timeout=6)
+            t.wait(lacks("Name the hotel", "Pick a day"), timeout=2)
+            dump("40_widgets_first_page", t)
+            t.send("1")
+            t.wait(has("question 2/3", "Name the hotel"), timeout=4)
+            t.send(RIGHT)
+            t.wait(has("question 3/3", "Pick a day", "1  Monday"), timeout=4)
+            t.send(LEFT)
+            t.send("Grand")
+            t.wait(lambda lines: "Grand" in " ".join(composer_rows(lines)))
+            t.send("\r")
+            t.wait(has("question 3/3", "Pick a day"), timeout=4)
+            t.send("[[")
+            t.wait(has("question 1/3", "● 1  Berlin"), timeout=4)
+            t.send("]]")
+            t.wait(has("question 3/3"), timeout=4)
+            t.send("1")
+            t.wait(has("reply to Pick a city: Berlin"), timeout=10)
+            want = "Pick a city: Berlin\n\nName the hotel: Grand\n\nPick a day: Monday"
+            assert sent_texts(run, "Chef")[-1] == want, sent_texts(run, "Chef")[-1]
+            t.wait(lacks("question"), timeout=2)
+
+        ok &= scenario("40_widgets_paged_card", run.term, several)
+    finally:
+        run.close()
+    return ok
+
+
+FLOWS = {"paged": paged_flow, "main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow, "unread": unread_flow}
 
 
 def main():

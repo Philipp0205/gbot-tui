@@ -88,8 +88,8 @@ def widget_open(entry):
     return bool(widget_options(entry))
 
 
-def latest_widget(entries):
-    """The newest choice the user can still answer.
+def _open_after_user(entries):
+    """Open widgets after the last user message, oldest first.
 
     A widget behind a later user message is stale. Digits belong to the
     composer then, because the user already replied.
@@ -98,11 +98,106 @@ def latest_widget(entries):
     for index, entry in enumerate(entries):
         if isinstance(entry, dict) and transcript.is_user(entry):
             last_user = index
-    found = None
-    for index, entry in enumerate(entries):
-        if index > last_user and widget_open(entry):
-            found = entry
-    return found
+    return [entry for index, entry in enumerate(entries) if index > last_user and widget_open(entry)]
+
+
+def latest_widget(entries):
+    """The newest choice the user can still answer."""
+    found = _open_after_user(entries)
+    return found[-1] if found else None
+
+
+def pages(entries):
+    """The questions the open card pages through, in order. [] when nothing is open.
+
+    A `steps` widget gives one page per answerable step. Several single-question
+    widgets in a row after the last user message give one page each. One page
+    means a plain card with no paging. A page has entry, step (index or None),
+    key, prompt, options, multi, and custom. The key is the entry id, plus
+    `#<step>` for a step.
+    """
+    opened = _open_after_user(entries)
+    if not opened:
+        return []
+    newest = opened[-1]
+    steps = step_questions(newest)
+    if steps:
+        widget = widget_message(newest)
+        group = [(newest, index) for index, step in enumerate(steps) if _question_answerable(step, widget)]
+    else:
+        group = [(entry, None) for entry in opened if not step_questions(entry)]
+    out = []
+    for entry, step in group:
+        prompt, options, multi, custom = current_question(entry, step or 0)
+        key = str(entry.get("id")) + ("" if step is None else f"#{step}")
+        out.append(
+            {"entry": entry, "step": step, "key": key, "prompt": prompt, "options": options, "multi": multi, "custom": custom}
+        )
+    return out
+
+
+def card_view(entries, state):
+    """(pages, current page index, answers so far) for the open card.
+
+    `state` is {"first": key of page 0, "at": index, "answers": {key: value}}.
+    A state from another card reads as a fresh one.
+    """
+    found = pages(entries)
+    if not found:
+        return [], 0, {}
+    state = state if isinstance(state, dict) else {}
+    if state.get("first") != found[0]["key"]:
+        return found, 0, {}
+    at = min(max(int(state.get("at") or 0), 0), len(found) - 1)
+    return found, at, state.get("answers") or {}
+
+
+def page_answer(found, answers):
+    """The one message a finished card sends: an answer per question, a blank line between.
+
+    Separate widgets carry their prompt too, so the bot can tell them apart.
+    """
+    parts = []
+    for page in found:
+        answer = answers.get(page["key"], "")
+        if page["step"] is None and len(found) > 1 and page["prompt"]:
+            answer = f"{page['prompt']}: {answer}"
+        parts.append(answer)
+    return "\n\n".join(parts)
+
+
+PAGE_HINT = "  ·  ← → or [ ] page"
+
+
+def page_picks(page, picks, answers):
+    """Toggled values on a multi-select page. A saved answer counts until the first toggle."""
+    key = page["key"]
+    if key in (picks or {}):
+        return list(picks[key])
+    saved = {part for part in str((answers or {}).get(key, "")).split("\n") if part}
+    return [value for _label, value in page["options"] if value in saved]
+
+
+def page_text(page, at, count, picks=(), answer=""):
+    """One question of a paged card under `question 2/3`.
+
+    Options are numbered with a mark column, so an answered one reads `● 2  Paris`
+    and the rows do not shift when the mark appears. `picks` are the toggled
+    values of a multi-select.
+    """
+    lines = [f"question {at + 1}/{count}{PAGE_HINT}"]
+    if page["prompt"]:
+        lines.append(page["prompt"])
+    parts = {part for part in str(answer).split("\n") if part}
+    known = {value for _label, value in page["options"]}
+    chosen = set() if page["multi"] else parts
+    option_lines, _matched, extra = _option_lines(page["options"], True, True, chosen, set(picks or ()))
+    lines.extend(option_lines)
+    if extra:
+        lines.append("answer the rest in the app")
+    if answer and not page["multi"] and not parts & known:
+        lines.append("●  " + str(answer))
+    return "\n".join(lines)
 
 
 # Up to 9 options, one digit selects. Past that, two digits (`10`, or `02`)
@@ -191,15 +286,15 @@ def _option_lines(options, open_, multi, chosen, picked):
     return lines, matched, uncovered
 
 
-def _steps_text(entry, steps, picks, numbered, step_at, step_answers):
+def _steps_text(entry, steps, picks, numbered):
+    """A `steps` card as one block. An open multi-question card is paged instead (page_text)."""
     widget = widget_message(entry)
     answered = widget_answered(entry)
     # A finished card stores one answer per step, with a blank line between them.
-    if answered and not step_answers:
-        step_answers = answered.split("\n\n")
-    answers = list(step_answers or [])
+    answers = answered.split("\n\n") if answered else []
     open_ = widget_open(entry) and numbered
-    at = int(step_at or 0) if open_ else len(steps)
+    # The question the number keys answer: the first one that can be answered.
+    current_at = next((i for i, step in enumerate(steps) if _question_answerable(step, widget)), 0)
     lines = []
     head = widget.get("prompt") if isinstance(widget.get("prompt"), str) else ""
     head = head.strip()
@@ -222,7 +317,7 @@ def _steps_text(entry, steps, picks, numbered, step_at, step_answers):
             if not matched:
                 lines.append("●  " + str(answers[index]).strip())
             continue
-        current = open_ and index == at
+        current = open_ and index == current_at
         option_lines, _matched, extra = _option_lines(
             step["options"], current, step["multi"], set(), set(picks or ()) if current else ()
         )
@@ -236,14 +331,14 @@ def _steps_text(entry, steps, picks, numbered, step_at, step_answers):
     return "\n".join(line for line in lines if line is not None)
 
 
-def widget_text(entry, picks=(), numbered=True, step_at=0, step_answers=()):
+def widget_text(entry, picks=(), numbered=True):
     """The prompt and its options. The open choice is numbered. A picked one is marked."""
     widget = widget_message(entry)
     if widget is None:
         return ""
     steps = step_questions(entry)
     if steps:
-        return _steps_text(entry, steps, picks, numbered, step_at, step_answers)
+        return _steps_text(entry, steps, picks, numbered)
     prompt = widget.get("prompt")
     prompt = prompt.strip() if isinstance(prompt, str) else ""
     if widget_skipped(entry) and not widget_answered(entry) and prompt:
@@ -265,12 +360,9 @@ def widget_text(entry, picks=(), numbered=True, step_at=0, step_answers=()):
     return "\n".join(lines)
 
 
-def choice_hint(entry, step_at=0):
-    prompt, options, multi, custom = current_question(entry, step_at) if entry else ("", [], False, False)
+def _hint(options, multi, custom):
     if not options:
-        if entry and widget_open(entry) and custom:
-            return "type an answer"
-        return ""
+        return "type an answer" if custom else ""
     wide = len(options) > OPTION_DIGITS
     keys = [option_key(index, wide) for index in range(1, len(options) + 1)]
     keys = [key for key in keys if key]
@@ -282,3 +374,16 @@ def choice_hint(entry, step_at=0):
     if multi:
         return f"{span} choose · enter sends"
     return f"{span} answer"
+
+
+def choice_hint(entry, step_at=0):
+    """Footer keys for one widget entry. A paged card uses page_hint."""
+    if not entry or not widget_open(entry):
+        return ""
+    _prompt, options, multi, custom = current_question(entry, step_at)
+    return _hint(options, multi, custom)
+
+
+def page_hint(page):
+    """Footer keys for the open page of a card."""
+    return _hint(page["options"], page["multi"], page["custom"]) if page else ""

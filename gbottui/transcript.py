@@ -147,10 +147,10 @@ def _part_text(part):
     return ""
 
 
-def entry_text(entry, picks=(), numbered=True, step_at=0, step_answers=()):
+def entry_text(entry, picks=(), numbered=True):
     if not isinstance(entry, dict) or is_thinking(entry):
         return ""
-    text = _entry_body(entry, picks, numbered, step_at, step_answers)
+    text = _entry_body(entry, picks, numbered)
     if is_user(entry):
         return text
     return hide_thinking_markup(text)
@@ -164,7 +164,7 @@ def attachment_text(entry):
     return f"\U0001F4CE {name}" + (f" ({', '.join(details)})" if details else "")
 
 
-def _entry_body(entry, picks=(), numbered=True, step_at=0, step_answers=()):
+def _entry_body(entry, picks=(), numbered=True):
     if entry.get("kind") == "user-attachment":
         return attachment_text(entry)
     for key in ("text", "prompt"):
@@ -180,7 +180,7 @@ def _entry_body(entry, picks=(), numbered=True, step_at=0, step_answers=()):
         return "\n".join(piece for piece in (_part_text(part) for part in content) if piece)
     if isinstance(content, dict) and not is_thinking_part(content) and isinstance(content.get("text"), str):
         return content["text"]
-    shown = widgets.widget_text(entry, picks, numbered, step_at, step_answers)
+    shown = widgets.widget_text(entry, picks, numbered)
     if shown:
         return shown
     if isinstance(message, dict) and isinstance(message.get("content"), str):

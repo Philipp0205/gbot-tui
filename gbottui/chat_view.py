@@ -18,6 +18,7 @@ HELP = [
     ("ctrl-o", "copy the last reply (OSC 52)"),
     ("y n", "answer a pending approval"),
     ("1-9", "pick a widget option"),
+    ("left right [ ]", "page back and forth through several questions"),
     ("@bot text", "send to another bot"),
     ("@", "tag a bot: up/down, tab or enter inserts, esc closes"),
     ("esc", "back to the bot list"),
@@ -125,8 +126,7 @@ def draw(stdscr, chat):
         decide = bool(transcript.latest_decision(chat.messages, chat.answered)) and not chat.deciding
         hint = ""
         if getattr(chat, "loaded", False) and not getattr(chat, "widget_busy", False) and not chat.typed:
-            entry = widgets.latest_widget(chat.messages)
-            hint = widgets.choice_hint(entry, chat.step_at(entry) if entry else 0)
+            hint = widgets.page_hint(chat.page())
         error = chat.footer_error() if hasattr(chat, "footer_error") else chat.error
         footer = grid.footer_rows(
             chat.phase, error, decide=decide, width=width, choice=hint, notice=getattr(chat, "notice", "")

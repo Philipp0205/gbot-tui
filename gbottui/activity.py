@@ -306,11 +306,10 @@ def activity_preview(entries, state):
             if card["details"]:
                 return one_line(card["details"][0])
             return "Needs approval"
-        widget = widgets.latest_widget(entries)
-        if widget:
-            prompt, _options, _multi, _custom = widgets.current_question(widget)
-            if prompt:
-                return one_line(prompt)
+        found = widgets.pages(entries)
+        if found:
+            if found[0]["prompt"]:
+                return one_line(found[0]["prompt"])
             return "Needs a choice"
     for entry in reversed(entries):
         text = transcript.entry_text(entry).strip()
