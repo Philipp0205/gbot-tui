@@ -134,12 +134,10 @@ def picker_spans(bot, selected, width, columns=None):
     name_style = "bold" if selected else "default"
     lead = "→ " if selected else "  "
     lead_style = "bold" if selected else "dim"
-    color = (bot.get("avatarColor") or bot.get("avatar_color") or "").lower()
     room = max(width - 7, 1)
     # The same lightened color the chat mark uses, including red and yellow,
     # which are also the names of the warning styles.
-    mark_style = "bot:" + color if color in colors.AVATAR_COLORS else (color or "default")
-    mark = ("● ", mark_style)
+    mark = ("● ", "bot:" + colors.bot_color(bot))
     snap = bot.get("activity") if isinstance(bot.get("activity"), dict) else None
     if snap and snap.get("state") in activity.OVERVIEW_STATES:
         return _status_spans(lead, lead_style, mark, name, name_style, snap, title, room, columns)

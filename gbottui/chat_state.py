@@ -2,7 +2,7 @@
 
 import math
 
-from . import activity, backend, draft, herdr, icons, roster, tabs, transcript, widgets
+from . import activity, backend, colors, draft, herdr, icons, roster, tabs, transcript, widgets
 
 
 # Poll cadence in seconds. Each read is one gbot process, so idle backs off.
@@ -66,7 +66,8 @@ class Chat:
         self.loading_older = False
         self.resume = herdr.resume_arg(target)
         bot = roster.ROSTER.get(target) or {}
-        self.avatar_color = bot.get("avatarColor") or bot.get("avatar_color") or ""
+        # An unknown bot stays unset until its thread names it.
+        self.avatar_color = colors.bot_color(bot) if bot else ""
         self.avatar_shape = bot.get("avatarShape") or bot.get("avatar_shape") or ""
         self.label = (bot.get("title") or bot.get("tagline") or "").strip()
         self.deciding = False

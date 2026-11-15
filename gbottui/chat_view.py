@@ -50,17 +50,20 @@ def search_target(rows, chat):
     return hits[at], hits
 
 
-def paint_composer(stdscr, y, width, lines, placeholder=False, first=0):
+def paint_composer(stdscr, y, width, lines, placeholder=False, first=0, border=None):
     span = max(width, 0)
     if span < 2:
         return
     inner = span - 2
+    border = styles.ATTR["default"] if border is None else border
     attr = styles.ATTR["dim"] if placeholder else styles.ATTR["default"]
     for index, line in enumerate(lines):
-        paint.put(stdscr, y + index, 0, "│", styles.ATTR["default"])
+        paint.put(stdscr, y + index, 0, "│", border)
         prefix = " →  " if index + first == 0 else "    "
         paint.put(stdscr, y + index, 1, (prefix + line)[:inner], attr)
-        paint.put(stdscr, y + index, span - 1, "│", styles.ATTR["default"])
+        if index + first == 0 and inner >= 2:
+            paint.put(stdscr, y + index, 2, "→", border)
+        paint.put(stdscr, y + index, span - 1, "│", border)
 
 
 def draw(stdscr, chat):
@@ -154,13 +157,14 @@ def draw(stdscr, chat):
     cursor = None
     if composer_h >= 3:
         top, _mid, bot = grid.composer_lines(width, chat.typed)
-        paint.put(stdscr, composer_at, 0, top, styles.ATTR["default"])
+        border = styles.dot_attr(color)
+        paint.put(stdscr, composer_at, 0, top, border)
         visible = composer_h - 2
         row, col = grid.draft_cursor(chat.typed, getattr(chat, "pos", None), width)
         first = grid.composer_window(len(lines), row, visible)
         shown = lines[first : first + visible] if lines else ["Add a follow-up"]
-        paint_composer(stdscr, composer_at + 1, width, shown, placeholder=not lines, first=first)
-        paint.put(stdscr, composer_at + composer_h - 1, 0, bot, styles.ATTR["default"])
+        paint_composer(stdscr, composer_at + 1, width, shown, placeholder=not lines, first=first, border=border)
+        paint.put(stdscr, composer_at + composer_h - 1, 0, bot, border)
         column = grid.composer_cursor_column("", placeholder=True) if not lines else 5 + col
         cursor = (composer_at + 1 + (row - first if lines else 0), min(column, max(width - 2, 0)))
     elif composer_h == 1:
@@ -172,6 +176,7 @@ def draw(stdscr, chat):
             grid.clip("→  " + shown, max(width - 1, 0)),
             styles.ATTR["default"] if chat.typed else styles.ATTR["dim"],
         )
+        paint.put(stdscr, composer_at, 0, "→", styles.dot_attr(color))
         pos = len(chat.typed) if getattr(chat, "pos", None) is None else min(chat.pos, len(chat.typed))
         column = 2 if not chat.typed else 3 + pos
         cursor = (composer_at, min(column, max(width - 2, 0)))

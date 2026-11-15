@@ -88,6 +88,15 @@ def bot_avatar(bot):
     return shape, color
 
 
+def bot_color(bot):
+    """The avatar color name for a bot row, with Grok Bot's default when unset.
+
+    Every list and chat mark goes through this, so a bot with no avatarColor
+    has the same color here as in the app and in Herdr.
+    """
+    return bot_avatar(bot)[1]
+
+
 def avatar_color(name):
     return AVATAR_COLORS.get((name or "").lower(), "#777777")
 

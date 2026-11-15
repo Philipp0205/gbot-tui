@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 
-from . import activity, app, cache, chat_state, chat_view, draft, gbot_cli, grid, herdr, paint, roster, styles, terminal, theme, transcript, widgets
+from . import activity, app, cache, chat_state, chat_view, colors, draft, gbot_cli, grid, herdr, paint, roster, styles, terminal, theme, transcript, widgets
 
 
 # The loop sleeps in select, so a finished read wakes it at once. This cap is
@@ -545,7 +545,7 @@ def chat_loop(stdscr, chat):
                 label = (bot.get("title") or bot.get("tagline") or "").strip()
                 if label:
                     chat.label = label
-                    chat.avatar_color = chat.avatar_color or bot.get("avatarColor") or ""
+                    chat.avatar_color = chat.avatar_color or colors.bot_color(bot)
                     dirty = True
             if chat.expire_working():
                 dirty = True
