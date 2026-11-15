@@ -46,7 +46,7 @@ What the desktop app's chat does, and where gbot-tui stands. The backend is fixe
 | Notifications | Partial | Herdr OSC 7501 state and tab name (`herdr.py`); bell + OSC 9 for needs you (below); no notice for a plain reply in another bot | |
 | Bell / OSC 9 notify on needs-you while in the list | Done | `picker.pick` writes `terminal.notify` (BEL, `ESC ] 9 ; <name> needs you BEL`) for each name `activity.newly_blocked` returns; once per transition, the first look is the baseline | 29 |
 | Settings screen | Not possible | no settings call; theme is env only | |
-| Bot avatar and color | Done | `styles.dot_attr`, `icons.py` for Herdr | |
+| Bot avatar and color | Done | `styles.dot_attr`, `icons.py` for Herdr | `colors.bot_color` resolves every list and chat color; no `avatarColor` falls back to `default_color(id)` as in the app and Herdr. The chat composer box and `→` use the same color. |
 | Thinking / progress lines hidden | Done | `transcript.is_thinking`, `hidden_status_ids` | |
 | Voice input / output | Not possible | no audio path in a terminal or in `gbot` | |
 | Edit / delete / regenerate a message | Not possible | no such `gbot` command | |

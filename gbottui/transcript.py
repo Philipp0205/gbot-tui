@@ -3,7 +3,7 @@
 import os
 import re
 
-from . import gbot_cli, widgets
+from . import colors, gbot_cli, widgets
 
 
 # shortcut: two empty polls after a reply count as finished, so a bot that
@@ -367,14 +367,18 @@ def parse_thread(payload):
     if not isinstance(target, dict):
         target = {}
     session = target.get("sessionId") if isinstance(target.get("sessionId"), str) else ""
+    agent_id = gbot_cli.gateway_agent_id(target)
+    # Same fallback as the list: no avatarColor means the app's default for the id.
+    # Without an agent id there is nothing to hash, so the color stays unset.
+    color = colors.bot_color({"id": agent_id, "avatarColor": target.get("avatarColor")}) if agent_id else ""
     return {
         "entries": [entry for entry in entries if isinstance(entry, dict)],
         "cursor": cursor,
         "gap_reset": bool(payload.get("gapReset")) if isinstance(payload, dict) else False,
         "name": target.get("name") or "",
         "id": target.get("id") or "",
-        "agent_id": gbot_cli.gateway_agent_id(target),
+        "agent_id": agent_id,
         "viewer_session": session.strip(),
         "avatar_shape": target.get("avatarShape") or "",
-        "avatar_color": target.get("avatarColor") or "",
+        "avatar_color": color or target.get("avatarColor") or "",
     }

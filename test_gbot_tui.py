@@ -1036,6 +1036,61 @@ class LookTests(unittest.TestCase):
             roster.list_bots = original
             roster.ROSTER.clear()
 
+    def test_a_bot_without_avatar_color_gets_the_default_color(self):
+        bot = {"id": "ea566f99-aded-40c2-99fc-60e5477d2a61", "name": "Plain", "title": "", "avatarColor": ""}
+        expected = colors.default_color(bot["id"])
+        self.assertEqual(picker.picker_spans(bot, True, 40)[1], ("● ", "bot:" + expected))
+        self.assertEqual(picker.picker_spans({"id": bot["id"], "name": "Plain"}, False, 40)[1], ("● ", "bot:" + expected))
+        roster.ROSTER.clear()
+        roster.ROSTER["Plain"] = bot
+        try:
+            self.assertEqual(chat_state.Chat("Plain").avatar_color, expected)
+        finally:
+            roster.ROSTER.clear()
+        page = transcript.parse_thread({"target": {"id": bot["id"], "name": "Plain"}, "transcript": {"entries": []}})
+        self.assertEqual(page["avatar_color"], expected)
+
+    def test_a_bot_with_avatar_color_keeps_it(self):
+        agent_id = "ea566f99-aded-40c2-99fc-60e5477d2a61"
+        chosen = "black" if colors.default_color(agent_id) != "black" else "red"
+        bot = {"id": agent_id, "name": "Ink", "avatarColor": chosen}
+        self.assertEqual(picker.picker_spans(bot, True, 40)[1], ("● ", "bot:" + chosen))
+        roster.ROSTER.clear()
+        roster.ROSTER["Ink"] = bot
+        try:
+            self.assertEqual(chat_state.Chat("Ink").avatar_color, chosen)
+        finally:
+            roster.ROSTER.clear()
+        page = transcript.parse_thread({"target": {"id": agent_id, "name": "Ink", "avatarColor": chosen}})
+        self.assertEqual(page["avatar_color"], chosen)
+
+    def test_the_composer_box_and_prompt_use_the_bot_color(self):
+        class AttrScreen(FakeScreen):
+            def __init__(self):
+                super().__init__(24, 40)
+                self.cells = []
+
+            def addnstr(self, y, x, text, n, attr=0):
+                self.cells.append((y, x, text[:n], attr))
+
+        saved = dict(styles_mod.TEXT_ATTR)
+        saved_avatar = dict(styles_mod.AVATAR_ATTR)
+        try:
+            styles_mod.TEXT_ATTR["blue"] = 777
+            chat = chat_state.Chat("Researcher")
+            chat.avatar_color = "blue"
+            screen = AttrScreen()
+            chat_view.draw(screen, chat)
+        finally:
+            styles_mod.TEXT_ATTR.clear()
+            styles_mod.TEXT_ATTR.update(saved)
+            styles_mod.AVATAR_ATTR.clear()
+            styles_mod.AVATAR_ATTR.update(saved_avatar)
+        colored = [cell for cell in screen.cells if cell[3] == 777]
+        self.assertTrue(any(text.startswith("┌") or text.startswith("╭") for _y, _x, text, _a in colored))
+        self.assertTrue(any(text == "│" for _y, _x, text, _a in colored))
+        self.assertTrue(any(text == "→" for _y, _x, text, _a in colored))
+
 
 class MarkdownTests(unittest.TestCase):
     def _plain(self, text, width=40):
