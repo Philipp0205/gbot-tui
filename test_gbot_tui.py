@@ -1863,6 +1863,43 @@ class NoticeTests(unittest.TestCase):
         finally:
             herdr.APP = previous
 
+    def test_a_bot_named_like_the_tui_gets_its_own_app(self):
+        from PIL import Image
+
+        self.assertEqual(herdr.notice_name("gbot tui"), "gbot-tui")
+        self.assertEqual(herdr.app_name("gbot tui"), "gbot-tui-bot")
+        self.assertNotEqual(herdr.app_name("gbot tui"), herdr.SOURCE)
+        self.assertLessEqual(len(herdr.app_name("gbot tui").encode()), 32)
+        self.assertNotIn(" ", herdr.app_name("gbot tui"))
+        self.assertEqual(herdr.app_name("Outfitly"), "Outfitly")
+        self.assertEqual(herdr.app_name("Cursor Cloud Session"), "Cursor-Cloud-Session")
+        previous = herdr.APP
+        try:
+            herdr.bind_app("gbot tui", "b9")
+            self.assertNotEqual(herdr.APP, "gbot-tui")
+            app = herdr.APP
+            report = herdr.osc_report("idle", "gbot tui")
+            self.assertEqual(report.split("app=", 1)[1].split(":", 1)[0], app)
+            herdr.bind_app("Outfitly", "b4")
+            self.assertEqual(herdr.APP, "Outfitly")
+        finally:
+            herdr.APP = previous
+        with tempfile.TemporaryDirectory() as tmp:
+            Image.new("RGBA", (18, 18), (0, 0, 0, 255)).save(Path(tmp) / "bot-heart.png")
+            Image.new("RGBA", (18, 18), (0, 0, 0, 255)).save(Path(tmp) / "bot-heart-face.png")
+            made = icons.install_avatars(
+                [
+                    {"id": "b9", "name": "gbot tui", "avatarShape": "heart", "avatarColor": "red"},
+                    {"id": "b4", "name": "Outfitly", "avatarShape": "heart", "avatarColor": "red"},
+                ],
+                root=tmp,
+                src=tmp,
+            )
+            self.assertIn(app, made["gbot-b9"]["match"])
+            self.assertNotIn("gbot-tui", made["gbot-b9"]["match"])
+            self.assertEqual(made["gbot-b9"]["name"], "gbot tui")
+            self.assertEqual(made["gbot-b4"]["match"], ["Outfitly", "gbot-b4"])
+
     def test_a_late_icon_does_not_replace_another_bots_name(self):
         previous_app = herdr.APP
         previous_install = icons.install_avatars_later

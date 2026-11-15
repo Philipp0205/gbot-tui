@@ -50,7 +50,7 @@ def report_command(herdr, pane, phase, label, session_id, seq, resume):
         "--source",
         SOURCE,
         "--agent",
-        notice_name(label) or label,
+        app_name(label) or label,
         "--state",
         herdr_state(phase),
         "--seq",
@@ -72,7 +72,7 @@ def release_command(herdr, pane, label, seq):
         "--source",
         SOURCE,
         "--agent",
-        notice_name(label) or label,
+        app_name(label) or label,
         "--seq",
         str(seq),
     ]
@@ -111,10 +111,23 @@ def notice_name(name):
     return raw[:APP_LIMIT].decode("utf-8", "ignore").rstrip().rstrip("-")
 
 
+BOT_APP = "gbot-tui-bot"
+
+
+def app_name(name):
+    """The OSC app for a bot. A bot called "gbot tui" would collide with SOURCE.
+
+    The TUI reports SOURCE for its own list view, so Herdr could not tell that
+    bot's chat from the list or match the bot's program icon. It gets BOT_APP.
+    """
+    label = notice_name(name)
+    return BOT_APP if label == SOURCE else label
+
+
 def bind_app(name, bot_id=""):
     """Point Herdr's program report at the bot's name. The icon key is the fallback."""
     global APP
-    label = notice_name(name) or program_key(bot_id) or ""
+    label = app_name(name) or program_key(bot_id) or ""
     if label:
         APP = label
 
