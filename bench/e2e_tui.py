@@ -321,6 +321,21 @@ def main_flow():
 
         ok &= scenario("03_open_bot", term, open_bot)
 
+        def mention(t):
+            t.settle(0.5)
+            t.send("@tra")
+            # The list sits above the composer box and names the bot.
+            t.wait(lambda lines: any("● Travel Agent" in line for line in lines))
+            assert not any("● Researcher" in line for line in t.lines()[2:]), "this chat's own bot was suggested"
+            dump("37_mention_list_open", t)
+            t.send("\t")
+            t.wait(lambda lines: composer_rows(lines) == ["→  @Travel Agent"])
+            t.wait(lacks("● Travel Agent"))
+            t.send("\x15")  # ctrl-u clears the draft for the next scenario
+            t.wait(has("→  Add a follow-up"))
+
+        ok &= scenario("37_mention_autocomplete", term, mention)
+
         def send_stream(t):
             t.settle(0.5)
             t.send("hello there my friend")

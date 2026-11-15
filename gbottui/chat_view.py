@@ -2,7 +2,7 @@
 
 import curses
 
-from . import grid, markdown, paint, styles, terminal, transcript, widgets
+from . import colors, grid, markdown, paint, roster, styles, terminal, transcript, widgets
 
 LOADING = "Loading conversation…"
 HELP = [
@@ -19,6 +19,7 @@ HELP = [
     ("y n", "answer a pending approval"),
     ("1-9", "pick a widget option"),
     ("@bot text", "send to another bot"),
+    ("@", "tag a bot: up/down, tab or enter inserts, esc closes"),
     ("esc", "back to the bot list"),
     ("ctrl-c ctrl-d", "quit"),
     ("? f1", "this help (?? types a ?)"),
@@ -64,6 +65,38 @@ def paint_composer(stdscr, y, width, lines, placeholder=False, first=0, border=N
         if index + first == 0 and inner >= 2:
             paint.put(stdscr, y + index, 2, "→", border)
         paint.put(stdscr, y + index, span - 1, "│", border)
+
+
+def paint_mentions(stdscr, chat, bottom, top, width):
+    """The @-mention list in the rows just above the composer box (`bottom` is its top row)."""
+    if not getattr(chat, "mention_open", False) or getattr(chat, "help", False):
+        return
+    matches = chat.mention_matches()
+    shown = matches[: max(min(len(matches), bottom - top), 0)]
+    if not shown:
+        return
+    span = min(max(len(name) for name, _at in shown) + 4, max(width - 2, 0))
+    if span < 5:
+        return
+    selected = min(getattr(chat, "mention_sel", 0), len(shown) - 1)
+    roster_now = roster.ROSTER
+    for index, (name, positions) in enumerate(shown):
+        y = bottom - len(shown) + index
+        base = curses.A_REVERSE if index == selected else 0
+        paint.put(stdscr, y, 1, " " * span, styles.ATTR["default"] | base)
+        dot = styles.dot_attr(colors.bot_color(roster_now.get(name) or {}))
+        paint.put(stdscr, y, 2, "●", dot | base)
+        room = span - 4
+        shown_name = name[:room]
+        at = 0
+        while at < len(shown_name):
+            bold = at in positions
+            end = at
+            while end < len(shown_name) and (end in positions) == bold:
+                end += 1
+            attr = styles.ATTR["default"] | base | (curses.A_BOLD if bold else 0)
+            paint.put(stdscr, y, 4 + at, shown_name[at:end], attr)
+            at = end
 
 
 def draw(stdscr, chat):
@@ -154,6 +187,7 @@ def draw(stdscr, chat):
         if searching and chat.search and x is not None:
             paint_matches(stdscr, y, x, text, chat.search, index == target)
     composer_at = header + body_h
+    paint_mentions(stdscr, chat, composer_at, header + gap, width)
     cursor = None
     if composer_h >= 3:
         top, _mid, bot = grid.composer_lines(width, chat.typed)

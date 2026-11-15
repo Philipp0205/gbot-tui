@@ -8,7 +8,7 @@ import sys
 import threading
 import time
 
-from . import activity, app, cache, chat_state, chat_view, colors, draft, gbot_cli, grid, herdr, paint, roster, styles, terminal, theme, transcript, widgets
+from . import activity, app, cache, chat_state, chat_view, colors, draft, gbot_cli, grid, herdr, mentions, paint, roster, styles, terminal, theme, transcript, widgets
 
 
 # The loop sleeps in select, so a finished read wakes it at once. This cap is
@@ -278,8 +278,81 @@ def older_job(chat):
     return ("older", args)
 
 
+def mention_key(chat, key):
+    """A key while the @-mention list is open. True when the list took the key.
+
+    Up and Down move the selection, Tab or Enter insert `@Name `, Esc closes
+    the list and stays in the chat. Every other key is the composer's, and
+    `sync_mention` then decides whether the list stays.
+    """
+    if not chat.mention_open:
+        return False
+    if chat.help or chat.search is not None:
+        chat.close_mention()
+        return False
+    matches = chat.mention_matches()
+    if not matches:
+        chat.close_mention()
+        return False
+    if key in (curses.KEY_UP, curses.KEY_DOWN):
+        step = -1 if key == curses.KEY_UP else 1
+        chat.mention_sel = (min(chat.mention_sel, len(matches) - 1) + step) % len(matches)
+        return True
+    if key in ("\t", "\r", curses.KEY_ENTER):
+        name = matches[min(chat.mention_sel, len(matches) - 1)][0]
+        chat.typed, chat.pos = mentions.insert(chat.typed, chat.pos, name)
+        chat.close_mention()
+        return True
+    if key in ("\x1b", 27):
+        chat.close_mention()
+        return True
+    return False
+
+
+def sync_mention(chat, key):
+    """After a composer key: open on a typed `@`, keep filtering, close when it no longer fits."""
+    found = mentions.query_at(chat.typed, chat.pos)
+    if (
+        not chat.mention_open
+        and key == "@"
+        and not isinstance(key, paint.Pasted)
+        and found is not None
+        and not found[1]
+        and not chat.help
+        and chat.search is None
+    ):
+        chat.mention_open = True
+        chat.mention_sel = 0
+        chat.mention_query = ""
+    if not chat.mention_open:
+        return
+    matches = chat.mention_matches() if found is not None else []
+    if not matches or chat.help or chat.search is not None:
+        chat.close_mention()
+    elif found[1] != chat.mention_query:
+        chat.mention_query = found[1]
+        chat.mention_sel = 0
+    else:
+        chat.mention_sel = min(chat.mention_sel, len(matches) - 1)
+
+
 def chat_key(chat, key, stdscr):
     """Apply one key. Returns "quit", "back", a job tuple, or None."""
+    if key in ("\x03", "\x04"):
+        return "quit"
+    if mention_key(chat, key):
+        chat.expire_notice(any_key=True)
+        return None
+    result = composer_key_press(chat, key, stdscr)
+    if not isinstance(result, str):
+        sync_mention(chat, key)
+    else:
+        chat.close_mention()
+    return result
+
+
+def composer_key_press(chat, key, stdscr):
+    """The chat's keys with the mention list closed."""
     if key == curses.KEY_RESIZE:
         return None
     if key in ("\x03", "\x04"):

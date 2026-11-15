@@ -344,7 +344,7 @@ def footer_spans(phase, error, decide=False, width=0, choice="", notice=""):
         return [(clip(notice, room) if room else notice, "green")]
     if phase == "working":
         return [("Generating", "bold"), ("  —  pgup scroll", "dim")]
-    rest = "esc bots · ctrl-c quit · pgup scroll · ? keys"
+    rest = "esc bots · ctrl-c quit · pgup scroll · @ tag a bot · ? keys"
     if choice:
         # One "enter". A multi-select hint already says "enter sends".
         enter = "" if "enter" in choice.lower() else "enter send · "
