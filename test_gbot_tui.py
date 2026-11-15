@@ -26,6 +26,7 @@ from gbottui import (
     herdr,
     icons,
     markdown,
+    mentions,
     paint,
     picker,
     roster,
@@ -3420,6 +3421,30 @@ class RouteTests(unittest.TestCase):
             ("Cursor Cloud Session", "do it"),
         )
 
+    def test_full_name_with_spaces_routes(self):
+        self.assertEqual(
+            roster.parse_route("@Travel Agent plan a trip", ["Travel Agent"]),
+            ("Travel Agent", "plan a trip"),
+        )
+        self.assertEqual(
+            roster.parse_route("@cursor cloud session do it", self.names),
+            ("Cursor Cloud Session", "do it"),
+        )
+
+    def test_longest_full_name_wins(self):
+        names = ["Travel", "Travel Agent", "Travel Agent Pro"]
+        self.assertEqual(
+            roster.parse_route("@Travel Agent Pro plan", names),
+            ("Travel Agent Pro", "plan"),
+        )
+        self.assertEqual(roster.parse_route("@Travel Agent plan", names), ("Travel Agent", "plan"))
+
+    def test_hyphen_slug_still_routes(self):
+        self.assertEqual(
+            roster.parse_route("@Travel-Agent plan", ["Travel Agent"]),
+            ("Travel Agent", "plan"),
+        )
+
     def test_plain_text_is_not_routed(self):
         self.assertIsNone(roster.parse_route("hello @chef", self.names))
         self.assertIsNone(roster.parse_route("@chef", self.names))
@@ -4085,6 +4110,170 @@ class OfflineTests(unittest.TestCase):
         chat.error = "send failed"
         chat.ingest(transcript.parse_thread({"transcript": {"entries": []}}), first=True)
         self.assertEqual(chat.error, "send failed")
+
+
+class MentionTests(unittest.TestCase):
+    NAMES = ["Researcher", "Travel Agent", "Chef", "Smart Trade", "Trader", "Cursor Cloud Session"]
+
+    def setUp(self):
+        self.saved = dict(roster.ROSTER)
+        roster.ROSTER.clear()
+        roster.ROSTER.update({name: {"name": name, "avatarColor": "red"} for name in self.NAMES})
+
+    def tearDown(self):
+        roster.ROSTER.clear()
+        roster.ROSTER.update(self.saved)
+
+    def test_ranking_prefix_then_word_start_then_subsequence(self):
+        names = ["Xtra Bot", "Smart Trade", "Trader", "T r a"]
+        ranked = [name for name, _at in mentions.rank("tra", names)]
+        self.assertEqual(ranked[0], "Trader")
+        self.assertEqual(ranked[1], "Smart Trade")
+        self.assertLess(ranked.index("Smart Trade"), ranked.index("T r a"))
+        # A tighter subsequence beats a looser one, then name order.
+        self.assertEqual([n for n, _ in mentions.rank("ce", ["Cursor Cloud Session", "Chef", "Cache"])], ["Cache", "Chef", "Cursor Cloud Session"])
+        self.assertEqual([n for n, _ in mentions.rank("zz", names)], [])
+
+    def test_match_is_case_insensitive_and_reports_positions(self):
+        self.assertEqual(mentions.match("TA", "Travel Agent")[1], [0, 2])
+        self.assertEqual(mentions.match("tra", "Travel Agent")[1], [0, 1, 2])
+        self.assertEqual(mentions.match("agent", "Travel Agent")[1], [7, 8, 9, 10, 11])
+        self.assertEqual(mentions.match("tg", "Travel Agent")[1], [0, 8])
+        self.assertEqual(len(mentions.rank("", self.NAMES + self.NAMES)), mentions.MAX_ROWS)
+
+    def test_query_at_the_cursor(self):
+        self.assertEqual(mentions.query_at("@tra", 4), (0, "tra"))
+        self.assertEqual(mentions.query_at("hi @tra", 7), (3, "tra"))
+        self.assertEqual(mentions.query_at("hi @", None), (3, ""))
+        self.assertEqual(mentions.query_at("hi @tra there", 7), (3, "tra"))
+        self.assertIsNone(mentions.query_at("a@b", 3))
+        self.assertIsNone(mentions.query_at("mail me a@b", 11))
+        self.assertIsNone(mentions.query_at("@tra ", 5))
+        self.assertIsNone(mentions.query_at("hello", 5))
+
+    def test_insert_replaces_the_query(self):
+        self.assertEqual(mentions.insert("@tra", 4, "Travel Agent"), ("@Travel Agent ", 14))
+        self.assertEqual(mentions.insert("hi @tra there", 7, "Travel Agent"), ("hi @Travel Agent  there", 17))
+        self.assertEqual(mentions.insert("hi @", None, "Chef"), ("hi @Chef ", 9))
+
+    def test_typing_opens_filters_and_excludes_this_bot(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "@")
+        self.assertTrue(chat.mention_open)
+        names = [name for name, _ in chat.mention_matches()]
+        self.assertNotIn("Researcher", names)
+        self.assertEqual(len(names), 5)
+        _typed(chat, "tra")
+        self.assertEqual([name for name, _ in chat.mention_matches()][0], "Trader")
+        self.assertTrue(chat.mention_open)
+
+    def test_at_after_text_without_a_space_does_not_open(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "a@")
+        self.assertFalse(chat.mention_open)
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "hi @")
+        self.assertTrue(chat.mention_open)
+
+    def test_bracketed_paste_does_not_open(self):
+        chat = chat_state.Chat("Researcher")
+        paint.PASTING = True
+        try:
+            keys = paint.decode_keys(list("@tra"))
+        finally:
+            paint.PASTING = False
+        _typed(chat, keys)
+        self.assertEqual(chat.typed, "@tra")
+        self.assertFalse(chat.mention_open)
+
+    def test_arrows_move_the_selection_in_both_forms(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "@")
+        self.assertEqual(chat.mention_sel, 0)
+        for key in (curses.KEY_DOWN, curses.KEY_DOWN, curses.KEY_UP):
+            _typed(chat, [key])
+        self.assertEqual(chat.mention_sel, 1)
+        # Down, Down, Up, Up in CSI and SS3 form: 1 -> 2 -> 3 -> 2 -> 1.
+        for key in paint.decode_keys(list("\x1b[B\x1bOB\x1b[A\x1bOA")):
+            _typed(chat, [key])
+        self.assertEqual(chat.mention_sel, 1)
+        self.assertEqual(chat.typed, "@")
+        self.assertTrue(chat.mention_open)
+        _typed(chat, [curses.KEY_UP, curses.KEY_UP])
+        self.assertEqual(chat.mention_sel, len(chat.mention_matches()) - 1)
+
+    def test_tab_inserts_the_selected_bot(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "hi @tra")
+        self.assertEqual(chat_screen.chat_key(chat, "\t", None), None)
+        self.assertEqual(chat.typed, "hi @Trader ")
+        self.assertEqual(chat.pos, len(chat.typed))
+        self.assertFalse(chat.mention_open)
+
+    def test_enter_with_the_list_open_inserts_and_does_not_send(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "@trav")
+        result = chat_screen.chat_key(chat, "\r", None)
+        self.assertIsNone(result)
+        self.assertEqual(chat.typed, "@Travel Agent ")
+        self.assertFalse(any(entry.get("local") for entry in chat.messages))
+        self.assertFalse(chat.mention_open)
+
+    def test_esc_closes_the_list_and_stays_in_the_chat(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "@tra")
+        self.assertIsNone(chat_screen.chat_key(chat, "\x1b", None))
+        self.assertFalse(chat.mention_open)
+        self.assertEqual(chat.typed, "@tra")
+        self.assertEqual(chat_screen.chat_key(chat, "\x1b", None), "back")
+
+    def test_backspace_space_and_no_match_close_the_list(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "@t")
+        _typed(chat, ["\x7f"])
+        self.assertTrue(chat.mention_open)
+        _typed(chat, ["\x7f"])
+        self.assertFalse(chat.mention_open)
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "@tra ")
+        self.assertFalse(chat.mention_open)
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "@zzz")
+        self.assertFalse(chat.mention_open)
+
+    def test_the_sent_text_is_the_plain_draft(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "see @che")
+        _typed(chat, ["\t"])
+        _typed(chat, "for that")
+        self.assertEqual(chat.typed, "see @Chef for that")
+        job = chat_screen.chat_key(chat, "\r", None)
+        self.assertEqual(job, ("send", ("Researcher", "see @Chef for that")))
+
+    def test_list_closed_keys_are_unchanged(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "hello")
+        self.assertEqual(chat_screen.chat_key(chat, "\r", None), ("send", ("Researcher", "hello")))
+        _typed(chat, "a\tb")
+        self.assertEqual(chat.typed, "ab")
+
+    def test_the_list_is_drawn_above_the_composer(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "@tra")
+        screen = FakeScreen(24, 80)
+        chat_view.draw(screen, chat)
+        found = {y: "".join(parts) for y, parts in screen.rows.items()}
+        box = next(y for y, text in found.items() if text.startswith("┌"))
+        self.assertTrue(any("Trader" in text for y, text in found.items() if y < box))
+        self.assertTrue(any("Travel Agent" in text for y, text in found.items() if y < box))
+        chat.mention_open = False
+        screen = FakeScreen(24, 80)
+        chat_view.draw(screen, chat)
+        self.assertFalse(any("Trader" in "".join(parts) for parts in screen.rows.values()))
+
+    def test_help_and_footer_mention_tagging(self):
+        self.assertTrue(any(keys == "@" for keys, _what in chat_view.HELP))
+        self.assertIn("@ tag a bot", grid.footer_spans("idle", "")[0][0])
 
 
 if __name__ == "__main__":

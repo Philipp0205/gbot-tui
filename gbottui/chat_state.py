@@ -2,7 +2,7 @@
 
 import math
 
-from . import activity, backend, colors, draft, herdr, icons, roster, tabs, transcript, widgets
+from . import activity, backend, colors, draft, herdr, icons, mentions, roster, tabs, transcript, widgets
 
 
 # Poll cadence in seconds. Each read is one gbot process, so idle backs off.
@@ -51,6 +51,11 @@ class Chat:
         # and the draft that was there before the first Up.
         self.hist_at = None
         self.hist_draft = ("", None)
+        # The @-mention list: open flag, selected row, and the query it was
+        # last filtered by (a new query puts the selection back on the top row).
+        self.mention_open = False
+        self.mention_sel = 0
+        self.mention_query = ""
         self.error = ""
         # A neutral or success line for the footer, not drawn as an error.
         self.notice = ""
@@ -636,6 +641,21 @@ class Chat:
 
     def type_text(self, value):
         self.edit(draft.insert, value)
+
+    def mention_matches(self):
+        """The suggestions for the `@query` at the cursor: [(name, matched indexes)].
+
+        The bot roster minus this chat's own bot. Empty when there is no query
+        at the cursor.
+        """
+        names = [name for name in roster.ROSTER if name not in (self.target, self.title)]
+        found = mentions.suggest(self.typed, self.pos, names)
+        return found[2] if found else []
+
+    def close_mention(self):
+        self.mention_open = False
+        self.mention_sel = 0
+        self.mention_query = ""
 
     def sent_history(self):
         """Your earlier messages in this chat, oldest first, repeats folded.

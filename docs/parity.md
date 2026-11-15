@@ -13,6 +13,7 @@ What the desktop app's chat does, and where gbot-tui stands. The backend is fixe
 | Open a bot, switch bots | Done | `app.screens` (Enter / Esc share one curses session) | 03, 11, 12 |
 | Open by name from the shell | Done | `app.main`, `roster` prefix match | 14, 15 |
 | `@bot task` route from inside a chat | Done | `roster.parse_route`, `chat_key` "route" | |
+| `@` mention autocomplete | Done | typing `@` at the start of the draft or after whitespace opens up to 6 suggestions above the composer, from `roster.ROSTER` minus this chat's bot; fuzzy subsequence match, prefix > word start > tighter subsequence > name (`mentions.py`); Up/Down, Tab/Enter insert `@Name `, Esc closes (`chat_screen.mention_key`, `sync_mention`); drawn by `chat_view.paint_mentions`; a bracketed paste does not open it; footer and `?` help say `@ tag a bot` | 37 |
 | Switch conversations within a bot | Not possible | `gbot thread` reads one transcript per target; no list-of-threads call is used | |
 | New conversation | Not possible | no new-thread / reset call in `gbot_cli.py` | |
 | Streaming replies | Done | polls at 0.3s; an entry with the same id replaces its row (`Chat._absorb`); `isStreaming` keeps `working` | 04 |

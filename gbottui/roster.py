@@ -55,11 +55,27 @@ def match_bot(query, names):
 def parse_route(text, names):
     """`@bot task` -> (bot name, task). None when the text is not routed.
 
-    A bot name with spaces is written with hyphens: `@Cursor-Cloud-Session`.
+    Two forms are accepted after the `@`:
+    - a full bot name with spaces, followed by a space, case-insensitive
+      (`@Travel Agent plan a trip`). When several names fit, the longest wins.
+      A full name with no task after it is not routed (None).
+    - otherwise one word, matched with `match_bot` against the names with
+      spaces written as hyphens (`@Cursor-Cloud-Session do it`, `@che soup`).
     """
     if not text.startswith("@"):
         return None
-    head, _, task = text[1:].partition(" ")
+    rest = text[1:]
+    full = [
+        name
+        for name in names
+        if rest[: len(name)].casefold() == name.casefold()
+        and rest[len(name) : len(name) + 1] == " "
+    ]
+    if full:
+        best = max(full, key=len)
+        task = rest[len(best) + 1 :].strip()
+        return (best, task) if task else None
+    head, _, task = rest.partition(" ")
     task = task.strip()
     if not head or not task:
         return None

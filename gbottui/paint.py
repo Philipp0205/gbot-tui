@@ -186,6 +186,12 @@ def is_escape(key):
     return key in ("\x1b", 27)
 
 
+class Pasted(str):
+    """A character that arrived inside a bracketed paste. Equal to the plain string."""
+
+    __slots__ = ()
+
+
 def decode_keys(keys, more=lambda: None):
     """Fold ESC-prefixed CSI / SS3 sequences curses passed through into keys.
 
@@ -204,7 +210,12 @@ def decode_keys(keys, more=lambda: None):
         key = queue.pop(0)
         if not is_escape(key):
             # Inside a bracketed paste Enter is a newline in the draft, not send.
-            out.append("\n" if PASTING and key in ("\r", curses.KEY_ENTER) else key)
+            # The mark lets the chat tell pasted text from typed text.
+            if PASTING and isinstance(key, str):
+                key = Pasted("\n" if key in ("\r", curses.KEY_ENTER) else key)
+            elif PASTING and key == curses.KEY_ENTER:
+                key = Pasted("\n")
+            out.append(key)
             continue
         lead = pull()
         if lead is None:
@@ -263,6 +274,6 @@ def read_keys(stdscr, restore=0):
             keys.append(stdscr.get_wch())
         except curses.error:
             break
-    if any(is_escape(key) for key in keys):
+    if PASTING or any(is_escape(key) for key in keys):
         keys = decode_keys(keys, follow_up(stdscr, restore))
     return keys
