@@ -43,7 +43,7 @@ What the desktop app's chat does, and where gbot-tui stands. The backend is fixe
 | Reconnect | Done | a failed read retries with backoff 2, 4, 8, 15, 30s (`Chat.read_failed`, `chat_state.RETRY_DELAYS`) | 27 |
 | Explicit reconnecting / offline label | Done | footer `offline · retrying in Ns` counts down (`Chat.offline_label`, `footer_error`); `reconnected` notice on the next good read (`Chat.read_back`) | 14, 27 |
 | Theme (light / dark) | Done | `theme.py` OSC 11 probe, `GBOT_TUI_THEME` | |
-| Notifications | Partial | Herdr OSC 7501 state and tab name (`herdr.py`); bell + OSC 9 for needs you (below); no notice for a plain reply in another bot | |
+| Notifications | Partial | Herdr OSC 7501 state and tab name (`herdr.py`); bell + OSC 9 for needs you (below); no notice for a plain reply in another bot. The Herdr reports are checked end to end against a fake `herdr` in the `herdr` e2e flow: idle on open, working on send, blocked/permission on an approval, idle after the reply, `release-agent` on quit, and OSC 7501 with no CLI call when only `HC_TERMINAL_ID` is set (Desktop) | 31-36 |
 | Bell / OSC 9 notify on needs-you while in the list | Done | `picker.pick` writes `terminal.notify` (BEL, `ESC ] 9 ; <name> needs you BEL`) for each name `activity.newly_blocked` returns; once per transition, the first look is the baseline | 29 |
 | Settings screen | Not possible | no settings call; theme is env only | |
 | Bot avatar and color | Done | `styles.dot_attr`, `icons.py` for Herdr | `colors.bot_color` resolves every list and chat color; no `avatarColor` falls back to `default_color(id)` as in the app and Herdr. The chat composer box and `→` use the same color. |
