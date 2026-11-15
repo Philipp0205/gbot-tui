@@ -230,8 +230,14 @@ def environment(home, herdr=None, **mock):
 class Run:
     """One app process in its own HOME. Scenarios share it and run in order."""
 
-    def __init__(self, *argv, rows=24, cols=80, herdr=None, **mock):
+    def __init__(self, *argv, rows=24, cols=80, herdr=None, seen=None, **mock):
         self.home = tempfile.mkdtemp(prefix="gbot-e2e-")
+        if seen:
+            # The cursors the app saved on an earlier run: a bot whose newest reply is after it is unread.
+            folder = os.path.join(self.home, ".cache", "gbot-tui")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "seen.json"), "w", encoding="utf-8") as handle:
+                json.dump(seen, handle)
         self.env = environment(self.home, herdr=herdr, **mock)
         self.term = Term([sys.executable, APP, *argv], self.env, rows, cols)
 
@@ -526,6 +532,42 @@ def bell_flow():
             assert count == 1, f"rang {count} times for one transition"
 
         return scenario("29_needs_you_bell", run.term, bell)
+    finally:
+        run.close()
+
+
+def row_with(lines, name):
+    return next((line for line in lines if name in line and "Grok bots" not in line), "")
+
+
+def row_state(lines, name):
+    """The state word on a list row: the text between the dot and the name."""
+    row = row_with(lines, name)
+    return row.split("●", 1)[-1].split(name)[0].strip() if "●" in row else ""
+
+
+def unread_flow():
+    """Open an unread bot and come back: its row and the count line change at once."""
+    # The mock thread ends m29 (user), m30 (bot's "earlier reply"). Chef was last seen at m29.
+    # The thread names a viewer session, not the list's bot id (MOCK_THREAD_ID).
+    run = Run(seen={"id:a3": "m29", "name:Chef": "m29"}, MOCK_REPLY="0.4", MOCK_THREAD_ID="session")
+    try:
+        def back_to_idle(t):
+            t.wait(lambda lines: row_state(lines, "Chef") == "unread", timeout=10)
+            t.wait(has("1 unread"))
+            dump("38_unread_list_before", t)
+            t.send(DOWN * 2)
+            t.send("\r")
+            t.wait(has("Chef", "earlier reply", "Add a follow-up"))
+            t.wait(lacks("Generating", "working"), timeout=10)
+            t.send(ESC)
+            t.wait(has("Grok bots", "Researcher"))
+            # The scan pass takes longer than this: it is the saved state that must be right.
+            t.wait(lambda lines: row_state(lines, "Chef") == "idle", timeout=1.5)
+            assert "unread" not in row_with(t.lines(), "Chef"), row_with(t.lines(), "Chef")
+            assert not any("1 unread" in line for line in t.lines()), "the count line still says unread"
+
+        return scenario("38_unread_clears_on_return", run.term, back_to_idle)
     finally:
         run.close()
 
@@ -985,7 +1027,7 @@ def herdr_flow():
     return ok
 
 
-FLOWS = {"main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow}
+FLOWS = {"main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow, "unread": unread_flow}
 
 
 def main():

@@ -242,6 +242,17 @@ class Chat:
         self.rows_rev += 1
         self._rows_key = None
 
+    def list_id(self):
+        """The id the bot list knows this bot by.
+
+        The thread's own id can be a session. The list reads seen, activity and
+        server state by the roster id first, so a row saved under another id
+        would never replace what the list already has.
+        """
+        bot = roster.ROSTER.get(self.target) or {}
+        ident = bot.get("id")
+        return ident if isinstance(ident, str) and ident else self.session_id
+
     def sync_activity(self):
         """The open chat is what the list shows on the way back.
 
@@ -249,8 +260,9 @@ class Chat:
         """
         entries = [entry for entry in self.messages if isinstance(entry, dict)]
         cursor = self.cursor or transcript.last_id([entry for entry in entries if not entry.get("local")])
-        activity.remember_seen(self.target, self.session_id, cursor)
-        backend.mark_read_later(self.session_id)
+        bot_id = self.list_id()
+        activity.remember_seen(self.target, bot_id, cursor)
+        backend.mark_read_later(bot_id)
         shown = [entry for entry in entries if not entry.get("local")]
         # An open widget is needs-you on the list even while this chat is idle.
         if self.phase == "blocked" or (self.phase != "working" and widgets.latest_widget(shown)):
@@ -260,7 +272,7 @@ class Chat:
         else:
             state = "idle"
         activity.store_activity(
-            {"id": self.session_id, "name": self.target},
+            {"id": bot_id, "name": self.target},
             {
                 "state": state,
                 "unread": 0,

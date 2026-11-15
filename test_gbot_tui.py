@@ -2938,6 +2938,44 @@ class OverviewTests(unittest.TestCase):
         self.assertEqual(views[0]["activity"]["state"], "idle")
         self.assertEqual(activity.lookup_seen(bots[0]), "m3")
 
+    def test_opening_a_chat_clears_unread_when_the_thread_names_another_id(self):
+        # The list knows the bot as a1. The thread names its own id (a session).
+        bots = [{"id": "a1", "name": "Researcher"}]
+        first = {"entries": [{"id": "m1", "role": "assistant", "text": "hello"}], "cursor": "m1"}
+        activity.build_overview(bots, lambda bot: first)
+        second = {
+            "entries": [
+                {"id": "m1", "role": "assistant", "text": "hello"},
+                {"id": "m2", "role": "assistant", "text": "the paper is out"},
+            ],
+            "cursor": "m2",
+        }
+        views, _error = activity.build_overview(bots, lambda bot: second)
+        self.assertEqual(views[0]["activity"]["state"], "unread")
+
+        page = transcript.parse_thread(
+            {
+                "target": {"id": "sess-1", "sessionId": "sess-1", "name": "Researcher"},
+                "transcript": {"entries": second["entries"]},
+                "cursor": "m2",
+            }
+        )
+        roster.ROSTER["Researcher"] = bots[0]
+        try:
+            chat = chat_state.Chat("Researcher")
+            chat.ingest(page, first=True)
+        finally:
+            roster.ROSTER.pop("Researcher", None)
+        # Back on the list: the saved state is what is drawn until the next scan.
+        row = activity.with_activity(bots)[0]["activity"]
+        self.assertEqual(row["state"], "idle")
+        self.assertEqual(row["unread"], 0)
+        self.assertEqual(activity.lookup_seen(bots[0]), "m2")
+        self.assertEqual(activity.overview_summary(activity.with_activity(bots)), "1 idle")
+        # The next scan reads the same cursor and agrees.
+        views, _error = activity.build_overview(bots, lambda bot: second)
+        self.assertEqual(views[0]["activity"]["state"], "idle")
+
     def test_list_previews_share_a_column(self):
         def bot(name, preview):
             return {

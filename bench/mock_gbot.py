@@ -10,6 +10,7 @@ MOCK_HISTORY  entries in a new thread (default 30); `thread --limit N` returns t
 MOCK_HANG   seconds each `thread` call hangs, for the loading state (default 0)
 MOCK_STREAM seconds a reply keeps growing after it first shows (default 0: whole at once)
 MOCK_INCLUSIVE  1: `thread --after <id>` always returns that entry too, unchanged
+MOCK_THREAD_ID  session: `thread` names target.id "sess-<bot id>", not the id `bots list` gives
 
 The text sent picks the reply, for bench/e2e_tui.py:
   "long ..."     a long Markdown reply with headings, a list and a fenced code block
@@ -33,6 +34,7 @@ HANG = float(os.environ.get("MOCK_HANG", "0") or 0)
 STREAM = float(os.environ.get("MOCK_STREAM", "0") or 0)
 GRACE = 3.0
 INCLUSIVE = os.environ.get("MOCK_INCLUSIVE") == "1"
+THREAD_SESSION = os.environ.get("MOCK_THREAD_ID") == "session"
 LONG = """# Trip plan
 
 Here is the plan for the week, with the parts that still need a decision.
@@ -153,8 +155,10 @@ def main(argv):
                 growing = entries[at].get("stream") and now < entries[at]["at"] + entries[at]["stream"] + GRACE
                 entries = entries[at:] if growing or INCLUSIVE else entries[at + 1 :]
         bot = bot_for(target)
+        # MOCK_THREAD_ID=session: the thread names the viewer's session, not the list's bot id.
+        thread_id = "sess-" + bot["id"] if THREAD_SESSION else bot["id"]
         payload = {
-            "target": {"id": bot["id"], "name": bot["name"], "avatarColor": bot.get("avatarColor", "")},
+            "target": {"id": thread_id, "name": bot["name"], "avatarColor": bot.get("avatarColor", "")},
             "transcript": {"entries": [shown(e, now) for e in entries][-limit:]},
         }
         print(json.dumps(payload))
