@@ -49,7 +49,7 @@ def show_avatar_later(bot):
     def done(made):
         key = herdr.program_key(bot.get("id") or "")
         # A later chat, or the list after Esc, owns APP now. Leave it alone.
-        if key in made and herdr.APP in {"gbot-tui", key, herdr.notice_name(name)}:
+        if key in made and herdr.APP in {"gbot-tui", key, herdr.app_name(name)}:
             herdr.bind_app(name, bot.get("id"))
 
     return install_avatars_later([bot], done)
@@ -200,7 +200,7 @@ def install_avatars(bots, root=None, src=None):
                 handle.write(png)
         # Herdr matches this list against the OSC app. The app is the hyphenated
         # name (`Cursor-Cloud-Session`), so that string has to be here.
-        human = herdr.notice_name(bot.get("name") or "")
+        human = herdr.app_name(bot.get("name") or "")
 
         def aliases(slot):
             found = []
