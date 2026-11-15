@@ -3208,6 +3208,9 @@ class OverviewTests(unittest.TestCase):
             self.assertEqual(views[0]["activity"]["state"], "working")
             clock.at = 10 + activity.WORKING_TIMEOUT
             views, error = activity.build_overview(bots, read)
+            self.assertEqual(views[0]["activity"]["state"], "working")
+            clock.at = 10 + activity.WORKING_LIVE_TIMEOUT
+            views, error = activity.build_overview(bots, read)
             self.assertEqual(views[0]["activity"]["state"], "idle")
 
         page = transcript.parse_thread(
@@ -3247,7 +3250,7 @@ class OverviewTests(unittest.TestCase):
             chat = chat_state.Chat("Chef")
             chat.ingest(stream, first=True)
             self.assertEqual(chat.phase, "working")
-            clock.at = activity.WORKING_TIMEOUT
+            clock.at = activity.WORKING_LIVE_TIMEOUT
             self.assertTrue(chat.expire_working())
             self.assertEqual(chat.phase, "idle")
             grown = transcript.parse_thread(
@@ -3264,6 +3267,126 @@ class OverviewTests(unittest.TestCase):
             )
             chat.ingest(grown)
             self.assertEqual(chat.phase, "working")
+
+
+class WorkingLivenessTests(unittest.TestCase):
+    """The working indicator follows the gateway, not only the visible text."""
+
+    class Clock:
+        def __init__(self, at):
+            self.at = at
+
+        def __enter__(self):
+            self.old = activity.clock
+            activity.clock = lambda: self.at
+            return self
+
+        def __exit__(self, *args):
+            activity.clock = self.old
+
+    @staticmethod
+    def page(entries):
+        return transcript.parse_thread(
+            {
+                "target": {"id": "a2", "name": "Chef"},
+                "transcript": {"entries": entries},
+                "cursor": entries[-1]["id"],
+            }
+        )
+
+    def test_streaming_entry_quiet_for_five_minutes_stays_working(self):
+        entries = [
+            {"id": "m1", "role": "user", "text": "go"},
+            {"id": "m2", "role": "assistant", "text": "partial", "isStreaming": True},
+        ]
+        with self.Clock(0) as clock:
+            chat = chat_state.Chat("Chef")
+            chat.ingest(self.page(entries), first=True)
+            self.assertEqual(chat.phase, "working")
+            clock.at = 300
+            self.assertFalse(chat.expire_working())
+            chat.ingest(transcript.parse_thread({"transcript": {"entries": []}, "cursor": "m2"}))
+            self.assertEqual(chat.phase, "working")
+            snap = activity.judge_activity(entries, "m2", "m2", previous=activity.lookup_activity({"name": "Chef", "id": "a2"}))
+            self.assertEqual(snap["state"], "working")
+            self.assertEqual(activity.lookup_activity({"name": "Chef", "id": "a2"})["state"], "working")
+
+    def test_hidden_thinking_entries_keep_working_past_timeout(self):
+        base = [
+            {"id": "m1", "role": "user", "text": "go"},
+            {"id": "t1", "role": "assistant", "kind": "thinking", "text": "hmm"},
+        ]
+        with self.Clock(0) as clock:
+            chat = chat_state.Chat("Chef")
+            chat.ingest(self.page(base), first=True)
+            self.assertEqual(chat.phase, "working")
+            snap = activity.judge_activity(base, "t1", "t1")
+            self.assertEqual(snap["state"], "working")
+            entries = list(base)
+            for step in range(1, 5):
+                clock.at = step * 60
+                entries.append({"id": f"t{step + 1}", "role": "assistant", "kind": "thinking", "text": "more" * step})
+                chat.ingest(
+                    transcript.parse_thread(
+                        {"transcript": {"entries": [entries[-1]]}, "cursor": entries[-1]["id"]}
+                    )
+                )
+                self.assertEqual(chat.phase, "working", step)
+                snap = activity.judge_activity(entries, entries[-1]["id"], "m1", previous=snap)
+                self.assertEqual(snap["state"], "working", step)
+            self.assertGreater(clock.at, activity.WORKING_TIMEOUT)
+            # A hidden entry that grows in place counts as well.
+            clock.at += 100
+            entries[-1] = dict(entries[-1], text="more" * 40)
+            chat.ingest(
+                transcript.parse_thread(
+                    {"transcript": {"entries": [entries[-1]]}, "cursor": entries[-1]["id"]}
+                )
+            )
+            self.assertEqual(chat.phase, "working")
+            # Once nothing arrives for the plain timeout, it ends.
+            clock.at += activity.WORKING_TIMEOUT
+            chat.ingest(transcript.parse_thread({"transcript": {"entries": []}, "cursor": entries[-1]["id"]}))
+            self.assertEqual(chat.phase, "idle")
+
+    def test_user_last_line_with_nothing_arriving_goes_idle(self):
+        entries = [
+            {"id": "m1", "role": "assistant", "text": "hi"},
+            {"id": "m2", "role": "user", "text": "go"},
+        ]
+        with self.Clock(0) as clock:
+            chat = chat_state.Chat("Chef")
+            chat.ingest(self.page(entries), first=True)
+            self.assertEqual(chat.phase, "working")
+            clock.at = activity.WORKING_TIMEOUT - 1
+            self.assertFalse(chat.expire_working())
+            clock.at = activity.WORKING_TIMEOUT
+            self.assertTrue(chat.expire_working())
+            self.assertEqual(chat.phase, "idle")
+            snap = activity.judge_activity(entries, "m2", "m2")
+            clock.at = 2 * activity.WORKING_TIMEOUT
+            snap = activity.judge_activity(entries, "m2", "m2", previous=snap)
+            self.assertEqual(snap["state"], "idle")
+
+    def test_stuck_streaming_flag_goes_idle_after_safety_cap(self):
+        entries = [
+            {"id": "m1", "role": "user", "text": "go"},
+            {"id": "m2", "role": "assistant", "text": "partial", "inProgress": True},
+        ]
+        with self.Clock(0) as clock:
+            chat = chat_state.Chat("Chef")
+            chat.ingest(self.page(entries), first=True)
+            snap = activity.judge_activity(entries, "m2", "m2")
+            clock.at = activity.WORKING_LIVE_TIMEOUT - 1
+            self.assertFalse(chat.expire_working())
+            self.assertEqual(activity.judge_activity(entries, "m2", "m2", previous=snap)["state"], "working")
+            clock.at = activity.WORKING_LIVE_TIMEOUT
+            self.assertTrue(chat.expire_working())
+            self.assertEqual(chat.phase, "idle")
+            self.assertEqual(activity.judge_activity(entries, "m2", "m2", previous=snap)["state"], "idle")
+            # The next poll must not flip it back to working.
+            chat.ingest(transcript.parse_thread({"transcript": {"entries": []}, "cursor": "m2"}))
+            self.assertEqual(chat.phase, "idle")
 
 
 class ServerStateTests(unittest.TestCase):

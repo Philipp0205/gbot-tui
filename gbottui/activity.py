@@ -7,10 +7,17 @@ import time
 from . import backend, cache, gbot_cli, markdown, picker, styles, transcript, widgets
 
 
-# A turn that never grows (the last line stays yours, or isStreaming stays
-# set) would otherwise say `working` forever. This is how long with no new
-# text before the chat and the overview fall back to idle.
+# A turn that never changes (the last line stays yours) would otherwise say
+# `working` forever. This is how long with nothing arriving in the thread
+# (visible text or hidden thinking, progress, tool entries) before the chat
+# and the overview fall back to idle.
 WORKING_TIMEOUT = 120
+# While the gateway marks the turn live (isStreaming, inProgress, a progress
+# status) the turn stays `working` this long without a change. It is only a
+# safety cap, so a stuck flag cannot spin forever.
+WORKING_LIVE_TIMEOUT = 1800
+# Entries at the end of the thread that the activity token measures in full.
+TOKEN_TAIL = 40
 
 
 # How many trailing entries the overview reads. Same window as a chat poll,
@@ -190,18 +197,55 @@ def clock():
     return time.monotonic()
 
 
+def _raw_size(value, depth=0):
+    """Total length of the strings inside one entry. Numbers and clocks do not count."""
+    if isinstance(value, str):
+        return len(value)
+    if depth > 6:
+        return 0
+    if isinstance(value, dict):
+        return sum(_raw_size(item, depth + 1) for item in value.values())
+    if isinstance(value, list):
+        return sum(_raw_size(item, depth + 1) for item in value)
+    return 0
+
+
 def content_token(entries):
-    """Identity of the visible text. A longer reply is new content; a quiet flag is not."""
+    """Identity of the thread. Any change to it counts as activity.
+
+    The visible text is in it, and so are the ids, the status, and the raw size
+    of the newest entries. A new or growing hidden thinking, progress, or tool
+    entry changes the token even though it adds no visible text.
+    """
     parts = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
+    entries = [entry for entry in entries if isinstance(entry, dict)]
+    tail_from = max(len(entries) - TOKEN_TAIL, 0)
+    for index, entry in enumerate(entries):
         kind = "u" if transcript.is_user(entry) else "b"
         flag = ""
         if entry.get("streaming") is True or entry.get("inProgress") is True or entry.get("isStreaming") is True:
             flag = "*"
-        parts.append(kind + flag + transcript.entry_text(entry))
+        meta = ""
+        if index >= tail_from:
+            status = entry.get("status")
+            meta = "\x1f".join(
+                (
+                    entry.get("id") if isinstance(entry.get("id"), str) else "",
+                    status if isinstance(status, str) else "",
+                    str(_raw_size(entry)),
+                )
+            )
+        parts.append(kind + flag + meta + "\x1d" + transcript.entry_text(entry))
     return "\x1e".join(parts)
+
+
+def quiet_limit(entries):
+    """Seconds with no change in the thread before `working` gives up.
+
+    A turn the gateway marks live keeps the long cap. A last line that is just
+    the user's, with nothing arriving, gets the short one.
+    """
+    return WORKING_LIVE_TIMEOUT if entry_in_progress(entries) else WORKING_TIMEOUT
 
 
 def awaiting_reply(entries):
@@ -293,9 +337,10 @@ def judge_activity(entries, cursor, seen, previous=None):
 
     An empty `seen` does not mark the whole history as new. `blocked` wins over
     a new reply, and a new reply wins over `running`. An open widget after the
-    user's last message is `needs you`. `working` that gains no text for
-    WORKING_TIMEOUT falls back to idle. `previous` is the last snap, so the
-    overview can time that quiet stretch with `clock`.
+    user's last message is `needs you`. `working` with no change in the thread
+    for `quiet_limit` (WORKING_TIMEOUT, or WORKING_LIVE_TIMEOUT while the
+    gateway marks the turn live) falls back to idle. `previous` is the last
+    snap, so the overview can time that quiet stretch with `clock`.
     """
     entries = [entry for entry in entries if isinstance(entry, dict) and not entry.get("local")]
     cursor = cursor or transcript.last_id(entries)
@@ -305,7 +350,7 @@ def judge_activity(entries, cursor, seen, previous=None):
     since = _working_since(previous, token, now) if running else 0
     if transcript.pending_approval(entries) or widgets.latest_widget(entries):
         phase = "blocked"
-    elif running and now - since < WORKING_TIMEOUT:
+    elif running and now - since < quiet_limit(entries):
         phase = "working"
     else:
         phase = "idle"
