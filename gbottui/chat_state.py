@@ -327,7 +327,10 @@ class Chat:
         return (self.widget_steps.get(entry.get("id")) or {}).get("at", 0)
 
     def note_content(self):
-        """Restart the quiet-turn clock when the transcript text changes."""
+        """Restart the quiet-turn clock when anything in the thread changes.
+
+        The token covers hidden thinking, progress, and tool entries too.
+        """
         token = activity.content_token(self.messages)
         now = activity.clock()
         if token != self.content_token or self.content_at is None:
@@ -335,22 +338,26 @@ class Chat:
             self.content_at = now
 
     def quiet_for(self):
-        """True when the visible text has been unchanged for WORKING_TIMEOUT."""
+        """True when the thread has not changed for the limit.
+
+        That is WORKING_TIMEOUT, or the long safety cap while the gateway
+        marks the turn live.
+        """
         now = activity.clock()
         if self.content_at is None:
             self.content_at = now
             return False
-        return now - self.content_at >= activity.WORKING_TIMEOUT
+        return now - self.content_at >= activity.quiet_limit(self.messages)
 
     def content_expired(self):
         return self.phase == "working" and self.quiet_for()
 
     def settle_working(self, phase):
-        """Keep a live reply in `working`, and give up when it stops changing."""
+        """Keep a live reply in `working`, and give up when nothing changes."""
         if phase == "done" and activity.entry_in_progress(self.messages):
             phase = "working"
-        # Any turn with no new text, including one whose last line is the user's
-        # or whose isStreaming flag never clears.
+        # A turn whose last line is the user's gives up after WORKING_TIMEOUT.
+        # One the gateway marks live gives up after the safety cap.
         if phase == "working" and self.quiet_for():
             return "idle"
         if phase in {"idle", "done"} and activity.entry_in_progress(self.messages) and not self.quiet_for():
@@ -358,7 +365,7 @@ class Chat:
         return phase
 
     def expire_working(self):
-        """Drop a turn that has had no new text for WORKING_TIMEOUT."""
+        """Drop a turn that has had no change for its limit."""
         if not self.content_expired():
             return False
         self.choice_wait = False
