@@ -9,6 +9,7 @@ What the desktop app's chat does, and where gbot-tui stands. The backend is fixe
 | Bot list with status (needs you / unread / working / idle) | Done | `picker.py` `pick`, `activity.py` `Survey`, `with_activity` | 01 |
 | Unread counts and order from the server | Done | `backend.refresh_server_state`, `activity.order_bots` | |
 | Mark read on leave | Done | `backend.mark_read_later`, `Chat.sync_activity` (seen cursor and saved state under the roster id, so the row is `idle` on return) | 38 |
+| Mark read from the list (Ctrl-X) | Done | `picker.py` `pick`, `activity.mark_read` (same seen cursor, server mark-read and unread 0 as opening the chat; `needs you` and `working` stay) | 41 |
 | Filter the list | Done | `picker.fuzzy_bots`, `preview_score` | 02 |
 | Open a bot, switch bots | Done | `app.screens` (Enter / Esc share one curses session) | 03, 11, 12 |
 | Open by name from the shell | Done | `app.main`, `roster` prefix match | 14, 15 |

@@ -172,6 +172,35 @@ def seen_mark(bot):
     return transcript.last_id(cache.read_thread_cache(bot.get("name") or ""))
 
 
+def mark_read(bot):
+    """Treat this bot as read without opening it. Ctrl-X on the list.
+
+    The same three steps as opening the chat (`Chat.sync_activity`): the seen
+    cursor moves to the bot's latest cursor, the server unread clears, and the
+    snapshot is stored with unread 0. `needs you` and `working` stay; a row
+    that was only `unread` falls back to `idle`. A bot with no cursor yet has
+    nothing to move to, so this does nothing. Returns True when it marked.
+    """
+    if not isinstance(bot, dict):
+        return False
+    snap = bot.get("activity")
+    if not isinstance(snap, dict) or not snap.get("cursor"):
+        snap = lookup_activity(bot)
+    cursor = snap.get("cursor") if isinstance(snap, dict) else ""
+    if not isinstance(cursor, str) or not cursor:
+        return False
+    name = bot.get("name") or ""
+    bot_id = bot.get("id") or ""
+    remember_seen(name, bot_id, cursor)
+    backend.mark_read_later(bot_id)
+    state = snap.get("state")
+    store_activity(
+        {"id": bot_id, "name": name},
+        {**snap, "state": "idle" if state == "unread" else state, "unread": 0},
+    )
+    return True
+
+
 def baseline_seen(bot, cursor):
     """Record the first cursor a scan saw. Later scans leave it where it is."""
     if not isinstance(cursor, str) or not cursor:
