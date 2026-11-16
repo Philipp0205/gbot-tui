@@ -3,11 +3,13 @@
 import curses
 import threading
 
-from . import activity, colors, gbot_cli, grid, paint, styles, terminal, theme
+from . import activity, backend, colors, gbot_cli, grid, paint, styles, terminal, theme
 
 
 # "needs you" and "80 unread" are 9 wide. Two spaces keep the next column off the word.
 STATE_COLUMN = 11
+# A section tag needs the row to stay at least this wide without it.
+TAG_MIN_WIDTH = 40
 
 
 def fuzzy_score(query, name):
@@ -122,13 +124,23 @@ def _status_spans(lead, lead_style, mark, name, name_style, snap, title, room, c
     return spans
 
 
-def picker_spans(bot, selected, width, columns=None):
+def picker_spans(bot, selected, width, columns=None, tag=""):
     """One selection row: mark, avatar, state, name, and a preview.
 
     The state is `needs you`, `unread`, `running`, or `idle`. A row with no
     reading yet holds that column with a dash so the names still line up.
     Without a shared grid, a row that has no state yet keeps the tagline.
+    `tag` is a section name. It is dimmed at the end of the row, and the
+    preview gives up the room for it. A window too narrow for that shows no tag.
     """
+    if tag:
+        reserve = len(tag) + 2
+        if width - reserve >= TAG_MIN_WIDTH:
+            return _row_spans(bot, selected, width - reserve, columns) + [("  " + tag, "dim")]
+    return _row_spans(bot, selected, width, columns)
+
+
+def _row_spans(bot, selected, width, columns=None):
     title = (bot.get("title") or bot.get("tagline") or "").strip()
     name = bot["name"]
     name_style = "bold" if selected else "default"
@@ -223,6 +235,65 @@ def fuzzy_bots(query, bots):
     return [bot for _score, _index, bot in ranked]
 
 
+def group_bots(bots, layout):
+    """Group `bots` under headers in the server's order.
+
+    Returns (ordered, rows). `ordered` holds only bots, group by group. `rows` is
+    what is drawn: ("header", label) or ("bot", index into ordered). A pinned
+    group comes first, then each section by name, then "other" for bots in no
+    section. A bot shows once, in the first group that lists it. Empty groups
+    have no header. With no groups known, or every bot in "other", the list is
+    flat: `rows` has no headers.
+    """
+    pinned = layout.get("pinned") or []
+    sections = layout.get("sections") or []
+    groups = [("pinned", pinned)] if pinned else []
+    groups += [(section.get("name") or "section", section.get("agent_ids") or []) for section in sections]
+    if not groups:
+        return list(bots), [("bot", index) for index in range(len(bots))]
+    taken = set()
+    buckets = []
+    for label, ids in groups:
+        wanted = set(ids)
+        members = [bot for bot in bots if bot.get("id") in wanted and bot.get("id") not in taken]
+        taken.update(bot["id"] for bot in members)
+        if members:
+            buckets.append((label, members))
+    rest = [bot for bot in bots if bot.get("id") not in taken]
+    if not buckets:
+        return list(bots), [("bot", index) for index in range(len(bots))]
+    if rest:
+        buckets.append(("other", rest))
+    ordered = []
+    rows = []
+    for label, members in buckets:
+        rows.append(("header", label))
+        for bot in members:
+            rows.append(("bot", len(ordered)))
+            ordered.append(bot)
+    return ordered, rows
+
+
+def section_tags(layout):
+    """agent id -> the name of the first section that lists it. Pinned is not a section."""
+    tags = {}
+    for section in layout.get("sections") or []:
+        name = section.get("name") or ""
+        if not name:
+            continue
+        for ident in section.get("agent_ids") or []:
+            tags.setdefault(ident, name)
+    return tags
+
+
+def row_of(rows, selected):
+    """The drawn row of the `selected`-th bot. Headers are not counted in `selected`."""
+    for position, (kind, value) in enumerate(rows):
+        if kind == "bot" and value == selected:
+            return position
+    return 0
+
+
 class Loader:
     """Run one gbot call on a thread. The UI polls `ready` instead of waiting."""
 
@@ -305,6 +376,8 @@ def pick(stdscr, bots, refresh=None):
     chosen = ""
     pending = []
     showing_help = False
+    # The row layout as last drawn (headers and bots), to repaint when it changes.
+    last_shape = None
     # Each bot's state as last drawn, for the bell when one starts needing you.
     states = None
     try:
@@ -330,8 +403,15 @@ def pick(stdscr, bots, refresh=None):
                 for name in fresh:
                     terminal.write_tty(terminal.notify(f"{name} needs you"))
             shown = fuzzy_bots(query, views)
+            layout = backend.current_sections()
             if not query:
                 shown = activity.order_bots(shown)
+                # `selected` counts bots only, so Up, Down, Enter and Ctrl-X never land on a header.
+                shown, rows = group_bots(shown, layout)
+                tags = {}
+            else:
+                rows = [("bot", index) for index in range(len(shown))]
+                tags = section_tags(layout)
             if moved and chosen:
                 names = [bot["name"] for bot in shown]
                 if chosen in names:
@@ -353,6 +433,14 @@ def pick(stdscr, bots, refresh=None):
             problem = survey.problem()
             height, width = stdscr.getmaxyx()
             stdscr.erase()
+            # Headers come and go with the search and shift every row below them. A
+            # full repaint then beats curses scrolling a region, which not every
+            # terminal (or emulator) applies the same way.
+            shape = tuple(kind for kind, _value in rows)
+            if shape != last_shape:
+                if last_shape is not None and hasattr(stdscr, "clearok"):
+                    stdscr.clearok(True)
+                last_shape = shape
             paint.put(stdscr, 0, 1, "Grok bots", styles.ATTR["bold"])
             banner = list_banner(query, summary, width)
             if banner:
@@ -360,17 +448,23 @@ def pick(stdscr, bots, refresh=None):
             footer = 1 if height >= 4 else 0
             body_h = max(height - 2 - footer, 0)
             top = 0
-            if body_h and selected >= body_h:
-                top = selected - body_h + 1
+            # The scroll window counts drawn rows, headers included, not bots.
+            at = row_of(rows, selected) if shown else 0
+            if body_h and at >= body_h:
+                top = at - body_h + 1
             if showing_help:
                 paint_list_help(stdscr, 2, body_h, width)
             elif not shown and body_h:
                 empty = "  loading bots…" if loader and not bots else "  no match"
                 paint.put(stdscr, 2, 1, grid.clip(empty, max(width - 2, 0)), styles.ATTR["dim"])
             columns = list_columns(shown, width)
-            for index, bot in enumerate([] if showing_help else shown[top : top + body_h]):
-                actual = top + index
-                paint.paint_spans(stdscr, 2 + index, 1, picker_spans(bot, actual == selected, width, columns))
+            for index, (kind, value) in enumerate([] if showing_help else rows[top : top + body_h]):
+                if kind == "header":
+                    paint.put(stdscr, 2 + index, 1, grid.clip(value, max(width - 2, 0)), styles.ATTR["dim"])
+                    continue
+                bot = shown[value]
+                spans = picker_spans(bot, value == selected, width, columns, tags.get(bot.get("id"), ""))
+                paint.paint_spans(stdscr, 2 + index, 1, spans)
             if footer:
                 if note:
                     spans = [(grid.clip(note, max(width - 2, 0)), "red")]

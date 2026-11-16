@@ -1,6 +1,6 @@
 # Parity with the Grok Bot desktop chat
 
-What the desktop app's chat does, and where gbot-tui stands. The backend is fixed: the `gbot` calls in `gbottui/gbot_cli.py` (`bots list`, `thread [--after]`, `send`, `approvals respond`, the opt-in widget hook) and the two Cursor calls in `gbottui/backend.py` (`ListGrokBotAgentStatuses`, `SetGrokBotAgentClientState` mark-read). A Gap is something those calls already allow. Not possible needs a call the repo does not make.
+What the desktop app's chat does, and where gbot-tui stands. The backend is fixed: the `gbot` calls in `gbottui/gbot_cli.py` (`bots list`, `thread [--after]`, `send`, `approvals respond`, the opt-in widget hook) and the three Cursor calls in `gbottui/backend.py` (`ListGrokBotAgentStatuses`, `SetGrokBotAgentClientState` mark-read, and the read-only `GetGrokBotUserRuntimeSettings` for pinned bots and sidebar sections; nothing is ever written back to it). A Gap is something those calls already allow. Not possible needs a call the repo does not make.
 
 `bench/e2e_tui.py` runs the scenarios named in the last column against `bench/mock_gbot.py`.
 
@@ -8,6 +8,7 @@ What the desktop app's chat does, and where gbot-tui stands. The backend is fixe
 |---|---|---|---|
 | Bot list with status (needs you / unread / working / idle) | Done | `picker.py` `pick`, `activity.py` `Survey`, `with_activity` | 01 |
 | Unread counts and order from the server | Done | `backend.refresh_server_state`, `activity.order_bots` | |
+| Bot categories (sidebar sections, pinned) | Done (read-only) | `backend.refresh_sections` reads `GetGrokBotUserRuntimeSettings` (empty body; pinned agents are field 6, sidebar sections field 7) in the background beside `refresh_server_state` and caches it in `~/.cache/gbot-tui/sections.json` (`backend.load_sections_cache` at startup). With an empty search `picker.group_bots` draws dim, unselectable headers: `pinned` first, each section by name in the server's order, then `other`; empty sections have no header, a bot in several sections shows in the first. A search is flat, with the section name dimmed at the end of the row when it fits (`picker.section_tags`). No sections known (no token, offline, a failed call) is the flat list. Sections cannot be created, renamed or edited: there is no Update call | 49 |
 | Mark read on leave | Done | `backend.mark_read_later`, `Chat.sync_activity` (seen cursor and saved state under the roster id, so the row is `idle` on return) | 38 |
 | Mark read from the list (Ctrl-X) | Done | `picker.py` `pick`, `activity.mark_read` (same seen cursor, server mark-read and unread 0 as opening the chat; `needs you` and `working` stay) | 41 |
 | Filter the list | Done | `picker.fuzzy_bots`, `preview_score` | 02 |

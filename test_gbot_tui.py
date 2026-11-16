@@ -3803,6 +3803,270 @@ class ServerStateTests(unittest.TestCase):
         self.assertEqual([bot["name"] for bot in ordered], ["B", "A"])
         self.assertEqual(ordered[0]["activity"]["unread"], 3)
 
+
+def _pb(field, payload):
+    """One length-delimited protobuf field."""
+    return backend._varint(field << 3 | 2) + backend._varint(len(payload)) + payload
+
+
+def _section_blob(ident, name, agent_ids):
+    return _pb(1, ident.encode()) + _pb(2, name.encode()) + b"".join(_pb(3, a.encode()) for a in agent_ids)
+
+
+class SectionParseTests(unittest.TestCase):
+    def blob(self, pinned_field=1):
+        sections = _pb(1, _section_blob("section-mwb7wxq3-1", "Projects", ["u-1", "u-2"])) + _pb(
+            1, _section_blob("section-x-2", "Home", ["u-3"])
+        )
+        settings = (
+            b"\x08\x05"  # field 1, a varint: ignored
+            + b"\x15\x00\x00\x80\x3f"  # field 2, a fixed32: skipped
+            + _pb(3, b"ignored")
+            + _pb(6, _pb(pinned_field, b"u-9") + _pb(pinned_field, b"u-8"))
+            + _pb(7, sections)
+        )
+        return _pb(1, settings)
+
+    def test_parses_pinned_and_sections_in_order(self):
+        layout = backend.parse_runtime_settings(self.blob())
+        self.assertEqual(layout["pinned"], ["u-9", "u-8"])
+        self.assertEqual(
+            layout["sections"],
+            [
+                {"id": "section-mwb7wxq3-1", "name": "Projects", "agent_ids": ["u-1", "u-2"]},
+                {"id": "section-x-2", "name": "Home", "agent_ids": ["u-3"]},
+            ],
+        )
+
+    def test_pinned_ids_are_read_from_another_field_number_too(self):
+        self.assertEqual(backend.parse_runtime_settings(self.blob(pinned_field=2))["pinned"], ["u-9", "u-8"])
+
+    def test_empty_and_unrelated_answers_have_no_sections(self):
+        empty = {"pinned": [], "sections": []}
+        self.assertEqual(backend.parse_runtime_settings(b""), empty)
+        self.assertEqual(backend.parse_runtime_settings(_pb(2, b"x")), empty)
+        self.assertEqual(backend.parse_runtime_settings(_pb(1, b"")), empty)
+
+    def test_a_cut_off_answer_raises_what_the_refresh_catches(self):
+        with self.assertRaises((ValueError, IndexError)):
+            backend.parse_runtime_settings(b"\x0a\x80")
+
+    def test_the_call_is_read_only_with_an_empty_body(self):
+        calls = []
+        real = backend.backend_call
+        backend.backend_call = lambda method, body, timeout=15: calls.append((method, body)) or self.blob()
+        backend.set_sections({})
+        try:
+            backend.refresh_sections()
+            self.assertEqual(calls, [("GetGrokBotUserRuntimeSettings", b"")])
+            self.assertEqual(backend.current_sections()["pinned"], ["u-9", "u-8"])
+            self.assertEqual(cache.read_json(cache.sections_path())["sections"][0]["name"], "Projects")
+        finally:
+            backend.backend_call = real
+            backend.set_sections({})
+
+    def test_a_failed_call_keeps_the_layout_and_raises_nothing(self):
+        real = backend.backend_call
+
+        def fail(method, body, timeout=15):
+            raise gbot_cli.GbotError("no Cursor token")
+
+        backend.backend_call = fail
+        backend.set_sections({"pinned": ["a"], "sections": []})
+        try:
+            backend.refresh_sections()
+            self.assertEqual(backend.current_sections()["pinned"], ["a"])
+        finally:
+            backend.backend_call = real
+            backend.set_sections({})
+
+    def test_the_cache_fills_the_layout_at_startup_but_never_replaces_a_fresh_one(self):
+        cache.write_private(cache.sections_path(), {"pinned": ["p"], "sections": [{"id": "s", "name": "Work", "agent_ids": ["a", 3]}]})
+        backend.set_sections({})
+        try:
+            backend.load_sections_cache()
+            self.assertEqual(backend.current_sections()["sections"], [{"id": "s", "name": "Work", "agent_ids": ["a"]}])
+            backend.set_sections({"pinned": ["fresh"], "sections": []})
+            backend.load_sections_cache()
+            self.assertEqual(backend.current_sections()["pinned"], ["fresh"])
+        finally:
+            backend.set_sections({})
+            os.remove(cache.sections_path())
+
+    def test_a_broken_cache_means_no_sections(self):
+        for junk in ([], "x", {"sections": "x", "pinned": 3}, {"sections": [1, None]}):
+            self.assertEqual(backend.clean_sections(junk)["pinned"], [])
+            self.assertEqual([s for s in backend.clean_sections(junk)["sections"] if s["agent_ids"]], [])
+
+
+BOTS_FOR_SECTIONS = [
+    {"id": "a", "name": "Alpha"},
+    {"id": "b", "name": "Bravo"},
+    {"id": "c", "name": "Charlie"},
+    {"id": "d", "name": "Delta"},
+]
+
+
+class SectionGroupTests(unittest.TestCase):
+    layout = {
+        "pinned": ["d"],
+        "sections": [
+            {"id": "s1", "name": "Projects", "agent_ids": ["c", "a", "d"]},
+            {"id": "s2", "name": "Empty", "agent_ids": ["zzz"]},
+            {"id": "s3", "name": "Again", "agent_ids": ["a"]},
+        ],
+    }
+
+    def names(self, bots, rows):
+        return [bots[v]["name"] if k == "bot" else "#" + v for k, v in rows]
+
+    def test_pinned_then_sections_then_other_in_each_groups_own_order(self):
+        ordered, rows = picker.group_bots(BOTS_FOR_SECTIONS, self.layout)
+        self.assertEqual(self.names(ordered, rows), ["#pinned", "Delta", "#Projects", "Alpha", "Charlie", "#other", "Bravo"])
+        self.assertEqual([bot["name"] for bot in ordered], ["Delta", "Alpha", "Charlie", "Bravo"])
+
+    def test_empty_sections_have_no_header_and_a_bot_shows_once(self):
+        _ordered, rows = picker.group_bots(BOTS_FOR_SECTIONS, self.layout)
+        headers = [value for kind, value in rows if kind == "header"]
+        self.assertEqual(headers, ["pinned", "Projects", "other"])
+        self.assertEqual(len([1 for kind, _ in rows if kind == "bot"]), 4)
+
+    def test_no_sections_known_is_the_flat_list(self):
+        for layout in ({}, {"pinned": [], "sections": []}, {"pinned": ["nobody"], "sections": []}):
+            ordered, rows = picker.group_bots(BOTS_FOR_SECTIONS, layout)
+            self.assertEqual(ordered, BOTS_FOR_SECTIONS)
+            self.assertEqual([kind for kind, _ in rows], ["bot"] * 4)
+
+    def test_section_tags_use_the_first_section(self):
+        tags = picker.section_tags(self.layout)
+        self.assertEqual(tags, {"c": "Projects", "a": "Projects", "d": "Projects", "zzz": "Empty"})
+
+    def test_a_tag_is_dim_at_the_end_when_it_fits_and_dropped_when_it_does_not(self):
+        bot = BOTS_FOR_SECTIONS[0]
+        wide = picker.picker_spans(bot, False, 80, None, "Projects")
+        self.assertEqual(wide[-1], ("  Projects", "dim"))
+        narrow = picker.picker_spans(bot, False, 30, None, "Projects")
+        self.assertNotIn("Projects", "".join(text for text, _style in narrow))
+        self.assertEqual(picker.picker_spans(bot, False, 80), picker.picker_spans(bot, False, 80, None, ""))
+
+
+class _ListScreen(FakeScreen):
+    """Feeds keys to the list and keeps a copy of every frame."""
+
+    def __init__(self, keys, height=24, width=80):
+        super().__init__(height, width)
+        self.keys = list(keys)
+        self.frames = []
+
+    def timeout(self, _ms):
+        pass
+
+    def keypad(self, _on):
+        pass
+
+    def bkgd(self, *_args):
+        pass
+
+    def get_wch(self):
+        self.frames.append({y: " ".join(parts) for y, parts in self.rows.items()})
+        if not self.keys:
+            raise KeyboardInterrupt
+        return self.keys.pop(0)
+
+
+class SectionListTests(unittest.TestCase):
+    layout = {
+        "pinned": ["d"],
+        "sections": [{"id": "s1", "name": "Projects", "agent_ids": ["c", "a"]}],
+    }
+
+    def run_list(self, keys, height=24, width=80):
+        class Quiet:
+            def __init__(self, _bots):
+                pass
+
+            def status(self):
+                return False, 0, 0, 0
+
+            def problem(self):
+                return ""
+
+            def close(self):
+                pass
+
+        marked = []
+        originals = (activity.Survey, picker.paint.fast_escape, picker.paint.place_cursor, picker.terminal.enable_wheel, activity.mark_read)
+        activity.Survey = Quiet
+        picker.paint.fast_escape = picker.paint.place_cursor = picker.terminal.enable_wheel = lambda *a: None
+        activity.mark_read = lambda bot: marked.append(bot["name"])
+        backend.set_sections(self.layout)
+        screen = _ListScreen(keys, height, width)
+        try:
+            result = picker.pick(screen, [dict(bot) for bot in BOTS_FOR_SECTIONS])
+        finally:
+            (activity.Survey, picker.paint.fast_escape, picker.paint.place_cursor, picker.terminal.enable_wheel, activity.mark_read) = originals
+            backend.set_sections({})
+        return result, screen, marked
+
+    def test_headers_are_drawn_dim_in_the_servers_order(self):
+        _result, screen, _marked = self.run_list(["\r"])
+        frame = screen.frames[0]
+        self.assertEqual(frame[2].strip(), "pinned")
+        self.assertIn("Delta", frame[3])
+        self.assertEqual(frame[4].strip(), "Projects")
+        self.assertIn("Alpha", frame[5])
+        self.assertIn("Charlie", frame[6])
+        self.assertEqual(frame[7].strip(), "other")
+        self.assertIn("Bravo", frame[8])
+        # The highlight starts on the first bot, not on the header above it.
+        self.assertIn("→", frame[3])
+
+    def test_enter_on_the_first_row_below_a_header_opens_that_bot(self):
+        self.assertEqual(self.run_list(["\r"])[0], "Delta")
+
+    def test_up_and_down_skip_headers(self):
+        self.assertEqual(self.run_list([curses.KEY_DOWN, "\r"])[0], "Alpha")
+        self.assertEqual(self.run_list([curses.KEY_DOWN, curses.KEY_DOWN, curses.KEY_DOWN, "\r"])[0], "Bravo")
+        self.assertEqual(self.run_list([curses.KEY_DOWN] * 6 + [curses.KEY_UP, curses.KEY_UP, "\r"])[0], "Alpha")
+        self.assertEqual(self.run_list([curses.KEY_UP, "\r"])[0], "Delta")
+
+    def test_ctrl_x_marks_the_highlighted_bot_not_a_header(self):
+        result, _screen, marked = self.run_list([curses.KEY_DOWN, curses.KEY_DOWN, "\x18", "\r"])
+        self.assertEqual(marked, ["Charlie"])
+        self.assertEqual(result, "Charlie")
+
+    def test_the_scroll_window_counts_header_rows(self):
+        # Height 7 leaves 4 body rows for 7 drawn rows (3 headers, 4 bots).
+        result, screen, _marked = self.run_list([curses.KEY_DOWN] * 3 + ["\r"], height=7)
+        self.assertEqual(result, "Bravo")
+        last = screen.frames[-1]
+        self.assertIn("→", last[5])
+        self.assertIn("Bravo", last[5])
+        self.assertEqual(last[4].strip(), "other")
+
+    def test_a_search_is_flat_and_tags_each_row_with_its_section(self):
+        result, screen, _marked = self.run_list(list("a") + ["\r"])
+        frame = screen.frames[1]
+        rows = [frame[y] for y in sorted(frame) if y >= 2 and "·" not in frame[y] and "●" in frame[y]]
+        self.assertTrue(rows)
+        self.assertFalse(any(frame.get(y, "").strip() in ("pinned", "other", "Projects") for y in range(2, 10)))
+        alpha = next(row for row in rows if "Alpha" in row)
+        self.assertTrue(alpha.rstrip().endswith("Projects"), alpha)
+        self.assertEqual(result, "Alpha")
+
+    def test_no_sections_known_is_todays_flat_list(self):
+        self.layout, saved = {}, self.layout
+        try:
+            result, screen, _marked = self.run_list([curses.KEY_DOWN, "\r"])
+        finally:
+            self.layout = saved
+        frame = screen.frames[0]
+        self.assertEqual(result, "Bravo")
+        for y in range(2, 8):
+            self.assertNotIn(frame.get(y, "").strip(), ("pinned", "other", "Projects"))
+        self.assertIn("Alpha", frame[2])
+
+
 class RouteTests(unittest.TestCase):
     names = ["Chef", "Cursor Cloud Session"]
 

@@ -8,7 +8,7 @@ import sys
 import termios
 import threading
 
-from . import activity, cache, chat_screen, chat_state, gbot_cli, herdr, icons, picker, roster, tabs, terminal, theme
+from . import activity, backend, cache, chat_screen, chat_state, gbot_cli, herdr, icons, picker, roster, tabs, terminal, theme
 
 
 def parse_args(argv):
@@ -72,6 +72,8 @@ def screens(stdscr, target):
             if cached and not roster.ROSTER:
                 roster.ROSTER.update({bot["name"]: bot for bot in cached})
             refresh = roster.list_bots if first or not cached else (lambda: roster.list_bots(avatars="skip"))
+            # The last known sections, so the headers show before the backend answers.
+            backend.load_sections_cache()
             target = picker.pick(stdscr, cached, refresh=refresh)
             first = False
             if not target:

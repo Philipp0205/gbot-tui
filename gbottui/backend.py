@@ -1,11 +1,11 @@
-"""Calls to the Cursor backend: login token, unread state, mark read."""
+"""Calls to the Cursor backend: login token, unread state, mark read, sidebar sections."""
 
 import os
 import subprocess
 import threading
 import time
 
-from . import activity, gbot_cli
+from . import activity, cache, gbot_cli
 
 
 def token_expired(token, now=None):
@@ -71,6 +71,12 @@ def _proto_fields(data):
             if byte < 0x80:
                 break
         kind = key & 7
+        if kind == 1 or kind == 5:
+            # Fixed-width fields (doubles, floats) are not read here. Skip them.
+            i += 8 if kind == 1 else 4
+            if i > len(data):
+                raise IndexError("truncated fixed-width field")
+            continue
         if kind == 0 or kind == 2:
             value = shift = 0
             while True:
@@ -132,8 +138,127 @@ def parse_agent_statuses(data):
     return found
 
 
+def _text(value):
+    """A protobuf bytes value as a clean string, or None when it is not plain text."""
+    if not isinstance(value, bytes):
+        return None
+    try:
+        text = value.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if not text or not text.isprintable():
+        return None
+    return text
+
+
+def _strings(data, field=None):
+    """Every plain string in one message. `field` limits it to that field number."""
+    out = []
+    for number, value in _proto_fields(data):
+        text = _text(value)
+        if text is not None and (field is None or number == field):
+            out.append(text)
+    return out
+
+
+def _pinned_ids(data):
+    """Agent ids in the pinned message. Field 1 is the likely one, so any string is the fallback."""
+    try:
+        return _strings(data, 1) or _strings(data)
+    except (ValueError, IndexError):
+        return []
+
+
+def parse_runtime_settings(data):
+    """{"pinned": [agent id], "sections": [{"id", "name", "agent_ids"}]} from the response.
+
+    Only fields 6 (pinned agents) and 7 (sidebar sections) of the settings are read.
+    """
+    pinned = []
+    sections = []
+    for field, settings in _proto_fields(data):
+        if field != 1 or not isinstance(settings, bytes):
+            continue
+        for number, value in _proto_fields(settings):
+            if not isinstance(value, bytes):
+                continue
+            if number == 6:
+                pinned.extend(_pinned_ids(value))
+            elif number == 7:
+                for inner, raw in _proto_fields(value):
+                    if inner != 1 or not isinstance(raw, bytes):
+                        continue
+                    section = {"id": "", "name": "", "agent_ids": []}
+                    for part, item in _proto_fields(raw):
+                        text = _text(item)
+                        if text is None:
+                            continue
+                        if part == 1 and not section["id"]:
+                            section["id"] = text
+                        elif part == 2 and not section["name"]:
+                            section["name"] = text
+                        elif part == 3:
+                            section["agent_ids"].append(text)
+                    sections.append(section)
+    return {"pinned": pinned, "sections": sections}
+
+
+def clean_sections(data):
+    """The saved or parsed layout in its one shape. Anything else is no sections."""
+    empty = {"pinned": [], "sections": []}
+    if not isinstance(data, dict):
+        return empty
+
+    def ids(value):
+        return [item for item in value if isinstance(item, str) and item] if isinstance(value, list) else []
+
+    sections = []
+    for raw in data.get("sections") if isinstance(data.get("sections"), list) else []:
+        if not isinstance(raw, dict):
+            continue
+        name = raw.get("name") if isinstance(raw.get("name"), str) else ""
+        ident = raw.get("id") if isinstance(raw.get("id"), str) else ""
+        sections.append({"id": ident, "name": name, "agent_ids": ids(raw.get("agent_ids"))})
+    return {"pinned": ids(data.get("pinned")), "sections": sections}
+
+
+# The sidebar layout the desktop app keeps on the server: pinned ids and named sections.
+SECTIONS = {"pinned": [], "sections": []}
+
+
+def current_sections():
+    with activity.STATE_LOCK:
+        return SECTIONS
+
+
+def set_sections(layout):
+    global SECTIONS
+    with activity.STATE_LOCK:
+        SECTIONS = clean_sections(layout)
+
+
+def load_sections_cache():
+    """Show the last known sections at once. Never replaces a layout already fetched."""
+    layout = clean_sections(cache.read_json(cache.sections_path()))
+    with activity.STATE_LOCK:
+        fetched = bool(SECTIONS["pinned"] or SECTIONS["sections"])
+    if not fetched:
+        set_sections(layout)
+
+
+def refresh_sections():
+    """Read-only. Best effort: with no token, offline or a bad answer the old layout stays."""
+    try:
+        layout = parse_runtime_settings(backend_call("GetGrokBotUserRuntimeSettings", b""))
+    except (gbot_cli.GbotError, ValueError, IndexError):
+        return
+    set_sections(layout)
+    cache.write_private(cache.sections_path(), current_sections())
+
+
 def refresh_server_state(bots):
     """Best effort. The list falls back to its own reads when this fails."""
+    threading.Thread(target=refresh_sections, daemon=True).start()
     ids = [bot["id"] for bot in bots if isinstance(bot.get("id"), str) and bot["id"]]
     if not ids:
         return
