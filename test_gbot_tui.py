@@ -16,6 +16,7 @@ from gbottui import (
     app as app_mod,
     backend,
     cache,
+    cards as cards_mod,
     chat_screen,
     chat_state,
     chat_view,
@@ -4635,6 +4636,345 @@ class MentionTests(unittest.TestCase):
     def test_help_and_footer_mention_tagging(self):
         self.assertTrue(any(keys == "@" for keys, _what in chat_view.HELP))
         self.assertIn("@ tag a bot", grid.footer_spans("idle", "")[0][0])
+
+
+class RequestCardTests(unittest.TestCase):
+    """Secret, 1Password and form cards: read-only text, a state line, and `needs you`."""
+
+    HANDLES = ("REQHANDLE", "ACCESSHANDLE", "ENTRYHANDLE", "onepassword://", "APPLINKHANDLE")
+
+    def secret(self, **extra):
+        entry = {
+            "kind": "send-message",
+            "id": "s1",
+            "message": {
+                "type": "secret-request",
+                "secretRequest": {
+                    "label": "GitHub token (repo + workflow)",
+                    "description": "Needed to push the workflow",
+                    "target": {"kind": "box-env", "name": "GH_TOKEN_WORKFLOW", "platform": "x", "field": "GH_TOKEN_WORKFLOW"},
+                },
+            },
+            "timestampMs": 1794769353435,
+            "requestId": "REQHANDLE",
+            "seq": 18,
+        }
+        entry.update(extra)
+        return entry
+
+    def credential(self, expires=None, **extra):
+        entry = {
+            "kind": "send-message",
+            "id": "c1",
+            "message": {
+                "type": "credential-request",
+                "credentialRequest": {
+                    "kind": "brokered-login",
+                    "accessRequestId": "ACCESSHANDLE",
+                    "goal": "buy loanso.me",
+                    "entries": [
+                        {"entryId": "ENTRYHANDLE", "website": "ionos.com", "reason": "sign in to ionos"},
+                        {"entryId": "ENTRYHANDLE2", "website": "paypal.com", "reason": "pay"},
+                    ],
+                    "appLink": "onepassword://grant-brokered-access?token=APPLINKHANDLE",
+                    "requestedAtMs": 1794664413981,
+                    "expiresAtMs": expires if expires is not None else 1794665013981,
+                },
+            },
+            "requestId": "REQHANDLE",
+        }
+        entry.update(extra)
+        return entry
+
+    def form(self, **extra):
+        entry = {
+            "kind": "send-message",
+            "id": "f1",
+            "message": {
+                "type": "user-form",
+                "formRequest": {
+                    "secureValues": True,
+                    "title": "Hetzner 2FA code",
+                    "instruction": "",
+                    "reason": "auth",
+                    "domains": ["hetzner.com"],
+                    "fields": [
+                        {"id": "a", "label": "OTP code", "type": "otp", "required": True, "secret": True},
+                        {"id": "b", "label": "Name", "type": "text"},
+                    ],
+                },
+            },
+            "requestId": "REQHANDLE",
+            "formRequestId": "REQHANDLE",
+            "formFieldOutcomes": [{"id": "a", "filled": True, "secureValueStorage": "VALUEHANDLE"}],
+        }
+        entry.update(extra)
+        return entry
+
+    def rows(self, entry, width=60):
+        return grid.transcript_rows([entry], width)
+
+    def clock(self, ms):
+        old = cards_mod.now_ms
+        cards_mod.now_ms = lambda: ms
+        self.addCleanup(setattr, cards_mod, "now_ms", old)
+
+    def test_a_pending_secret(self):
+        self.assertEqual(
+            self.rows(self.secret()),
+            [
+                ("card-info", "\U0001F511 secret: GitHub token (repo + workflow)"),
+                ("card-info", "Needed to push the workflow"),
+                ("card-info", "env: GH_TOKEN_WORKFLOW"),
+                ("card", "waiting: enter it in the Grok Bot app"),
+            ],
+        )
+
+    def test_a_provided_secret_is_green(self):
+        rows = self.rows(self.secret(secretProvided=True))
+        self.assertEqual(rows[-1], ("card-ok", "provided"))
+        self.assertEqual(styles_mod.CARD_STYLE[rows[-1][0]], "green")
+        self.assertEqual(styles_mod.CARD_STYLE["card"], "yellow")
+        self.assertEqual({kind for kind, _text in rows[:-1]}, {"card-info"})
+
+    def test_a_pending_credential_with_one_line_per_entry(self):
+        self.clock(1794664413981)
+        self.assertEqual(
+            self.rows(self.credential()),
+            [
+                ("card-info", "1Password: buy loanso.me"),
+                ("card-info", "ionos.com: sign in to ionos"),
+                ("card-info", "paypal.com: pay"),
+                ("card", "waiting: approve in 1Password or the Grok Bot app"),
+            ],
+        )
+
+    def test_a_credential_states(self):
+        self.clock(1794664413981)
+        self.assertEqual(self.rows(self.credential(credentialResolution="approved"))[-1], ("card-ok", "approved"))
+        self.assertEqual(self.rows(self.credential(credentialResolution="failed"))[-1], ("card-no", "failed"))
+        self.assertEqual(self.rows(self.credential(credentialResolution="pending"))[-1][0], "card")
+
+    def test_a_pending_credential_past_its_expiry_is_expired(self):
+        self.clock(1794665013982)
+        rows = self.rows(self.credential())
+        self.assertEqual(rows[-1], ("card-no", "expired"))
+        self.assertFalse(cards_mod.any_pending([self.credential()]))
+        # A resolution wins over the clock.
+        self.assertEqual(self.rows(self.credential(credentialResolution="approved"))[-1], ("card-ok", "approved"))
+        self.clock(1794665013980)
+        self.assertEqual(self.rows(self.credential())[-1][0], "card")
+
+    def test_a_pending_form_lists_fields_without_values(self):
+        rows = self.rows(self.form())
+        self.assertEqual(
+            rows,
+            [
+                ("card-info", "form: Hetzner 2FA code"),
+                ("card-info", "OTP code (otp)"),
+                ("card-info", "Name (text)"),
+                ("card", "waiting: fill it in the Grok Bot app"),
+            ],
+        )
+
+    def test_a_form_instruction_and_a_submitted_form(self):
+        entry = self.form(formResolution="submitted")
+        entry["message"]["formRequest"]["instruction"] = "Type the code from your phone"
+        rows = self.rows(entry)
+        self.assertEqual(rows[1], ("card-info", "Type the code from your phone"))
+        self.assertEqual(rows[-1], ("card-ok", "submitted"))
+
+    def test_no_handle_or_value_is_ever_shown_or_copied(self):
+        self.clock(1794664413981)
+        for entry in (
+            self.secret(secretProvided=True),
+            self.secret(),
+            self.credential(),
+            self.credential(credentialResolution="approved"),
+            self.form(),
+            self.form(formResolution="submitted"),
+        ):
+            text = transcript.entry_text(entry)
+            shown = "\n".join(line for _kind, line in self.rows(entry))
+            for handle in self.HANDLES + ("VALUEHANDLE",):
+                self.assertNotIn(handle, text)
+                self.assertNotIn(handle, shown)
+            self.assertEqual(text.strip(), shown.strip())
+
+    def test_entry_text_is_the_plain_card(self):
+        self.assertEqual(
+            transcript.entry_text(self.secret()),
+            "\U0001F511 secret: GitHub token (repo + workflow)\nNeeded to push the workflow\n"
+            "env: GH_TOKEN_WORKFLOW\nwaiting: enter it in the Grok Bot app",
+        )
+        self.assertTrue(transcript.entry_text(self.form(formResolution="submitted")).endswith("\nsubmitted"))
+        self.assertIn("ionos.com: sign in to ionos", transcript.entry_text(self.credential(credentialResolution="failed")))
+
+    def test_a_card_is_found_by_search_and_is_a_bot_line(self):
+        rows = self.rows(self.secret())
+        self.assertEqual(grid.search_hits(rows, "gh_token_workflow"), [2])
+        self.assertFalse(transcript.is_user(self.secret()))
+
+    def test_a_missing_or_odd_field_does_not_crash(self):
+        for entry in (
+            {"kind": "send-message", "message": {"type": "secret-request"}},
+            {"kind": "send-message", "message": {"type": "credential-request", "credentialRequest": {"entries": "x"}}},
+            {"kind": "send-message", "message": {"type": "user-form", "formRequest": {"fields": [1, {"label": 3}]}}},
+            {"kind": "send-message", "message": {"type": "secret-request", "secretRequest": []}},
+        ):
+            self.assertTrue(self.rows(entry))
+            self.assertTrue(transcript.entry_text(entry))
+
+    def test_control_characters_in_a_label_are_flattened(self):
+        entry = self.secret()
+        entry["message"]["secretRequest"]["label"] = "tok\x1b]0;x\x07en"
+        text = transcript.entry_text(entry)
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("\x07", text)
+
+    def test_a_narrow_card_wraps_and_keeps_the_state_line_whole(self):
+        rows = self.rows(self.secret(), width=24)
+        self.assertTrue(all(len(line) <= 22 for _kind, line in rows))
+        self.assertEqual(
+            " ".join(line for kind, line in rows if kind == "card"),
+            "waiting: enter it in the Grok Bot app",
+        )
+
+    def test_a_pending_card_needs_you_and_a_settled_one_does_not(self):
+        self.clock(1794664413981)
+        for pending, settled in (
+            (self.secret(), self.secret(secretProvided=True)),
+            (self.credential(), self.credential(credentialResolution="approved")),
+            (self.credential(), self.credential(credentialResolution="failed")),
+            (self.form(), self.form(formResolution="submitted")),
+        ):
+            self.assertTrue(transcript.needs_user([pending]))
+            self.assertFalse(transcript.needs_user([settled]))
+            snap = activity.judge_activity([pending], "x", "")
+            self.assertEqual(snap["state"], "blocked")
+            self.assertEqual(activity.status_label(snap["state"]), "needs you")
+            self.assertEqual(activity.judge_activity([settled], "x", "")["state"], "idle")
+
+    def test_an_expired_credential_does_not_need_you(self):
+        self.clock(1794665013982)
+        self.assertFalse(transcript.needs_user([self.credential()]))
+        self.assertEqual(activity.judge_activity([self.credential()], "c1", "")["state"], "idle")
+
+    def test_a_pending_card_followed_by_a_user_message_is_skipped(self):
+        self.clock(1794664413981)
+        user = {"id": "u", "kind": "message", "role": "user", "text": "ok done"}
+        for pending in (self.secret(), self.credential(), self.form()):
+            entries = [pending, {"id": "b", "role": "assistant", "text": "hm"}, user]
+            self.assertFalse(transcript.needs_user(entries))
+            self.assertFalse(cards_mod.any_pending(entries))
+            self.assertIsNone(cards_mod.latest_pending(entries))
+            snap = activity.judge_activity(entries, "u", "")
+            self.assertNotEqual(snap["state"], "blocked")
+            rows = grid.transcript_rows(entries, 60)
+            self.assertIn(("card-no", "skipped"), rows)
+            self.assertNotIn("card", [kind for kind, _text in rows])
+        self.assertEqual(styles_mod.CARD_STYLE["card-no"], "gray")
+
+    def test_the_local_echo_of_a_sent_message_skips_the_card_too(self):
+        entries = [self.secret(), {"role": "user", "text": "later", "local": True}]
+        self.assertFalse(transcript.needs_user(entries))
+        self.assertIn(("card-no", "skipped"), grid.transcript_rows(entries, 60))
+
+    def test_a_pending_card_with_only_bot_entries_after_it_is_still_pending(self):
+        entries = [
+            self.secret(),
+            {"id": "b", "kind": "message", "role": "assistant", "text": "still waiting"},
+            {"id": "t", "kind": "send-message", "message": {"type": "thinking"}},
+        ]
+        self.assertTrue(transcript.needs_user(entries))
+        self.assertEqual(activity.judge_activity(entries, "t", "")["state"], "blocked")
+        self.assertIn(("card", "waiting: enter it in the Grok Bot app"), grid.transcript_rows(entries, 60))
+        # A user message before the card does not skip it.
+        self.assertTrue(transcript.needs_user([{"id": "u", "role": "user", "text": "hi"}, self.secret()]))
+
+    def test_only_the_cards_before_the_user_message_are_skipped(self):
+        entries = [self.secret(), {"id": "u", "role": "user", "text": "x"}, self.form()]
+        self.assertEqual([shown and shown["pending"] for shown in cards_mod.views(entries)], [False, None, True])
+        self.assertEqual(cards_mod.latest_pending(entries)["title"], "form: Hetzner 2FA code")
+
+    def test_a_resolved_or_expired_card_keeps_its_state_after_a_user_message(self):
+        user = {"id": "u", "role": "user", "text": "x"}
+        self.clock(1794664413981)
+        self.assertEqual(cards_mod.view(self.secret(secretProvided=True), True)["state"], "provided")
+        self.assertEqual(cards_mod.view(self.form(formResolution="submitted"), True)["tone"], "card-ok")
+        self.assertEqual(cards_mod.view(self.credential(credentialResolution="failed"), True)["state"], "failed")
+        self.assertEqual(cards_mod.view(self.credential(credentialResolution="approved"), True)["tone"], "card-ok")
+        self.clock(1794665013982)
+        self.assertEqual(grid.transcript_rows([self.credential(), user], 60)[3], ("card-no", "expired"))
+
+    def test_a_skipped_card_does_not_force_a_full_read(self):
+        chat = chat_state.Chat("bot")
+        chat.loaded = True
+        chat.cursor = "c"
+        chat.messages = [self.secret()]
+        self.assertEqual(chat.take_read(), ("bot",))
+        chat.messages = [self.secret(), {"id": "u", "role": "user", "text": "x"}]
+        self.assertEqual(chat.take_read(), ("bot", "c"))
+
+    def test_the_list_preview_names_the_request(self):
+        self.clock(1794664413981)
+        self.assertEqual(
+            activity.judge_activity([self.secret()], "s1", "")["preview"], "secret: GitHub token (repo + workflow)"
+        )
+        self.assertEqual(activity.judge_activity([self.credential()], "c1", "")["preview"], "1Password: buy loanso.me")
+        self.assertEqual(activity.judge_activity([self.form()], "f1", "")["preview"], "form: Hetzner 2FA code")
+
+    def test_a_new_pending_card_is_unread_worthy(self):
+        self.assertTrue(activity.notable(self.secret()))
+        self.assertTrue(activity.notable(self.form(formResolution="submitted")))
+
+    def test_the_chat_blocks_and_unblocks_with_the_card(self):
+        chat = chat_state.Chat("Researcher")
+        page = transcript.parse_thread({"transcript": {"entries": [self.form()]}, "cursor": "f1"})
+        chat.ingest(page, first=True)
+        self.assertEqual(chat.phase, "blocked")
+        self.assertEqual(activity.lookup_activity({"name": "Researcher"})["state"], "blocked")
+        header = "".join(text for text, _style in paint.title_spans(chat.title, chat.phase, 60))
+        self.assertIn("needs you", header)
+        self.assertEqual(paint.title_spans(chat.title, "blocked", 60)[1][1], "yellow")
+        self.assertEqual(grid.footer_spans(chat.phase, "")[0], ("Pending decision", "yellow"))
+        # No y/n: nothing here can be answered from the terminal.
+        self.assertIsNone(transcript.latest_decision(chat.messages))
+        # While pending, the next read is the whole tail, so a settlement made in the app shows up.
+        self.assertEqual(chat.take_read(), ("Researcher",))
+        settled = self.form(formResolution="submitted")
+        chat.ingest(transcript.parse_thread({"transcript": {"entries": [settled]}, "cursor": "f1"}))
+        self.assertNotEqual(chat.phase, "blocked")
+        self.assertEqual(chat.take_read(), ("Researcher", "f1"))
+        self.assertEqual(activity.lookup_activity({"name": "Researcher"})["state"], "idle")
+
+    def test_herdr_reports_blocked_for_a_pending_card(self):
+        seen = []
+        old = herdr.publish
+        herdr.publish = lambda phase, *args: seen.append(phase)
+        self.addCleanup(setattr, herdr, "publish", old)
+        chat = chat_state.Chat("Researcher")
+        chat.ingest(transcript.parse_thread({"transcript": {"entries": [self.secret()]}, "cursor": "s1"}), first=True)
+        self.assertEqual(seen[-1], "blocked")
+        self.assertEqual(herdr.herdr_state("blocked"), "blocked")
+        chat.ingest(transcript.parse_thread({"transcript": {"entries": [self.secret(secretProvided=True)]}, "cursor": "s1"}))
+        self.assertNotEqual(seen[-1], "blocked")
+
+    def test_keys_are_not_swallowed_by_a_request_card(self):
+        chat = chat_state.Chat("Researcher")
+        chat.ingest(transcript.parse_thread({"transcript": {"entries": [self.secret()]}, "cursor": "s1"}), first=True)
+        self.assertEqual(chat_screen.composer_key(chat, "y"), ("type", "y"))
+
+    def test_the_card_draws_in_the_chat(self):
+        chat = chat_state.Chat("Researcher")
+        chat.ingest(transcript.parse_thread({"transcript": {"entries": [self.secret()]}, "cursor": "s1"}), first=True)
+        screen = FakeScreen(24, 80)
+        chat_view.draw(screen, chat)
+        text = "\n".join("".join(parts) for _y, parts in sorted(screen.rows.items()))
+        self.assertIn("secret: GitHub token", text)
+        self.assertIn("env: GH_TOKEN_WORKFLOW", text)
+        self.assertIn("waiting: enter it in the Grok Bot app", text)
+        self.assertIn("needs you", text)
 
 
 if __name__ == "__main__":

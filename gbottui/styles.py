@@ -60,7 +60,7 @@ ATTR = {
     "cyan": curses.A_BOLD,
 }
 
-CARD_STYLE = {"card": "yellow", "card-ok": "green", "card-no": "gray"}
+CARD_STYLE = {"card": "yellow", "card-ok": "green", "card-no": "gray", "card-info": "default"}
 
 
 def apply_theme(stdscr):

@@ -3,7 +3,7 @@
 import os
 import re
 
-from . import colors, gbot_cli, widgets
+from . import cards, colors, gbot_cli, widgets
 
 
 # shortcut: two empty polls after a reply count as finished, so a bot that
@@ -183,6 +183,9 @@ def _entry_body(entry, picks=(), numbered=True):
     shown = widgets.widget_text(entry, picks, numbered)
     if shown:
         return shown
+    asked = cards.text(entry)
+    if asked:
+        return asked
     if isinstance(message, dict) and isinstance(message.get("content"), str):
         return message["content"]
     if isinstance(entry.get("preview"), str):
@@ -260,6 +263,15 @@ def request_of(entry):
 
 def pending_approval(entries):
     return any(approval_of(entry) for entry in entries)
+
+
+def needs_user(entries):
+    """A pending approval, or a secret, 1Password or form request nobody settled.
+
+    The one rule for `blocked` in the chat, the list and Herdr. An open widget
+    is the other half of it (`widgets.latest_widget`), which pages differently.
+    """
+    return pending_approval(entries) or cards.any_pending(entries)
 
 
 def latest_decision(entries, answered=()):

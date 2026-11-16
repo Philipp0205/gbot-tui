@@ -2,7 +2,7 @@
 
 import math
 
-from . import activity, backend, colors, draft, herdr, icons, mentions, roster, tabs, transcript, widgets
+from . import activity, backend, cards, colors, draft, herdr, icons, mentions, roster, tabs, transcript, widgets
 
 
 # Poll cadence in seconds. Each read is one gbot process, so idle backs off.
@@ -305,7 +305,7 @@ class Chat:
         self.pending_request = request_id
         self.deciding = True
         self.touch_rows()
-        if self.phase == "blocked" and not transcript.pending_approval(self.messages):
+        if self.phase == "blocked" and not transcript.needs_user(self.messages):
             self.note("idle")
         self.sync_activity()
         return (self.target, card["entry_id"], request_id, decision)
@@ -327,7 +327,7 @@ class Chat:
                 if transcript.request_of(entry) == request_id:
                     transcript.set_card_status(entry, "pending")
             self.touch_rows()
-            if transcript.pending_approval(self.messages) and self.phase != "blocked":
+            if transcript.needs_user(self.messages) and self.phase != "blocked":
                 self.note("blocked")
         self.sync_activity()
 
@@ -560,6 +560,11 @@ class Chat:
             self.full_reload = False
             self.replacing = True
             return self.full_read()
+        if self.loaded and cards.any_pending(self.messages):
+            # The user settles these in the app. A poll after the cursor never
+            # returns the older card again, so read the whole tail until it is settled.
+            self.replacing = True
+            return self.full_read()
         if self.cursor:
             return (self.target, self.cursor)
         return self.full_read()
@@ -667,7 +672,7 @@ class Chat:
         if first:
             self.loaded = True
             icons.show_avatar_later(page)
-            if transcript.pending_approval(self.messages):
+            if transcript.needs_user(self.messages):
                 phase = "blocked"
             elif self.phase == "working" or activity.awaiting_reply(self.messages) or activity.entry_in_progress(self.messages):
                 phase = "working"
@@ -684,7 +689,7 @@ class Chat:
             fresh,
             self.quiet,
             self.saw_other,
-            transcript.pending_approval(self.messages),
+            transcript.needs_user(self.messages),
         )
         phase = self.settle_working(phase)
         self.note(phase)

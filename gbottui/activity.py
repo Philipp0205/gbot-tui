@@ -4,7 +4,7 @@ import os
 import threading
 import time
 
-from . import backend, cache, gbot_cli, markdown, picker, styles, transcript, widgets
+from . import backend, cache, cards, gbot_cli, markdown, picker, styles, transcript, widgets
 
 
 # A turn that never changes (the last line stays yours) would otherwise say
@@ -345,6 +345,7 @@ def notable(entry):
         return False
     if transcript.entry_text(entry).strip():
         return True
+    # A request card has text, so the line above already counts it.
     return transcript.approval_of(entry) is not None
 
 
@@ -366,6 +367,9 @@ def activity_preview(entries, state):
             if card["details"]:
                 return one_line(card["details"][0])
             return "Needs approval"
+        asked = cards.latest_pending(entries)
+        if asked:
+            return one_line(asked["title"])
         found = widgets.pages(entries)
         if found:
             if found[0]["prompt"]:
@@ -396,7 +400,8 @@ def judge_activity(entries, cursor, seen, previous=None):
 
     An empty `seen` does not mark the whole history as new. `blocked` wins over
     a new reply, and a new reply wins over `running`. An open widget after the
-    user's last message is `needs you`. `working` with no change in the thread
+    user's last message is `needs you`, and so is a pending approval or a pending
+    secret, 1Password or form request (`transcript.needs_user`). `working` with no change in the thread
     for `quiet_limit` (WORKING_TIMEOUT, or WORKING_LIVE_TIMEOUT while the
     gateway marks the turn live) falls back to idle. `previous` is the last
     snap, so the overview can time that quiet stretch with `clock`.
@@ -407,7 +412,7 @@ def judge_activity(entries, cursor, seen, previous=None):
     token = content_token(entries)
     running = awaiting_reply(entries) or entry_in_progress(entries)
     since = _working_since(previous, token, now) if running else 0
-    if transcript.pending_approval(entries) or widgets.latest_widget(entries):
+    if transcript.needs_user(entries) or widgets.latest_widget(entries):
         phase = "blocked"
     elif running and now - since < quiet_limit(entries):
         phase = "working"

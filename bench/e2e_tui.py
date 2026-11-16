@@ -1135,7 +1135,120 @@ def markread_flow():
         run.close()
 
 
-FLOWS = {"paged": paged_flow, "main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow, "unread": unread_flow, "markread": markread_flow}
+def sent_bytes_clean(t):
+    """None of the fake grant handles the mock puts in these cards reached the terminal."""
+    raw = bytes(t.raw)
+    for handle in (b"REQHANDLE", b"ACCESSHANDLE", b"ENTRYHANDLE", b"APPLINKHANDLE", b"onepassword://"):
+        assert handle not in raw, f"{handle.decode()} was printed"
+
+
+def state_row(*words):
+    """A screen with a whole row that is exactly each word: a card's state line."""
+    return lambda lines: all(any(line.strip() == word for line in lines) for word in words)
+
+
+def cards_flow():
+    """Secret, 1Password and form cards: pending text, needs you, resolved state lines."""
+    run = Run("Chef", rows=40, cols=100)
+    try:
+        def ask(t, text):
+            t.wait(lambda lines: composer_rows(lines) == ["→  Add a follow-up"], timeout=10)
+            t.send(text)
+            t.wait(lambda lines: text in " ".join(composer_rows(lines)))
+            t.send("\r")
+
+        def secret(t):
+            t.wait(has("Chef", "earlier reply"), timeout=10)
+            t.settle(0.5)
+            ask(t, "secret please")
+            t.wait(has("\U0001F511 secret: GitHub token", "Needed to push the workflow", "env: GH_TOKEN_WORKFLOW"), timeout=10)
+            t.wait(has("waiting: enter it in the Grok Bot app"), timeout=3)
+            # A pending card blocks the chat the way an open approval does. There is no y/n for it.
+            t.wait(has("Pending decision"), timeout=3)
+            assert lacks("y approve")(t.lines()), "a secret card offered y/n"
+            sent_bytes_clean(t)
+            dump("42_card_secret_pending", t)
+            t.send(ESC)
+            t.wait(has("Grok bots", "Researcher"))
+            t.wait(lambda lines: row_state(lines, "Chef") == "needs you", timeout=3)
+            t.wait(has("1 needs you"), timeout=3)
+            assert "GitHub token" in row_with(t.lines(), "Chef"), row_with(t.lines(), "Chef")
+            dump("42_card_secret_list", t)
+            t.send("\r")
+            t.wait(has("Chef", "waiting: enter it in the Grok Bot app", "Add a follow-up"), timeout=10)
+
+        ok = scenario("42_card_secret_pending", run.term, secret)
+
+        def reopen(t):
+            """Leave the chat and open it again: the first read is the whole thread."""
+            t.wait(lacks("Generating", "working"), timeout=12)
+            t.send(ESC)
+            t.wait(has("Grok bots", "Researcher"))
+            t.send("\r")
+            t.wait(has("Chef", "Add a follow-up"), timeout=10)
+
+        def resolved_secret(t):
+            ask(t, "resolve the secret")
+            # A message after the card skips it at once: no `waiting`, no `needs you`, gray state line.
+            t.wait(state_row("skipped"), timeout=10)
+            t.wait(lacks("waiting: enter it in the Grok Bot app", "Pending decision"), timeout=5)
+            # The app settled it behind the chat's back. A skipped card is not polled, so the next open shows it.
+            reopen(t)
+            t.wait(state_row("provided"), timeout=10)
+            t.wait(lacks("waiting: enter it in the Grok Bot app", "skipped", "Pending decision"), timeout=5)
+            dump("43_card_secret_provided", t)
+
+        ok &= scenario("43_card_secret_provided", run.term, resolved_secret)
+
+        def others(t):
+            t.wait(lacks("Generating", "working"), timeout=12)
+            ask(t, "cred buy it")
+            t.wait(has("1Password: Buy the domain", "ionos.com: sign in to buy loanso.me"), timeout=10)
+            t.wait(has("waiting: approve in 1Password or the Grok Bot app"), timeout=3)
+            t.wait(lacks("Generating", "working"), timeout=12)
+            ask(t, "form code")
+            t.wait(has("form: Hetzner 2FA code", "Type the code from your phone", "OTP code (otp)"), timeout=10)
+            t.wait(has("waiting: fill it in the Grok Bot app", "Pending decision"), timeout=3)
+            # The credential card now has a message of yours after it: skipped. Only the form still waits.
+            t.wait(state_row("skipped"), timeout=3)
+            assert lacks("waiting: approve in 1Password or the Grok Bot app")(t.lines()), "a skipped card still waits"
+            sent_bytes_clean(t)
+            dump("44_card_credential_form_pending", t)
+
+        ok &= scenario("44_card_credential_form_pending", run.term, others)
+
+        def resolved_both(t):
+            t.wait(lacks("Generating", "working"), timeout=12)
+            ask(t, "resolve the rest")
+            t.wait(lacks("waiting:", "Pending decision"), timeout=5)
+            reopen(t)
+            t.wait(state_row("approved", "submitted"), timeout=10)
+            t.wait(lacks("waiting:", "Pending decision"), timeout=5)
+            sent_bytes_clean(t)
+            dump("45_card_resolved", t)
+            # The request cards never take a value: the composer is still just the composer.
+            assert composer_rows(t.lines()) == ["→  Add a follow-up"], composer_rows(t.lines())
+
+        ok &= scenario("45_card_credential_form_resolved", run.term, resolved_both)
+
+        def ended(t):
+            t.wait(lacks("Generating", "working"), timeout=12)
+            ask(t, "credfailed x")
+            t.wait(state_row("failed"), timeout=10)
+            t.wait(lacks("Generating", "working"), timeout=12)
+            ask(t, "credexpired x")
+            t.wait(state_row("failed", "expired"), timeout=10)
+            # Neither one is waiting for the user.
+            t.wait(lacks("waiting:", "Pending decision"), timeout=5)
+            dump("46_card_failed_expired", t)
+
+        ok &= scenario("46_card_failed_and_expired", run.term, ended)
+    finally:
+        run.close()
+    return ok
+
+
+FLOWS = {"cards": cards_flow, "paged": paged_flow, "main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow, "unread": unread_flow, "markread": markread_flow}
 
 
 def main():
