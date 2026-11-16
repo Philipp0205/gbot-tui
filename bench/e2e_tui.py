@@ -1281,7 +1281,30 @@ def media_flow():
     return ok
 
 
-FLOWS = {"media": media_flow, "cards": cards_flow, "paged": paged_flow, "main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow, "unread": unread_flow, "markread": markread_flow}
+def mouse_flow():
+    """F2 in the chat turns mouse capture off and on; the footer says select mode while it is off.
+
+    pyte does not track mouse modes, so only the hint is checked.
+    """
+    run = Run("Chef")
+    try:
+        def toggle(t):
+            t.wait(has("Chef", "earlier reply", "? keys"), timeout=10)
+            t.wait(lacks("Generating", "working"), timeout=12)
+            assert not any("select mode" in line for line in t.lines()), "select mode shown at start"
+            t.send("\x1bOQ")  # F2
+            t.wait(has("select mode · f2 mouse"), timeout=3)
+            dump("48_mouse_off", t)
+            t.send("\x1bOQ")
+            t.wait(lacks("select mode"), timeout=3)
+            t.wait(has("? keys"))
+
+        return scenario("48_mouse_toggle", run.term, toggle)
+    finally:
+        run.close()
+
+
+FLOWS = {"media": media_flow, "cards": cards_flow, "paged": paged_flow, "main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow, "unread": unread_flow, "markread": markread_flow, "mouse": mouse_flow}
 
 
 def main():

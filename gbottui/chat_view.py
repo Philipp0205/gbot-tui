@@ -24,6 +24,8 @@ HELP = [
     ("esc", "back to the bot list"),
     ("ctrl-c ctrl-d", "quit"),
     ("? f1", "this help (?? types a ?)"),
+    ("f2", "mouse on/off: off lets a plain drag select text"),
+    ("shift+drag", "select text while the mouse is on (most terminals)"),
 ]
 
 
@@ -135,6 +137,8 @@ def draw(stdscr, chat):
             target, hits = search_target(grid.visible_rows(chat, width), chat)
             at = hits.index(target) if target is not None else None
             footer = [grid.search_spans(chat.search, hits, at, width)]
+        elif footer:
+            footer[-1] = terminal.with_select_hint(footer[-1])
         # Error rows come out of the transcript, which keeps at least one row.
         footer = footer[-max(min(len(footer), body_h), 1) :]
         body_h -= len(footer) - 1

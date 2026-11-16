@@ -68,12 +68,53 @@ def open_link_at(x, y):
     return False
 
 
-def enable_wheel():
+MOUSE_ENV = "GBOT_TUI_MOUSE"
+SELECT_HINT = "select mode · f2 mouse"
+
+
+def mouse_default(environ=None):
+    """Mouse capture starts on, unless GBOT_TUI_MOUSE=0."""
+    environ = os.environ if environ is None else environ
+    return str(environ.get(MOUSE_ENV, "")).strip() != "0"
+
+
+# One flag for the list and the chat. While it is off the terminal keeps the
+# mouse, so a plain drag selects text; while it is on the wheel scrolls.
+MOUSE = mouse_default()
+
+
+def apply_mouse():
+    """Tell curses (and so the terminal) what MOUSE says."""
     try:
-        curses.mousemask(curses.BUTTON1_PRESSED | curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
-        curses.mouseinterval(0)
+        if MOUSE:
+            curses.mousemask(curses.BUTTON1_PRESSED | curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
+            curses.mouseinterval(0)
+        else:
+            curses.mousemask(0)
     except (AttributeError, curses.error):
         pass
+
+
+def set_mouse(on):
+    global MOUSE
+    MOUSE = bool(on)
+    apply_mouse()
+    return MOUSE
+
+
+def toggle_mouse():
+    return set_mouse(not MOUSE)
+
+
+def with_select_hint(spans):
+    """`spans` for a hint line, led by the select-mode note while the mouse is off."""
+    if MOUSE:
+        return spans
+    return [(SELECT_HINT + " · ", "yellow")] + list(spans)
+
+
+def enable_wheel():
+    apply_mouse()
 
 
 def wheel_direction(key):
