@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import tempfile
 import time
 
 
@@ -17,17 +18,47 @@ def roster_path():
     return os.path.join(cache_dir(), "roster.json")
 
 
+def file_sig(path):
+    """(inode, mtime_ns, size) of a file, or None when it is not there.
+
+    An atomic replace gives the file a new inode, so this changes even when two
+    writes land in the same clock tick with the same size.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+
+
 def write_private(path, data):
-    """Write a cache file only this user can read. Transcripts can be private."""
+    """Write a cache file only this user can read. Transcripts can be private.
+
+    The data goes to a private temp file in the same folder (mkstemp: mode 0600,
+    a name no other thread or process shares), then `os.replace` swaps it in, so
+    a reader sees the old file or the new one, never half of one. Returns the
+    `file_sig` of what was written (taken from the temp file, so a later write
+    by someone else does not look like ours), or None when the write failed.
+    """
+    tmp = None
     try:
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-        tmp = f"{path}.{os.getpid()}.tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=os.path.basename(path) + ".", suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(data, handle)
+            handle.flush()
+            stat = os.fstat(handle.fileno())
         os.replace(tmp, path)
+        tmp = None
+        return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
     except (OSError, TypeError, ValueError):
-        return
+        return None
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
 
 
 def read_json(path):
@@ -75,7 +106,7 @@ def read_thread_cache(target):
 
 
 def _save_locked(path, data):
-    write_private(path, data)
+    return write_private(path, data)
 
 
 # shortcut: tab completion reuses this file for 10 minutes, refresh sooner if bots are renamed often.
