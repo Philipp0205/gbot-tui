@@ -2,6 +2,7 @@
 
 import os
 import re
+from urllib.parse import unquote, urlparse
 
 from . import cards, colors, gbot_cli, widgets
 
@@ -147,26 +148,101 @@ def _part_text(part):
     return ""
 
 
-def entry_text(entry, picks=(), numbered=True):
+def entry_text(entry, picks=(), numbered=True, media=True):
+    """The words of one entry. `media` adds a placeholder line per image.
+
+    The transcript draws those lines itself (dim), so it asks with media=False.
+    Previews, copy and the change token keep them, so an image-only message
+    is not an empty string.
+    """
     if not isinstance(entry, dict) or is_thinking(entry):
         return ""
     text = _entry_body(entry, picks, numbered)
-    if is_user(entry):
-        return text
-    return hide_thinking_markup(text)
+    if not is_user(entry):
+        text = hide_thinking_markup(text)
+    if media:
+        text = "\n".join(part for part in [text, *image_lines(entry)] if part)
+    return text
+
+
+def _url_name(url):
+    """The file name at the end of a url. Never the rest of the path: a file://
+    url names a path on another machine."""
+    if not isinstance(url, str) or not url:
+        return ""
+    return unquote(os.path.basename(urlparse(url).path.rstrip("/")))
+
+
+def _size(item):
+    if item.get("width") and item.get("height"):
+        return f"{item['width']}x{item['height']}"
+    return ""
+
+
+def image_lines(entry):
+    """One `🖼 alt (WxH)` line per image on a message. Alt, else the file name."""
+    message = entry.get("message") if isinstance(entry, dict) else None
+    images = message.get("images") if isinstance(message, dict) else None
+    if not isinstance(images, list):
+        return []
+    lines = []
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        alt = image.get("alt")
+        name = " ".join(alt.split()) if isinstance(alt, str) else ""
+        name = name or _url_name(image.get("url")) or "image"
+        size = _size(image)
+        lines.append(f"\U0001F5BC {name}" + (f" ({size})" if size else ""))
+    return lines
 
 
 def attachment_text(entry):
-    name = entry.get("file_name") or os.path.basename(entry.get("file_path") or "") or "attachment"
+    name = (
+        entry.get("file_name")
+        or os.path.basename(entry.get("file_path") or "")
+        or _url_name(entry.get("url"))
+        or "attachment"
+    )
     details = [str(entry[key]) for key in ("secondaryText",) if entry.get(key)]
-    if entry.get("width") and entry.get("height"):
-        details.append(f"{entry['width']}x{entry['height']}")
-    return f"\U0001F4CE {name}" + (f" ({', '.join(details)})" if details else "")
+    alt = entry.get("alt")
+    alt = " ".join(alt.split()) if isinstance(alt, str) else ""
+    if alt and alt != name:
+        details.append(alt)
+    if _size(entry):
+        details.append(_size(entry))
+    text = f"\U0001F4CE {name}" + (f" ({', '.join(details)})" if details else "")
+    url = entry.get("url")
+    # Only a web url is worth showing (and clicking). file:// is another machine's path.
+    if isinstance(url, str) and url.startswith("https://") and not any(ch.isspace() for ch in url):
+        text += " " + url
+    return text
+
+
+# A page the bot made: a markdown link to a Cursor canvas.
+_PAGE_LINK = re.compile(
+    r"\[([^\]\n]+)\]\((https://cursor\.com/canvas/[^/\s)#?]+/[^/\s)#?]+/?(?:[?#][^\s)]*)?)\)"
+)
+
+
+def pages(entry):
+    """(title, url) for each distinct canvas page linked in a bot message."""
+    if not isinstance(entry, dict) or is_user(entry):
+        return []
+    found = []
+    for match in _PAGE_LINK.finditer(entry_text(entry, media=False)):
+        title, url = " ".join(match.group(1).split()) or "page", match.group(2)
+        if all(url != other for _title, other in found):
+            found.append((title, url))
+    return found
 
 
 def _entry_body(entry, picks=(), numbered=True):
     if entry.get("kind") == "user-attachment":
         return attachment_text(entry)
+    attached = entry.get("message")
+    if isinstance(attached, dict) and attached.get("type") == "attachment":
+        return attachment_text(attached)
     for key in ("text", "prompt"):
         if isinstance(entry.get(key), str) and entry[key]:
             return entry[key]

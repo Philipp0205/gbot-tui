@@ -181,8 +181,14 @@ def draw(stdscr, chat):
             paint.paint_bot_line(stdscr, y, 3, text, styles.bot_text_attr(color))
             x = 3
         elif kind in styles.CARD_STYLE:
+            url = getattr(text, "url", "")
             text = grid.clip(text, max(width - 2, 0))
-            paint.put(stdscr, y, 1, text, styles.ATTR[styles.CARD_STYLE[kind]])
+            attr = styles.ATTR[styles.CARD_STYLE[kind]]
+            if url:
+                # A page card opens its canvas like a link in the text does.
+                attr |= curses.A_UNDERLINE
+                terminal.LINK_HITS.append((y, 1, 1 + paint.cell_width(text), url))
+            paint.put(stdscr, y, 1, text, attr)
             x = 1
         if searching and chat.search and x is not None:
             paint_matches(stdscr, y, x, text, chat.search, index == target)
