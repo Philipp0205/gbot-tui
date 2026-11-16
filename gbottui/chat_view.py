@@ -146,7 +146,8 @@ def draw(stdscr, chat):
     label = getattr(chat, "label", "")
     if header:
         paint.put(stdscr, 0, 1, "●", styles.dot_attr(color))
-        paint.paint_spans(stdscr, 0, 3, paint.title_spans(chat.title, chat.phase, width))
+        doing = chat.doing_text() if chat.phase == "working" and hasattr(chat, "doing_text") else ""
+        paint.paint_spans(stdscr, 0, 3, paint.title_spans(chat.title, chat.phase, width, doing))
         if header > 1 and label:
             paint.put(stdscr, 1, 3, grid.clip(label, max(width - 4, 0)), styles.ATTR["dim"])
     gap = grid.header_gap(header, label, body_h)

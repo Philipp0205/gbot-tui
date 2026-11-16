@@ -403,6 +403,10 @@ class Chat:
         """The server's running flag for this bot: True, False, or None when unknown."""
         return backend.running_flag(self.list_id())
 
+    def doing_text(self):
+        """The bot's own live status line, or "" when unknown."""
+        return backend.doing_text(self.list_id())
+
     def poll_running(self):
         """Refresh the flag in the background, at most every RUNNING_EVERY seconds.
 
