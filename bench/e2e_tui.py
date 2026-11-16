@@ -1248,7 +1248,40 @@ def cards_flow():
     return ok
 
 
-FLOWS = {"cards": cards_flow, "paged": paged_flow, "main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow, "unread": unread_flow, "markread": markread_flow}
+def media_flow():
+    """Images, attachments and canvas pages: a placeholder line each, never the file:// path."""
+    run = Run("Chef", rows=40, cols=100)
+    try:
+        def ask(t, text):
+            t.wait(lambda lines: composer_rows(lines) == ["→  Add a follow-up"], timeout=10)
+            t.send(text)
+            t.wait(lambda lines: text in " ".join(composer_rows(lines)))
+            t.send("\r")
+
+        def media(t):
+            t.wait(has("Chef", "earlier reply"), timeout=10)
+            t.settle(0.5)
+            ask(t, "image please")
+            t.wait(has("here is the proof", "terminal proof (780x1688)"), timeout=10)
+            t.wait(lacks("Generating", "working"), timeout=12)
+            ask(t, "attach please")
+            t.wait(has("report.pdf", "quarterly numbers", "612x792", "https://files.example.com/report.pdf"), timeout=10)
+            t.wait(lacks("Generating", "working"), timeout=12)
+            ask(t, "page please")
+            t.wait(has("the plan is ready: Extrablatt revamp", "page: Extrablatt revamp"), timeout=10)
+            t.wait(lacks("Generating", "working"), timeout=12)
+            raw = bytes(t.raw)
+            for path in (b"file://", b"/home/box", b"agent-data", b"4f9c0de1"):
+                assert path not in raw, f"{path.decode()} was printed"
+            dump("47_media", t)
+
+        ok = scenario("47_media_image_attachment_page", run.term, media)
+    finally:
+        run.close()
+    return ok
+
+
+FLOWS = {"media": media_flow, "cards": cards_flow, "paged": paged_flow, "main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow, "unread": unread_flow, "markread": markread_flow}
 
 
 def main():

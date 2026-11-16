@@ -1243,6 +1243,36 @@ class MarkdownTests(unittest.TestCase):
         self.assertIn("●", shown)
 
 
+class CellWidthTests(unittest.TestCase):
+    def test_wide_and_combining_characters_take_their_cells(self):
+        self.assertEqual(paint.cell_width("abc"), 3)
+        self.assertEqual(paint.cell_width("📎"), 2)
+        self.assertEqual(paint.cell_width("📄 report"), 9)
+        self.assertEqual(paint.cell_width("中文"), 4)
+        self.assertEqual(paint.cell_width("e\u0301"), 1)
+
+    def test_a_span_after_an_emoji_starts_after_its_two_cells(self):
+        class Recorder(FakeScreen):
+            def __init__(self):
+                super().__init__(4, 80)
+                self.drawn = []
+
+            def addnstr(self, y, x, text, n, attr=0):
+                self.drawn.append((x, text))
+
+        screen = Recorder()
+        line = [("📎 ", "dim"), ("report.pdf (612x792) ", "dim"), ("https://x.example", "link")]
+        terminal.LINK_HITS.clear()
+        try:
+            paint.paint_bot_line(screen, 1, 3, line, 0)
+            # "📎 " is 3 cells, so the next span starts at column 6, not 5.
+            self.assertIn((6, "report.pdf (612x792) "), screen.drawn)
+            # The link starts after 3 + 21 cells and is 17 cells wide.
+            self.assertEqual(terminal.LINK_HITS, [(1, 3 + 3 + 21, 3 + 3 + 21 + 17, "https://x.example")])
+        finally:
+            terminal.LINK_HITS.clear()
+
+
 class SendTests(unittest.TestCase):
     def test_enter_shows_the_line_and_the_poll_replaces_it(self):
         chat = chat_state.Chat("Researcher")
@@ -4975,6 +5005,179 @@ class RequestCardTests(unittest.TestCase):
         self.assertIn("env: GH_TOKEN_WORKFLOW", text)
         self.assertIn("waiting: enter it in the Grok Bot app", text)
         self.assertIn("needs you", text)
+
+
+class MediaTests(unittest.TestCase):
+    IMAGE = {
+        "url": "file:///home/box/agent-data/agents/a1/assets/4f9c0de1",
+        "alt": "terminal proof",
+        "width": 780,
+        "height": 1688,
+    }
+
+    def image_entry(self, **image):
+        shown = dict(self.IMAGE, **image)
+        shown = {key: value for key, value in shown.items() if value is not None}
+        return {
+            "id": "i1",
+            "kind": "send-message",
+            "message": {"type": "text", "content": "here is the proof", "images": [shown]},
+        }
+
+    def page_entry(self, content):
+        return {"id": "p1", "kind": "send-message", "message": {"type": "text", "content": content}}
+
+    def rows(self, entry, width=60):
+        return grid.transcript_rows([entry], width)
+
+    def plain(self, entry, width=60):
+        return [(kind, markdown.line_plain(text)) for kind, text in self.rows(entry, width)]
+
+    def test_image_is_one_dim_line_after_the_text(self):
+        rows = self.rows(self.image_entry())
+        self.assertEqual([kind for kind, _text in rows], ["text", "text"])
+        self.assertEqual(rows[0][1], "here is the proof")
+        self.assertEqual(rows[1][1], [("\U0001F5BC terminal proof (780x1688)", "dim")])
+
+    def test_image_without_alt_uses_the_file_name_and_never_the_path(self):
+        for alt in (None, "", "   "):
+            lines = transcript.image_lines(self.image_entry(alt=alt))
+            self.assertEqual(lines, ["\U0001F5BC 4f9c0de1 (780x1688)"])
+        text = "\n".join(text for _kind, text in self.plain(self.image_entry(alt=None)))
+        self.assertNotIn("file://", text)
+        self.assertNotIn("/home/box", text)
+        self.assertNotIn("agent-data", text)
+
+    def test_image_without_size_or_url_still_shows_a_line(self):
+        entry = self.image_entry(width=None, height=None)
+        self.assertEqual(transcript.image_lines(entry), ["\U0001F5BC terminal proof"])
+        entry = self.image_entry(url=None, alt=None, width=None, height=None)
+        self.assertEqual(transcript.image_lines(entry), ["\U0001F5BC image"])
+
+    def test_an_image_only_message_is_not_empty_anywhere(self):
+        entry = self.image_entry()
+        entry["message"]["content"] = ""
+        placeholder = "\U0001F5BC terminal proof (780x1688)"
+        self.assertEqual(transcript.entry_text(entry), placeholder)
+        self.assertEqual(activity.activity_preview([entry], "idle"), placeholder)
+        self.assertIn(placeholder, self.plain(entry)[0][1])
+        self.assertEqual(transcript.watch_step("working", [entry], 0, False, False)[2], True)
+        chat = chat_state.Chat("Researcher")
+        chat.messages = [entry]
+        written = []
+        old = terminal.write_tty
+        terminal.write_tty = written.append
+        self.addCleanup(setattr, terminal, "write_tty", old)
+        self.assertTrue(chat_screen.copy_last_reply(chat))
+        self.assertIn(base64.b64encode(placeholder.encode("utf-8")), written[0])
+
+    def test_activity_preview_keeps_text_and_placeholder(self):
+        self.assertEqual(
+            activity.activity_preview([self.image_entry()], "idle"),
+            "here is the proof \U0001F5BC terminal proof (780x1688)",
+        )
+
+    def test_a_user_image_stays_in_the_bubble(self):
+        entry = self.image_entry()
+        entry["kind"] = "user"
+        kinds = {kind for kind, _text in self.rows(entry)}
+        self.assertEqual(kinds, {"user"})
+
+    def test_attachment_with_a_file_url_shows_name_alt_and_size_only(self):
+        entry = {
+            "id": "a1",
+            "kind": "send-message",
+            "message": {
+                "type": "attachment",
+                "url": "file:///workspace/report.pdf",
+                "file_name": "report.pdf",
+                "alt": "quarterly numbers",
+                "width": 612,
+                "height": 792,
+            },
+        }
+        self.assertEqual(transcript.entry_text(entry), "\U0001F4CE report.pdf (quarterly numbers, 612x792)")
+        self.assertNotIn("file://", "".join(text for _kind, text in self.plain(entry)))
+
+    def test_attachment_without_extras_or_name(self):
+        message = {"type": "attachment", "url": "file:///workspace/report.pdf"}
+        entry = {"id": "a1", "kind": "send-message", "message": message}
+        self.assertEqual(transcript.entry_text(entry), "\U0001F4CE report.pdf")
+        self.assertEqual(transcript.attachment_text({}), "\U0001F4CE attachment")
+
+    def test_attachment_with_an_https_url_keeps_a_clickable_link(self):
+        url = "https://files.example.com/report.pdf"
+        entry = {
+            "id": "a1",
+            "kind": "send-message",
+            "message": {"type": "attachment", "url": url, "file_name": "report.pdf"},
+        }
+        self.assertEqual(transcript.entry_text(entry), f"\U0001F4CE report.pdf {url}")
+        (_kind, line), = self.rows(entry, 80)
+        link = [text for text, style in line if style == "link"]
+        self.assertEqual(link, [url])
+        screen = FakeScreen(24, 80)
+        chat = chat_state.Chat("Researcher")
+        chat.messages = [entry]
+        chat_view.draw(screen, chat)
+        self.assertTrue(any(hit[3] == url for hit in terminal.LINK_HITS))
+
+    def test_the_old_user_attachment_is_unchanged(self):
+        entry = {"kind": "user-attachment", "id": "a", "file_name": "p.jpg", "url": "file:///x/p.jpg",
+                 "secondaryText": "649kB", "width": 10, "height": 20}
+        self.assertEqual(transcript.entry_text(entry), "\U0001F4CE p.jpg (649kB, 10x20)")
+
+    def test_a_page_link_gets_one_card_after_the_body(self):
+        entry = self.page_entry("the plan is ready: [Extrablatt revamp](https://cursor.com/canvas/store-x/abc)")
+        rows = self.rows(entry, 80)
+        self.assertEqual([kind for kind, _text in rows], ["text", "gap", "card-page"])
+        body = markdown.line_plain(rows[0][1])
+        self.assertIn("the plan is ready: Extrablatt revamp", body)
+        self.assertIn("https://cursor.com/canvas/store-x/abc", body)
+        self.assertEqual(rows[2][1], "\U0001F4C4 page: Extrablatt revamp")
+        self.assertEqual(rows[2][1].url, "https://cursor.com/canvas/store-x/abc")
+        self.assertIn("card-page", styles_mod.CARD_STYLE)
+
+    def test_one_card_per_distinct_page_url(self):
+        first = "[One](https://cursor.com/canvas/s/a)"
+        second = "[Two](https://cursor.com/canvas/s/b)"
+        again = "[One again](https://cursor.com/canvas/s/a)"
+        entry = self.page_entry(f"{first} and {second} and {again}")
+        self.assertEqual(
+            transcript.pages(entry),
+            [("One", "https://cursor.com/canvas/s/a"), ("Two", "https://cursor.com/canvas/s/b")],
+        )
+        cards = [text for kind, text in self.rows(entry, 80) if kind == "card-page"]
+        self.assertEqual(cards, ["\U0001F4C4 page: One", "\U0001F4C4 page: Two"])
+
+    def test_only_canvas_links_are_pages(self):
+        for content in (
+            "[Docs](https://example.com/canvas/s/a)",
+            "[Canvas](https://cursor.com/docs/canvas)",
+            "[Insecure](http://cursor.com/canvas/s/a)",
+            "[Short](https://cursor.com/canvas/s)",
+            "plain https://cursor.com/canvas/s/a url",
+        ):
+            self.assertEqual(transcript.pages(self.page_entry(content)), [], content)
+        self.assertEqual(transcript.pages({"role": "user", "text": "[A](https://cursor.com/canvas/s/a)"}), [])
+
+    def test_the_page_card_opens_through_the_link_machinery(self):
+        entry = self.page_entry("see [Plan](https://cursor.com/canvas/store-x/abc)")
+        chat = chat_state.Chat("Researcher")
+        chat.messages = [entry]
+        screen = FakeScreen(24, 80)
+        chat_view.draw(screen, chat)
+        urls = [hit[3] for hit in terminal.LINK_HITS]
+        self.assertEqual(urls.count("https://cursor.com/canvas/store-x/abc"), 2)
+        card = next(hit for hit in terminal.LINK_HITS if hit[2] - hit[1] <= len("\U0001F4C4 page: Plan") + 1)
+        opened = []
+        old = terminal.subprocess.Popen
+        terminal.subprocess.Popen = lambda argv, **_kw: opened.append(argv)
+        self.addCleanup(setattr, terminal.subprocess, "Popen", old)
+        self.assertTrue(terminal.open_link_at(card[1], card[0]))
+        self.assertEqual(opened, [["xdg-open", "https://cursor.com/canvas/store-x/abc"]])
+        text = "\n".join("".join(parts) for _y, parts in sorted(screen.rows.items()))
+        self.assertIn("\U0001F4C4 page: Plan", text)
 
 
 if __name__ == "__main__":

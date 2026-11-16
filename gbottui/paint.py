@@ -1,8 +1,19 @@
 """Painting spans and lines."""
 
 import curses
+import unicodedata
 
 from . import activity, grid, markdown, styles, terminal
+
+
+def cell_width(text):
+    """Terminal cells the text takes: wide (W/F) characters 2, combining marks 0, else 1."""
+    width = 0
+    for char in text:
+        if unicodedata.category(char) in ("Mn", "Me"):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+    return width
 
 
 def title_spans(title, phase, width):
@@ -34,7 +45,7 @@ def paint_spans(stdscr, y, x, spans):
     col = x
     for text, style in spans:
         put(stdscr, y, col, text, styles.span_attr(style))
-        col += len(text)
+        col += cell_width(text)
 
 
 def transcript_attr(style, base):
@@ -82,8 +93,9 @@ def paint_bot_line(stdscr, y, x, line, base):
         if "link" in style or style == "dim":
             for found in markdown._URL_RE.finditer(text):
                 url = found.group(0).rstrip(".,;:!?)]")
-                terminal.LINK_HITS.append((y, col + found.start(), col + found.start() + len(url), url))
-        col += len(text)
+                start = col + cell_width(text[: found.start()])
+                terminal.LINK_HITS.append((y, start, start + cell_width(url), url))
+        col += cell_width(text)
 
 
 def paint_user_line(stdscr, y, x, line):
@@ -95,7 +107,7 @@ def paint_user_line(stdscr, y, x, line):
     col = x + 1
     for text, style in line:
         put(stdscr, y, col, text, user_attr(style, base))
-        col += len(text)
+        col += cell_width(text)
     put(stdscr, y, col, " ", base)
 
 

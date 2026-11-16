@@ -262,6 +262,20 @@ def request_rows(asked, width):
     return rows
 
 
+PAGE_PREFIX = "\U0001F4C4 page: "
+
+
+class PageRow(str):
+    """The text of a `card-page` row. Equal to the plain string; `.url` is what a click opens."""
+
+    __slots__ = ("url",)
+
+    def __new__(cls, text, url):
+        row = super().__new__(cls, text)
+        row.url = url
+        return row
+
+
 def transcript_rows(entries, width, picks=None, card=None):
     rows = []
     user_w = max(width - 8, 1)
@@ -285,6 +299,8 @@ def transcript_rows(entries, width, picks=None, card=None):
             rows.extend(request_rows(asked, width))
             continue
         lines = card_lines(entry, width)
+        pictures = [] if transcript.is_user(entry) else transcript.image_lines(entry)
+        linked = transcript.pages(entry)
         if id(entry) in paged_ids:
             page = found[at]
             text = (
@@ -295,8 +311,9 @@ def transcript_rows(entries, width, picks=None, card=None):
         else:
             numbered = current is not None and entry is current
             name = found[0]["key"] if numbered else entry.get("id") if isinstance(entry, dict) else None
-            text = transcript.entry_text(entry, picks.get(name) or (), numbered).strip()
-        if not text and not lines:
+            # A bot's image lines are drawn dim below; a user's stay in the bubble.
+            text = transcript.entry_text(entry, picks.get(name) or (), numbered, media=not pictures).strip()
+        if not text and not lines and not pictures and not linked:
             continue
         if rows:
             rows.append(("gap", ""))
@@ -310,8 +327,15 @@ def transcript_rows(entries, width, picks=None, card=None):
             else:
                 for line in wrapped:
                     rows.append(("text", line))
+        for picture in pictures:
+            for line in wrap(picture, text_w):
+                rows.append(("text", [(line, "dim")]))
+        for title, url in linked:
+            if text or pictures:
+                rows.append(("gap", ""))
+            rows.append(("card-page", PageRow(clip(PAGE_PREFIX + title, max(width - 2, 1)), url)))
         if lines:
-            if text:
+            if text or pictures or linked:
                 rows.append(("gap", ""))
             kind = transcript.card_row_kind(entry)
             for line in lines:

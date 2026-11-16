@@ -24,6 +24,9 @@ The text sent picks the reply, for bench/e2e_tui.py:
   "secretdone ..", "credok ..", "credfailed ..", "credexpired ..", "formdone .."
                  the same cards already settled (or, for credexpired, past its expiry)
   "resolve ..."  settles every open card in place, as if the app had answered it
+  "image ..."    a text message with one image (file:// url, alt, 780x1688)
+  "attach ..."   an attachment message (https url, file name, alt, size)
+  "page ..."     a message linking a https://cursor.com/canvas/<store>/<id> page
   anything else  "reply to <text>"
 While a reply grows it is an `isStreaming` entry, and a `thread --after <its id>`
 still returns it, so the poll sees the new text under the same id. It keeps
@@ -173,6 +176,26 @@ def reply_entries(ident, text, at):
             "message": {"type": "widget", "widget": {"prompt": prompt, "allowCustom": custom,
                 "options": [{"label": label, "value": value} for label, value in options]}},
         } for n, (prompt, options, custom) in enumerate(asks, 1)]
+    if text.startswith("image"):
+        # A text message with an image. The url is a path on another machine.
+        return [{
+            "id": ident, "kind": "send-message", "at": at,
+            "message": {"type": "text", "content": "here is the proof", "images": [
+                {"url": "file:///home/box/agent-data/agents/a1/assets/4f9c0de1", "alt": "terminal proof",
+                 "width": 780, "height": 1688}]},
+        }]
+    if text.startswith("attach"):
+        return [{
+            "id": ident, "kind": "send-message", "at": at,
+            "message": {"type": "attachment", "url": "https://files.example.com/report.pdf",
+                        "file_name": "report.pdf", "alt": "quarterly numbers", "width": 612, "height": 792},
+        }]
+    if text.startswith("page"):
+        return [{
+            "id": ident, "kind": "send-message", "at": at,
+            "message": {"type": "text", "content":
+                        "the plan is ready: [Extrablatt revamp](https://cursor.com/canvas/store-x/abc)"},
+        }]
     body = LONG if text.startswith("long") else "reply to " + text
     return [{"id": ident, "role": "assistant", "text": body, "at": at, "stream": STREAM}]
 
