@@ -16,10 +16,22 @@ def cell_width(text):
     return width
 
 
-def title_spans(title, phase, width):
-    """The header name, a cyan `working` while a reply is in progress, a yellow `needs you` while blocked."""
+def title_spans(title, phase, width, doing=""):
+    """The header name, a cyan `working` while a reply is in progress, a yellow `needs you` while blocked.
+
+    While working, `doing` (the bot's own status line) follows `working`. It is
+    clipped so the name keeps 8 cells (or all of a shorter name), and dropped
+    first when there is no room.
+    """
     room = max(width - 4, 0)
     mark = {"working": " · working", "blocked": " · needs you"}.get(phase, "")
+    doing = " ".join((doing or "").split()) if phase == "working" else ""
+    if mark and doing:
+        lead = mark + " · "
+        budget = room - len(lead) - min(len(title), 8)
+        if budget >= 2:
+            full = lead + grid.clip(doing, budget)
+            return [(grid.clip(title, room - len(full)), "bold"), (full, activity.STATUS_STYLE["working"])]
     if mark and room > len(mark):
         style = activity.STATUS_STYLE["working" if phase == "working" else "blocked"]
         return [(grid.clip(title, room - len(mark)), "bold"), (mark, style)]

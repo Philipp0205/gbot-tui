@@ -81,6 +81,11 @@ def _status_spans(lead, lead_style, mark, name, name_style, snap, title, room, c
     """State, then name, then the latest line. The state column is what you scan."""
     label = activity.status_label(snap.get("state") or "", snap.get("unread") or 0)
     preview = " ".join((snap.get("preview") or title or "").split())
+    doing = " ".join((snap.get("doing") or "").split()) if snap.get("state") == "working" else ""
+    preview_style = "dim"
+    if doing:
+        preview = doing
+        preview_style = activity.STATUS_STYLE["working"]
     state_w = columns["state"] if columns else STATE_COLUMN
     field = state_field(label, state_w)
     style = activity.STATUS_STYLE.get(snap.get("state"), "dim")
@@ -100,7 +105,7 @@ def _status_spans(lead, lead_style, mark, name, name_style, snap, title, room, c
         ]
         if preview and preview_room > 0:
             spans.append((sep, "dim"))
-            spans.append((grid.clip(preview, preview_room), "dim"))
+            spans.append((grid.clip(preview, preview_room), preview_style))
         return spans
     # A very narrow window keeps the name. The state word needs its column.
     if room < len(field) + 1:
@@ -120,7 +125,7 @@ def _status_spans(lead, lead_style, mark, name, name_style, snap, title, room, c
     ]
     if preview and preview_room > 0:
         spans.append((sep, "dim"))
-        spans.append((grid.clip(preview, preview_room), "dim"))
+        spans.append((grid.clip(preview, preview_room), preview_style))
     return spans
 
 

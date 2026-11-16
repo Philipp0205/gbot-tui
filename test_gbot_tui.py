@@ -3926,8 +3926,47 @@ class ServerStateTests(unittest.TestCase):
         data = b"\x0a" + backend._varint(len(status)) + status
         self.assertEqual(
             backend.parse_agent_statuses(data),
-            {"abc": {"unread": 2, "latest": 1793864041547, "running": False}},
+            {"abc": {"unread": 2, "latest": 1793864041547, "running": False, "doing": ""}},
         )
+
+    @staticmethod
+    def live_with_activity(text, tool="SetStatus", **flags):
+        message = _pb(1, b"tool") + _pb(2, tool.encode()) + (_pb(3, text) if text is not None else b"")
+        return ServerStateTests.live(**flags) + _pb(5, message)
+
+    def doing(self, data, now_ms=1_000_000):
+        return backend.parse_agent_statuses(data, now_ms)["abc"]["doing"]
+
+    def test_doing_is_the_live_activity_line_while_running(self):
+        live = self.live_with_activity(b"is fixing the working indicator", is_running=True)
+        self.assertEqual(self.doing(self.status("abc", live=live)), "is fixing the working indicator")
+        # The status flag alone also means running.
+        self.assertEqual(self.doing(self.status("abc", live=self.live_with_activity(b"on it"), flag=True)), "on it")
+
+    def test_doing_is_one_clean_line_of_at_most_120_chars(self):
+        live = self.live_with_activity(b"  is\n fixing\t\tit  " + b"x" * 200, is_running=True)
+        text = self.doing(self.status("abc", live=live))
+        self.assertTrue(text.startswith("is fixing it xxx"))
+        self.assertEqual(len(text), 120)
+        self.assertEqual(text, text.strip())
+
+    def test_doing_is_empty_when_not_running_stale_or_missing(self):
+        text = b"is fixing it"
+        self.assertEqual(self.doing(self.status("abc", live=self.live_with_activity(text, is_running=False))), "")
+        self.assertEqual(self.doing(self.status("abc", live=self.live_with_activity(text), flag=False)), "")
+        stale = self.live_with_activity(text, is_running=True, updated=1000, stale_after=500)
+        self.assertEqual(self.doing(self.status("abc", live=stale), now_ms=1501), "")
+        self.assertEqual(self.doing(self.status("abc", live=self.live_with_activity(text, is_running=True), flag=None)), "is fixing it")
+        self.assertEqual(self.doing(self.status("abc", live=self.live_with_activity(None, is_running=True))), "")
+        self.assertEqual(self.doing(self.status("abc", live=self.live(is_running=True))), "")
+
+    def test_doing_never_shows_the_raw_tool_name_or_unprintable_text(self):
+        only_tool = self.live_with_activity(None, tool="SetStatus", is_running=True)
+        self.assertEqual(self.doing(self.status("abc", live=only_tool)), "")
+        for bad in (b"\xff\xfe", b"bell\x07", b"   "):
+            with self.subTest(bad):
+                live = self.live_with_activity(bad, is_running=True)
+                self.assertEqual(self.doing(self.status("abc", live=live)), "")
 
     @staticmethod
     def status(agent, live=b"", flag=None, client=b""):
@@ -4041,6 +4080,87 @@ class ServerStateTests(unittest.TestCase):
         self.assertEqual(self.with_flag(False, {"state": "blocked"}), "blocked")
         self.assertEqual(self.with_flag(None, {"state": "working"}), "working")
         self.assertEqual(self.with_flag(None, {"state": "idle"}), "idle")
+
+    def test_with_activity_sets_doing_only_while_working(self):
+        def snap(running, state, doing="is fixing it", unread=0):
+            bot = {"id": "w2", "name": "Wdoing"}
+            backend.SERVER.clear()
+            backend.SERVER["w2"] = {"unread": unread, "latest": 5, "running": running, "doing": doing}
+            self.addCleanup(backend.SERVER.clear)
+            activity.store_activity(bot, {"state": state, "cursor": "c", "preview": "", "unread": 0})
+            return activity.with_activity([bot])[0]["activity"]
+
+        self.assertEqual(snap(True, "idle")["doing"], "is fixing it")
+        self.assertNotIn("doing", snap(True, "idle", doing=""))
+        self.assertNotIn("doing", snap(False, "working"))
+        self.assertNotIn("doing", snap(True, "blocked"))
+        self.assertNotIn("doing", snap(None, "idle"))
+
+    def test_refresh_running_stores_doing_and_doing_text_reads_it(self):
+        backend.SERVER.clear()
+        backend.SERVER["abc"] = {"unread": 0, "latest": 7, "running": None}
+        live = self.live_with_activity(b"is fixing it", is_running=True)
+        try:
+            self.assertEqual(backend.doing_text("abc"), "")
+            with mock.patch.object(backend, "backend_call", lambda m, b: self.status("abc", live=live)):
+                backend.refresh_running("abc")
+            self.assertEqual(backend.doing_text("abc"), "is fixing it")
+            self.assertEqual(backend.doing_text("missing"), "")
+            self.assertEqual(backend.doing_text(None), "")
+            backend.clear_running("abc")
+            self.assertEqual(backend.doing_text("abc"), "")
+            backend.SERVER["abc"]["doing"] = "old"
+
+            def broken(method, body):
+                raise gbot_cli.GbotError("offline")
+
+            with mock.patch.object(backend, "backend_call", broken):
+                backend.refresh_running("abc")
+            self.assertEqual(backend.doing_text("abc"), "")
+        finally:
+            backend.SERVER.clear()
+
+    def test_the_working_row_shows_doing_instead_of_the_preview(self):
+        bot = {
+            "name": "Chef",
+            "title": "cooks",
+            "avatarColor": "violet",
+            "activity": {"state": "working", "unread": 0, "preview": "old reply", "cursor": "c", "doing": "is fixing the working indicator"},
+        }
+        for columns in (None, {"name": 6, "state": 11}):
+            with self.subTest(columns=columns):
+                spans = picker.picker_spans(bot, False, 80, columns)
+                row = "".join(text for text, _style in spans)
+                self.assertRegex(row, r"working\s+Chef\s+· is fixing")
+                self.assertTrue(row.rstrip().endswith("· is fixing the working indicator"))
+                self.assertNotIn("old reply", row)
+                self.assertEqual(spans[-1], ("is fixing the working indicator", "cyan"))
+        idle = dict(bot, activity=dict(bot["activity"], state="idle"))
+        row = "".join(text for text, _style in picker.picker_spans(idle, False, 80))
+        self.assertIn("old reply", row)
+        self.assertNotIn("fixing", row)
+        plain = dict(bot, activity={"state": "working", "unread": 0, "preview": "old reply", "cursor": "c"})
+        self.assertEqual(picker.picker_spans(plain, False, 80)[-1], ("old reply", "dim"))
+
+    def test_title_spans_show_doing_while_working(self):
+        doing = "is fixing the working indicator"
+        wide = paint.title_spans("Chef", "working", 80, doing)
+        self.assertEqual(wide, [("Chef", "bold"), (" · working · " + doing, "cyan")])
+        # Clipped so the name keeps 8 cells.
+        mid = paint.title_spans("Outfitly Bot", "working", 40, doing)
+        text = "".join(t for t, _s in mid)
+        self.assertLessEqual(len(text), 36)
+        self.assertEqual(len(mid[0][0]), 8)
+        self.assertTrue(mid[0][0].startswith("Outfit"))
+        self.assertIn("…", mid[1][0])
+        # No room for doing: today's mark, then today's name only.
+        self.assertEqual(paint.title_spans("Outfitly Bot", "working", 26, doing), paint.title_spans("Outfitly Bot", "working", 26))
+        self.assertEqual(paint.title_spans("Chef", "working", 20, doing), paint.title_spans("Chef", "working", 20))
+        self.assertEqual(paint.title_spans("Chef", "working", 8, doing), [("Chef", "bold")])
+        # Only while working.
+        for phase in ("idle", "blocked"):
+            self.assertEqual(paint.title_spans("Chef", phase, 80, doing), paint.title_spans("Chef", phase, 80))
+        self.assertEqual(paint.title_spans("Chef", "working", 80, ""), paint.title_spans("Chef", "working", 80))
 
     def test_server_state_sorts_and_counts(self):
         backend.SERVER.clear()

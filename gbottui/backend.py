@@ -137,8 +137,33 @@ def _running_of(status_flag, live, now_ms):
     return any(bool(state.get(number)) for number in (2, 3, 4, 13))
 
 
+DOING_MAX = 120
+
+
+def _doing_of(live, running):
+    """The bot's own one-line status from live activity field 3. Empty unless it is running.
+
+    Field 2 of the activity is a raw tool name and is never used.
+    """
+    if running is not True:
+        return ""
+    try:
+        activity_msg = next((v for f, v in _proto_fields(live) if f == 5 and isinstance(v, bytes)), b"")
+        raw = next((v for f, v in _proto_fields(activity_msg) if f == 3 and isinstance(v, bytes)), b"")
+        text = " ".join(raw.decode("utf-8").split())
+    except (ValueError, IndexError):
+        return ""
+    if not text.isprintable():
+        return ""
+    return text[:DOING_MAX].strip()
+
+
 def parse_agent_statuses(data, now_ms=None):
-    """id -> {"unread", "latest", "running"}. `running` is True, False, or None when unknown."""
+    """id -> {"unread", "latest", "running", "doing"}.
+
+    `running` is True, False, or None when unknown. `doing` is the live activity
+    line while running, else "".
+    """
     if now_ms is None:
         now_ms = int(time.time() * 1000)
     found = {}
@@ -155,10 +180,12 @@ def parse_agent_statuses(data, now_ms=None):
         state = dict(_proto_fields(client))
         unread = state.get(3)
         latest = state.get(4)
+        running = _running_of(bool(flag), live, now_ms)
         found[ids[0].decode("utf-8", "replace")] = {
             "unread": unread if isinstance(unread, int) else 0,
             "latest": latest if isinstance(latest, int) else 0,
-            "running": _running_of(bool(flag), live, now_ms),
+            "running": running,
+            "doing": _doing_of(live, running),
         }
     return found
 
@@ -318,10 +345,19 @@ def refresh_running(agent_id):
     with activity.STATE_LOCK:
         if not found and agent_id in SERVER:
             SERVER[agent_id]["running"] = None
+            SERVER[agent_id]["doing"] = ""
         for ident, state in found.items():
             # The chat is open, so a bot not known yet starts read.
             known = SERVER.setdefault(ident, {"unread": 0, "latest": state["latest"]})
             known["running"] = state["running"]
+            known["doing"] = state["doing"]
+
+
+def doing_text(agent_id):
+    """The bot's live one-line status, or "" when unknown."""
+    with activity.STATE_LOCK:
+        known = SERVER.get(agent_id or "")
+        return (known.get("doing") or "") if known else ""
 
 
 def clear_running(agent_id):
@@ -330,6 +366,7 @@ def clear_running(agent_id):
         known = SERVER.get(agent_id or "")
         if known:
             known["running"] = None
+            known["doing"] = ""
 
 
 def mark_read_later(agent_id):
