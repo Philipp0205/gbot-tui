@@ -35,8 +35,10 @@ PROGRESS_STATES = {"running", "streaming", "in_progress", "generating", "working
 STATE_LOCK = threading.Lock()
 ACTIVITY = {}
 SEEN = {}
-ACTIVITY_LOADED = {"done": False}
-SEEN_LOADED = {"done": False}
+# `sig` is the file's (inode, mtime, size) when this process last read or wrote
+# it; a different signature on disk means another instance wrote, so reload.
+ACTIVITY_LOADED = {"done": False, "sig": None}
+SEEN_LOADED = {"done": False, "sig": None}
 
 
 def activity_path():
@@ -74,31 +76,59 @@ def _clean_snap(snap):
     }
 
 
+def _sync_locked(state, store, path, clean_row):
+    """Reload `store` from `path` when the file changed since we last read or wrote it.
+
+    Other gbot-tui instances share these files. One stat per call; the file is
+    only read again when its signature (inode, mtime, size) moved. Caller holds
+    STATE_LOCK. `state["done"] = False` forces a reload (tests, a fresh start).
+    A file that is gone empties the store; one that cannot be parsed keeps it.
+    """
+    sig = cache.file_sig(path)
+    if state["done"] and state.get("sig") == sig:
+        return
+    state["done"] = True
+    state["sig"] = sig
+    data = cache.read_json(path) if sig is not None else None
+    if not isinstance(data, dict):
+        if sig is None:
+            store.clear()
+        return
+    rows = {}
+    for key, value in data.items():
+        clean = clean_row(value)
+        if isinstance(key, str) and clean:
+            rows[key] = clean
+    store.clear()
+    store.update(rows)
+
+
+def _clean_cursor(cursor):
+    return cursor if isinstance(cursor, str) and cursor else None
+
+
+def _sync_activity_locked():
+    _sync_locked(ACTIVITY_LOADED, ACTIVITY, activity_path(), _clean_snap)
+
+
+def _sync_seen_locked():
+    _sync_locked(SEEN_LOADED, SEEN, seen_path(), _clean_cursor)
+
+
+def _save_locked(state, path, store):
+    sig = cache._save_locked(path, dict(store))
+    if sig is not None:
+        state["sig"] = sig
+
+
 def load_activity():
     with STATE_LOCK:
-        if ACTIVITY_LOADED["done"]:
-            return
-        ACTIVITY_LOADED["done"] = True
-        data = cache.read_json(activity_path())
-        if not isinstance(data, dict):
-            return
-        for key, snap in data.items():
-            clean = _clean_snap(snap)
-            if isinstance(key, str) and clean:
-                ACTIVITY[key] = clean
+        _sync_activity_locked()
 
 
 def load_seen():
     with STATE_LOCK:
-        if SEEN_LOADED["done"]:
-            return
-        SEEN_LOADED["done"] = True
-        data = cache.read_json(seen_path())
-        if not isinstance(data, dict):
-            return
-        for key, cursor in data.items():
-            if isinstance(key, str) and isinstance(cursor, str) and cursor:
-                SEEN[key] = cursor
+        _sync_seen_locked()
 
 
 def store_activity(bot, snap, only_if_absent=False):
@@ -106,19 +136,20 @@ def store_activity(bot, snap, only_if_absent=False):
     keys = activity_keys(bot)
     if not clean or not keys:
         return
-    load_activity()
     with STATE_LOCK:
+        # Read-modify-write: take what other instances wrote, change only our keys.
+        _sync_activity_locked()
         # A live read can land while the list is still judging a saved thread.
         if only_if_absent and any(ACTIVITY.get(key) for key in keys):
             return
         for key in keys:
             ACTIVITY[key] = clean
-        cache._save_locked(activity_path(), dict(ACTIVITY))
+        _save_locked(ACTIVITY_LOADED, activity_path(), ACTIVITY)
 
 
 def lookup_activity(bot):
-    load_activity()
     with STATE_LOCK:
+        _sync_activity_locked()
         for key in activity_keys(bot):
             snap = ACTIVITY.get(key)
             if snap:
@@ -134,8 +165,8 @@ def remember_seen(name, bot_id, cursor, only_if_absent=False):
     """
     if not isinstance(cursor, str) or not cursor:
         return
-    load_seen()
     with STATE_LOCK:
+        _sync_seen_locked()
         keys = []
         if bot_id:
             keys.append("id:" + str(bot_id))
@@ -145,12 +176,12 @@ def remember_seen(name, bot_id, cursor, only_if_absent=False):
             return
         for key in keys:
             SEEN[key] = cursor
-        cache._save_locked(seen_path(), dict(SEEN))
+        _save_locked(SEEN_LOADED, seen_path(), SEEN)
 
 
 def lookup_seen(bot):
-    load_seen()
     with STATE_LOCK:
+        _sync_seen_locked()
         for key in activity_keys(bot):
             cursor = SEEN.get(key)
             if cursor:

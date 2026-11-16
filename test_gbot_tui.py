@@ -3048,6 +3048,99 @@ class OverviewTests(unittest.TestCase):
         ]
         self.assertEqual(picker.fuzzy_bots("pasta", bots)[0]["name"], "Chef")
 
+    def _as_another_instance(self, path, rows, bump=2):
+        """Write the file directly, as a second gbot-tui process would, with a newer mtime."""
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(rows, handle)
+        stat = os.stat(path)
+        stamp = stat.st_mtime_ns + bump * 1_000_000_000
+        os.utime(path, ns=(stamp, stamp))
+
+    def test_lookup_seen_picks_up_a_cursor_another_instance_wrote(self):
+        bot = {"id": "a1", "name": "Chef"}
+        activity.remember_seen("Chef", "a1", "m1")
+        self.assertEqual(activity.lookup_seen(bot), "m1")
+        with open(activity.seen_path(), encoding="utf-8") as handle:
+            rows = json.load(handle)
+        rows.update({"id:a1": "m7", "name:Chef": "m7"})
+        self._as_another_instance(activity.seen_path(), rows)
+        self.assertEqual(activity.lookup_seen(bot), "m7")
+
+    def test_lookup_activity_picks_up_a_snapshot_another_instance_wrote(self):
+        bot = {"id": "a1", "name": "Chef"}
+        activity.store_activity(bot, {"state": "unread", "unread": 2, "cursor": "m5", "preview": "hi"})
+        self.assertEqual(activity.lookup_activity(bot)["state"], "unread")
+        cleared = {"state": "idle", "unread": 0, "cursor": "m5", "preview": "hi"}
+        self._as_another_instance(activity.activity_path(), {"id:a1": cleared, "name:Chef": cleared})
+        self.assertEqual(activity.lookup_activity(bot)["state"], "idle")
+        self.assertEqual(activity.lookup_activity(bot)["unread"], 0)
+
+    def test_an_unchanged_file_is_not_read_again(self):
+        activity.remember_seen("Chef", "a1", "m1")
+        calls = []
+        real = cache.read_json
+        cache.read_json = lambda path: calls.append(path) or real(path)
+        try:
+            for _ in range(5):
+                activity.lookup_seen({"id": "a1", "name": "Chef"})
+        finally:
+            cache.read_json = real
+        self.assertEqual(calls, [])
+
+    def test_remember_seen_keeps_a_row_another_instance_wrote(self):
+        activity.remember_seen("Chef", "a1", "m1")
+        rows = {"id:a1": "m1", "name:Chef": "m1", "id:a2": "n4", "name:Night": "n4"}
+        self._as_another_instance(activity.seen_path(), rows)
+        activity.remember_seen("Chef", "a1", "m2")
+        with open(activity.seen_path(), encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved["id:a1"], "m2")
+        self.assertEqual(saved["id:a2"], "n4")
+        self.assertEqual(saved["name:Night"], "n4")
+        self.assertEqual(activity.lookup_seen({"id": "a2", "name": "Night"}), "n4")
+
+    def test_store_activity_keeps_a_row_another_instance_wrote(self):
+        chef = {"id": "a1", "name": "Chef"}
+        activity.store_activity(chef, {"state": "idle", "unread": 0, "cursor": "m1", "preview": ""})
+        night = {"state": "unread", "unread": 1, "cursor": "n2", "preview": "new"}
+        self._as_another_instance(
+            activity.activity_path(),
+            {
+                "id:a1": {"state": "idle", "unread": 0, "cursor": "m1", "preview": ""},
+                "id:a2": night,
+            },
+        )
+        activity.store_activity(chef, {"state": "working", "unread": 0, "cursor": "m2", "preview": ""})
+        with open(activity.activity_path(), encoding="utf-8") as handle:
+            saved = json.load(handle)
+        self.assertEqual(saved["id:a1"]["state"], "working")
+        self.assertEqual(saved["id:a2"]["state"], "unread")
+
+    def test_only_if_absent_is_judged_against_the_reloaded_file(self):
+        bot = {"id": "a1", "name": "Chef"}
+        activity.remember_seen("Other", "a9", "x1")
+        self._as_another_instance(activity.seen_path(), {"id:a1": "m9", "name:Chef": "m9", "id:a9": "x1"})
+        activity.remember_seen("Chef", "a1", "m1", only_if_absent=True)
+        self.assertEqual(activity.lookup_seen(bot), "m9")
+        with open(activity.seen_path(), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["id:a1"], "m9")
+        snap = {"state": "idle", "unread": 0, "cursor": "m1", "preview": ""}
+        activity.store_activity({"id": "a5", "name": "Zed"}, snap)
+        other = {"state": "blocked", "unread": 0, "cursor": "z3", "preview": "ask"}
+        self._as_another_instance(activity.activity_path(), {"id:a5": other, "name:Zed": other})
+        activity.store_activity({"id": "a5", "name": "Zed"}, snap, only_if_absent=True)
+        self.assertEqual(activity.lookup_activity({"id": "a5", "name": "Zed"})["state"], "blocked")
+
+    def test_write_private_replaces_atomically_and_stays_private(self):
+        path = activity.seen_path()
+        cache.write_private(path, {"a": "1"})
+        first = os.stat(path).st_ino
+        cache.write_private(path, {"a": "2"})
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        self.assertNotEqual(os.stat(path).st_ino, first)
+        self.assertEqual(cache.read_json(path), {"a": "2"})
+        self.assertEqual([n for n in os.listdir(os.path.dirname(path)) if n.endswith(".tmp")], [])
+
     def test_seen_is_private_and_the_cached_thread_counts_as_read(self):
         activity.remember_seen("Outfitly", "a1", "m3")
         self.assertEqual(os.stat(activity.seen_path()).st_mode & 0o777, 0o600)
