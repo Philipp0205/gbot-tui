@@ -18,6 +18,12 @@ The text sent picks the reply, for bench/e2e_tui.py:
   "widget ..."   a widget with three options
   "steps ..."    one widget with three `steps` (the second allows custom text)
   "multi ..."    three separate widget messages in a row (the second allows custom text)
+  "secret ..."   a pending secret-request card (GH_TOKEN_WORKFLOW)
+  "cred ..."     a pending 1Password credential-request card
+  "form ..."     a pending user-form card (one OTP field)
+  "secretdone ..", "credok ..", "credfailed ..", "credexpired ..", "formdone .."
+                 the same cards already settled (or, for credexpired, past its expiry)
+  "resolve ..."  settles every open card in place, as if the app had answered it
   anything else  "reply to <text>"
 While a reply grows it is an `isStreaming` entry, and a `thread --after <its id>`
 still returns it, so the poll sees the new text under the same id. It keeps
@@ -61,8 +67,75 @@ That is the **whole** plan. See https://example.com/plan for the map.
 """ + "\n".join(f"Extra line {i} of the long answer." for i in range(1, 21)) + "\nEND OF LONG"
 
 
+def card_entry(ident, at, kind, key, request, **settled):
+    """A secret / credential / form request entry, as `gbot thread --json` shows it.
+
+    The handles (appLink, accessRequestId, entryId, requestId) are fake but
+    present, so a flow can check the app never prints them.
+    """
+    entry = {
+        "id": ident, "kind": "send-message", "at": at,
+        "message": {"type": kind, key: request},
+        "timestampMs": int(at * 1000), "requestId": "REQHANDLE-" + ident, "seq": 1,
+    }
+    entry.update(settled)
+    return entry
+
+
+def secret_request():
+    return {"label": "GitHub token", "description": "Needed to push the workflow",
+            "target": {"kind": "box-env", "name": "GH_TOKEN_WORKFLOW", "platform": "linux", "field": "GH_TOKEN_WORKFLOW"}}
+
+
+def credential_request(at, expires_in=600):
+    return {"kind": "brokered-login", "accessRequestId": "ACCESSHANDLE", "goal": "Buy the domain",
+            "entries": [{"entryId": "ENTRYHANDLE", "website": "ionos.com", "reason": "sign in to buy loanso.me"}],
+            "appLink": "onepassword://grant-brokered-access?token=APPLINKHANDLE",
+            "requestedAtMs": int(at * 1000), "expiresAtMs": int((at + expires_in) * 1000)}
+
+
+def form_request():
+    return {"secureValues": True, "title": "Hetzner 2FA code", "instruction": "Type the code from your phone",
+            "reason": "auth", "domains": ["hetzner.com"],
+            "fields": [{"id": "f1", "label": "OTP code", "type": "otp", "required": True, "secret": True}]}
+
+
+# word -> (type, request key, request, settled fields): "secret ..." is pending,
+# the others show one resolved state. "resolve ..." settles every pending card.
+SECRET_ASKS = {
+    "secret": ("secret-request", "secretRequest", {}),
+    "secretdone": ("secret-request", "secretRequest", {"secretProvided": True}),
+    "cred": ("credential-request", "credentialRequest", {}),
+    "credok": ("credential-request", "credentialRequest", {"credentialResolution": "approved"}),
+    "credfailed": ("credential-request", "credentialRequest", {"credentialResolution": "failed"}),
+    "credexpired": ("credential-request", "credentialRequest", {}),
+    "form": ("user-form", "formRequest", {}),
+    "formdone": ("user-form", "formRequest", {"formResolution": "submitted"}),
+}
+SETTLE = {
+    "secret-request": {"secretProvided": True},
+    "credential-request": {"credentialResolution": "approved"},
+    "user-form": {"formResolution": "submitted"},
+}
+
+
+def ask_entries(ident, word, at):
+    kind, key, settled = SECRET_ASKS[word]
+    if kind == "secret-request":
+        request = secret_request()
+    elif kind == "credential-request":
+        # An expired one asked long ago and ran out; the others have 10 minutes.
+        request = credential_request(at - 7200, expires_in=600 if word == "credexpired" else 14400)
+    else:
+        request = form_request()
+    return [card_entry(ident, at, kind, key, request, **settled)]
+
+
 def reply_entries(ident, text, at):
     """The bot's entries for one sent text."""
+    words = text.split()
+    if words and words[0] in SECRET_ASKS:
+        return ask_entries(ident, words[0], at)
     if text.startswith("approve"):
         return [{
             "id": ident, "kind": "send-message", "at": at,
@@ -196,6 +269,12 @@ def main(argv):
         count = len(entries)
         now = time.time()
         entries.append({"id": f"m{count + 1}", "role": "user", "text": text, "at": now})
+        if text.split()[:1] == ["resolve"]:
+            # The user settled every open request in the app: change the cards in place.
+            for entry in entries:
+                message = entry.get("message")
+                if isinstance(message, dict) and message.get("type") in SETTLE:
+                    entry.update(SETTLE[message["type"]])
         entries.extend(reply_entries(f"m{count + 2}", text, now + REPLY))
         save(target, entries)
         print(json.dumps({"ok": True}))

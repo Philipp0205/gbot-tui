@@ -6,11 +6,12 @@ from . import activity, grid, markdown, styles, terminal
 
 
 def title_spans(title, phase, width):
-    """The header name, and a cyan `working` while a reply is in progress."""
+    """The header name, a cyan `working` while a reply is in progress, a yellow `needs you` while blocked."""
     room = max(width - 4, 0)
-    mark = " · working" if phase == "working" else ""
+    mark = {"working": " · working", "blocked": " · needs you"}.get(phase, "")
     if mark and room > len(mark):
-        return [(grid.clip(title, room - len(mark)), "bold"), (mark, activity.STATUS_STYLE["working"])]
+        style = activity.STATUS_STYLE["working" if phase == "working" else "blocked"]
+        return [(grid.clip(title, room - len(mark)), "bold"), (mark, style)]
     return [(grid.clip(title, room), "bold")]
 
 

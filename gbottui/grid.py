@@ -1,6 +1,6 @@
 """Wrapping and laying out the transcript and the composer."""
 
-from . import markdown, transcript, widgets
+from . import cards, markdown, transcript, widgets
 
 
 def clip(text, width):
@@ -247,6 +247,21 @@ def card_lines(entry, width):
     return lines
 
 
+def request_rows(asked, width):
+    """Rows of a secret, 1Password or form card: (kind, text), the state line last.
+
+    The body is neutral and only the state line takes the tone (green, yellow,
+    gray), so a settled card does not turn the whole thing green. No Markdown
+    here: an env name like GH_TOKEN_WORKFLOW is not emphasis.
+    """
+    room = max(width - 2, 1)
+    rows = []
+    for part in asked["body"].split("\n"):
+        rows.extend(("card-info", line) for line in wrap(part, room))
+    rows.extend((asked["tone"], line) for line in wrap(asked["state"], room))
+    return rows
+
+
 def transcript_rows(entries, width, picks=None, card=None):
     rows = []
     user_w = max(width - 8, 1)
@@ -260,8 +275,14 @@ def transcript_rows(entries, width, picks=None, card=None):
     # A single open question is numbered, and only that one.
     current = found[0]["entry"] if found and not paged else None
     hidden = transcript.hidden_status_ids(entries)
-    for entry in entries:
+    asked_views = cards.views(entries)
+    for entry, asked in zip(entries, asked_views):
         if isinstance(entry, dict) and transcript._row_key(entry) in hidden:
+            continue
+        if asked:
+            if rows:
+                rows.append(("gap", ""))
+            rows.extend(request_rows(asked, width))
             continue
         lines = card_lines(entry, width)
         if id(entry) in paged_ids:
