@@ -230,14 +230,19 @@ def environment(home, herdr=None, **mock):
 class Run:
     """One app process in its own HOME. Scenarios share it and run in order."""
 
-    def __init__(self, *argv, rows=24, cols=80, herdr=None, seen=None, **mock):
+    def __init__(self, *argv, rows=24, cols=80, herdr=None, seen=None, sections=None, **mock):
         self.home = tempfile.mkdtemp(prefix="gbot-e2e-")
-        if seen:
-            # The cursors the app saved on an earlier run: a bot whose newest reply is after it is unread.
+        if seen or sections:
             folder = os.path.join(self.home, ".cache", "gbot-tui")
             os.makedirs(folder)
+        if seen:
+            # The cursors the app saved on an earlier run: a bot whose newest reply is after it is unread.
             with open(os.path.join(folder, "seen.json"), "w", encoding="utf-8") as handle:
                 json.dump(seen, handle)
+        if sections:
+            # The sections the app saved on an earlier run. The e2e has no backend token, so this is all it gets.
+            with open(os.path.join(folder, "sections.json"), "w", encoding="utf-8") as handle:
+                json.dump(sections, handle)
         self.env = environment(self.home, herdr=herdr, **mock)
         self.term = Term([sys.executable, APP, *argv], self.env, rows, cols)
 
@@ -1304,7 +1309,72 @@ def mouse_flow():
         run.close()
 
 
-FLOWS = {"media": media_flow, "cards": cards_flow, "paged": paged_flow, "main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow, "unread": unread_flow, "markread": markread_flow, "mouse": mouse_flow}
+def sections_flow():
+    """Sidebar sections from the cache: dim headers, no selection on them, enter opens the bot below."""
+    layout = {
+        "pinned": [],
+        "sections": [
+            {"id": "section-e2e-1", "name": "Projects", "agent_ids": ["a3"]},
+            {"id": "section-e2e-2", "name": "Empty", "agent_ids": ["nobody"]},
+            {"id": "section-e2e-3", "name": "Home", "agent_ids": ["a2"]},
+        ],
+    }
+    run = Run(sections=layout)
+    try:
+        def rows_of(lines):
+            return [line.strip() for line in lines[2:12] if line.strip()]
+
+        def headers(t):
+            t.wait(has("Grok bots", "Projects", "Home", "other"), timeout=10)
+            t.wait(has("Chef", "Travel Agent", "Researcher"))
+            body = rows_of(t.lines())
+            order = [next(word for word in ("Projects", "Home", "other", "Chef", "Travel Agent", "Researcher", "Empty") if word in row) for row in body[:6]]
+            assert order == ["Projects", "Chef", "Home", "Travel Agent", "other", "Researcher"], order
+            assert not any("Empty" in row for row in body), "an empty section showed a header"
+            # The highlight is on the bot under the first header, never on the header.
+            assert "→" in row_with(t.lines(), "Chef"), row_with(t.lines(), "Chef")
+            assert "→" not in row_with(t.lines(), "Projects")
+            dump("49_sections_headers", t)
+
+        ok = scenario("49_sections_headers", run.term, headers)
+
+        def down_skips(t):
+            t.send(DOWN)
+            t.wait(lambda lines: "→" in row_with(lines, "Travel Agent"))
+            assert "→" not in row_with(t.lines(), "Home")
+            t.send(UP)
+            t.wait(lambda lines: "→" in row_with(lines, "Chef"))
+
+        ok &= scenario("49_sections_arrows_skip_headers", run.term, down_skips)
+
+        def search(t):
+            t.send("trav")
+            t.wait(has("/trav"))
+            t.wait(lacks("Chef", "other"))
+            row = row_with(t.lines(), "Travel Agent")
+            assert row.rstrip().endswith("Home"), row
+            assert not any(line.strip() == "Home" for line in t.lines()), "a header showed during a search"
+            dump("49_sections_search", t)
+            t.send(ESC)
+            t.wait(has("Projects", "other"))
+
+        ok &= scenario("49_sections_search", run.term, search)
+
+        def open_first(t):
+            t.send("\r")
+            t.wait(has("Chef", "earlier reply", "Add a follow-up"), timeout=10)
+            t.send(ESC)
+            t.wait(has("Projects", "Home", "other"), timeout=10)
+            t.send(DOWN + DOWN + "\r")
+            t.wait(has("Researcher", "earlier reply", "Add a follow-up"), timeout=10)
+
+        ok &= scenario("49_sections_enter_opens_bot_below_header", run.term, open_first)
+    finally:
+        run.close()
+    return ok
+
+
+FLOWS = {"sections": sections_flow, "media": media_flow, "cards": cards_flow, "paged": paged_flow, "main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow, "unread": unread_flow, "markread": markread_flow, "mouse": mouse_flow}
 
 
 def main():

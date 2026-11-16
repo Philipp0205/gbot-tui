@@ -18,6 +18,10 @@ def roster_path():
     return os.path.join(cache_dir(), "roster.json")
 
 
+def sections_path():
+    return os.path.join(cache_dir(), "sections.json")
+
+
 def file_sig(path):
     """(inode, mtime_ns, size) of a file, or None when it is not there.
 
