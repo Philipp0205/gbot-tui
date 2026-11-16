@@ -3169,6 +3169,43 @@ class OverviewTests(unittest.TestCase):
         views, _error = activity.build_overview(bots, lambda bot: second)
         self.assertEqual(views[0]["activity"]["state"], "idle")
 
+    def test_mark_read_moves_the_cursor_clears_unread_and_keeps_the_state(self):
+        calls = []
+        real = backend.mark_read_later
+        backend.mark_read_later = calls.append
+        try:
+            bot = {"id": "a1", "name": "Researcher"}
+            # No cursor or activity yet: nothing to do.
+            self.assertFalse(activity.mark_read(bot))
+            self.assertEqual(calls, [])
+            self.assertEqual(activity.lookup_seen(bot), "")
+            self.assertIsNone(activity.lookup_activity(bot))
+
+            activity.remember_seen("Researcher", "a1", "m1")
+            activity.store_activity(
+                bot, {"state": "unread", "unread": 3, "cursor": "m4", "preview": "out", "latest": 7}
+            )
+            view = activity.with_activity([bot])[0]
+            self.assertEqual(view["activity"]["unread"], 3)
+            self.assertTrue(activity.mark_read(view))
+            self.assertEqual(calls, ["a1"])
+            self.assertEqual(activity.lookup_seen(bot), "m4")
+            snap = activity.lookup_activity(bot)
+            self.assertEqual(snap["unread"], 0)
+            self.assertEqual(snap["state"], "idle")
+            self.assertEqual((snap["cursor"], snap["preview"], snap["latest"]), ("m4", "out", 7))
+            self.assertEqual(activity.status_label(snap["state"], snap["unread"]), "idle")
+
+            # needs you and working stay as they are; only the count clears.
+            for state in ("blocked", "working"):
+                activity.store_activity(bot, {"state": state, "unread": 2, "cursor": "m5"})
+                self.assertTrue(activity.mark_read(bot))
+                snap = activity.lookup_activity(bot)
+                self.assertEqual((snap["state"], snap["unread"]), (state, 0))
+                self.assertEqual(activity.lookup_seen(bot), "m5")
+        finally:
+            backend.mark_read_later = real
+
     def test_list_previews_share_a_column(self):
         def bot(name, preview):
             return {

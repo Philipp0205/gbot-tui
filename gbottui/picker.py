@@ -250,7 +250,7 @@ class Loader:
             return self.ready, self.result, self.error
 
 
-LIST_HINT = "type to search · enter open · ctrl-r refresh · ctrl-c quit · ? keys"
+LIST_HINT = "type to search · enter open · ctrl-r refresh · ^X read · ctrl-c quit · ? keys"
 LIST_HELP = [
     ("type", "search names, titles and previews"),
     ("backspace", "delete a search letter"),
@@ -258,6 +258,7 @@ LIST_HELP = [
     ("enter", "open the bot"),
     ("esc", "clear the search"),
     ("ctrl-r", "scan every bot again"),
+    ("ctrl-x", "mark the highlighted bot read, without opening it"),
     ("ctrl-c ctrl-d", "quit"),
     ("? f1", "this help (? types when searching)"),
 ]
@@ -410,6 +411,13 @@ def pick(stdscr, bots, refresh=None):
                 continue
             if key == "\x12":
                 survey.nudge()
+                continue
+            if key == "\x18":
+                # Read without opening. The highlight stays on this bot.
+                if shown:
+                    activity.mark_read(shown[selected])
+                    moved = True
+                    chosen = shown[selected]["name"]
                 continue
             if key in ("\x1b", 27):
                 query = ""

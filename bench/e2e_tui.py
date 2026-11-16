@@ -1110,7 +1110,32 @@ def paged_flow():
     return ok
 
 
-FLOWS = {"paged": paged_flow, "main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow, "unread": unread_flow}
+def markread_flow():
+    """Ctrl-X on an unread row clears its label in place, without opening the chat."""
+    run = Run(seen={"id:a3": "m29", "name:Chef": "m29"}, MOCK_REPLY="0.4", MOCK_THREAD_ID="session")
+    try:
+        def read_in_place(t):
+            t.wait(lambda lines: row_state(lines, "Chef") == "unread", timeout=10)
+            t.wait(has("1 unread"))
+            t.send(DOWN * 2)
+            t.settle(0.3)
+            dump("41_markread_before", t)
+            t.send("\x18")
+            t.wait(lambda lines: row_state(lines, "Chef") == "idle", timeout=1.5)
+            assert "unread" not in row_with(t.lines(), "Chef"), row_with(t.lines(), "Chef")
+            assert not any("unread" in line for line in t.lines()), "an unread label is still shown"
+            # Still the list, and the highlight is still on Chef: Enter opens it.
+            assert has("Grok bots", "Researcher")(t.lines()), "left the list"
+            dump("41_markread_after", t)
+            t.send("\r")
+            t.wait(has("Chef", "earlier reply", "Add a follow-up"))
+
+        return scenario("41_markread_in_the_list", run.term, read_in_place)
+    finally:
+        run.close()
+
+
+FLOWS = {"paged": paged_flow, "main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow, "unread": unread_flow, "markread": markread_flow}
 
 
 def main():
