@@ -4379,6 +4379,121 @@ class ListHelpTests(unittest.TestCase):
         self.assertNotIn("/x", drawn[2])
 
 
+class MouseToggleTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = terminal.MOUSE
+        self.masks = []
+        self.mousemask = curses.mousemask
+        curses.mousemask = lambda mask: self.masks.append(mask)
+
+    def tearDown(self):
+        curses.mousemask = self.mousemask
+        terminal.MOUSE = self.saved
+
+    def test_toggle_flips_the_shared_flag_and_the_mask(self):
+        terminal.set_mouse(True)
+        self.assertTrue(terminal.MOUSE)
+        self.assertNotEqual(self.masks[-1], 0)
+        self.assertFalse(terminal.toggle_mouse())
+        self.assertEqual(self.masks[-1], 0)
+        self.assertTrue(terminal.toggle_mouse())
+        self.assertNotEqual(self.masks[-1], 0)
+
+    def test_enable_wheel_respects_the_flag(self):
+        terminal.set_mouse(False)
+        terminal.enable_wheel()
+        self.assertEqual(self.masks[-1], 0)
+        terminal.set_mouse(True)
+        terminal.enable_wheel()
+        self.assertNotEqual(self.masks[-1], 0)
+
+    def test_env_sets_the_start_state(self):
+        self.assertTrue(terminal.mouse_default({}))
+        self.assertTrue(terminal.mouse_default({"GBOT_TUI_MOUSE": "1"}))
+        self.assertTrue(terminal.mouse_default({"GBOT_TUI_MOUSE": ""}))
+        self.assertFalse(terminal.mouse_default({"GBOT_TUI_MOUSE": "0"}))
+        self.assertFalse(terminal.mouse_default({"GBOT_TUI_MOUSE": " 0 "}))
+
+    def test_the_select_hint_leads_the_line_only_while_off(self):
+        spans = [("enter send", "dim")]
+        terminal.set_mouse(True)
+        self.assertEqual(terminal.with_select_hint(spans), spans)
+        terminal.set_mouse(False)
+        shown = terminal.with_select_hint(spans)
+        self.assertTrue(shown[0][0].startswith("select mode · f2 mouse"))
+        self.assertEqual(shown[1:], spans)
+
+    def test_f2_in_the_chat_toggles_and_the_footer_says_so(self):
+        terminal.set_mouse(True)
+        chat = _search_chat(4)
+        screen = FakeScreen(12, 80)
+        chat_view.draw(screen, chat)
+        self.assertNotIn("select mode", " ".join(screen.rows[11]))
+        self.assertIsNone(chat_screen.chat_key(chat, curses.KEY_F2, None))
+        self.assertFalse(terminal.MOUSE)
+        self.assertEqual(chat.typed, "")
+        chat_view.draw(screen, chat)
+        self.assertTrue(" ".join(screen.rows[11]).lstrip().startswith("select mode · f2 mouse"))
+        chat_screen.chat_key(chat, curses.KEY_F2, None)
+        self.assertTrue(terminal.MOUSE)
+        chat_view.draw(screen, chat)
+        self.assertNotIn("select mode", " ".join(screen.rows[11]))
+
+    def test_the_list_toggles_with_f2_and_shows_the_hint(self):
+        drawn = []
+
+        class Screen(FakeScreen):
+            def __init__(self, keys):
+                super().__init__(24, 80)
+                self.keys = list(keys)
+
+            def timeout(self, _ms):
+                pass
+
+            def keypad(self, _on):
+                pass
+
+            def bkgd(self, *_args):
+                pass
+
+            def get_wch(self):
+                drawn.append(" ".join(self.rows.get(23, [])))
+                return self.keys.pop(0)
+
+        class Quiet:
+            def __init__(self, _bots):
+                pass
+
+            def status(self):
+                return False, 0, 0, 0
+
+            def problem(self):
+                return ""
+
+            def close(self):
+                pass
+
+        originals = (activity.Survey, picker.paint.fast_escape, picker.paint.place_cursor)
+        activity.Survey = Quiet
+        picker.paint.fast_escape = picker.paint.place_cursor = lambda *a: None
+        terminal.set_mouse(True)
+        try:
+            screen = Screen([curses.KEY_F2, curses.KEY_F2, "\r"])
+            self.assertEqual(picker.pick(screen, [{"name": "Chef"}]), "Chef")
+        finally:
+            activity.Survey, picker.paint.fast_escape, picker.paint.place_cursor = originals
+        self.assertNotIn("select mode", drawn[0])
+        self.assertIn("select mode · f2 mouse", drawn[1])
+        self.assertNotIn("select mode", drawn[2])
+        self.assertTrue(terminal.MOUSE)
+
+    def test_both_helps_list_f2_and_shift_drag(self):
+        for table in (chat_view.HELP, picker.LIST_HELP):
+            keys = dict(table)
+            self.assertEqual(keys["f2"], "mouse on/off: off lets a plain drag select text")
+            self.assertEqual(keys["shift+drag"], "select text while the mouse is on (most terminals)")
+
+
 def _views(**states):
     return [{"name": name, "activity": {"state": state}} for name, state in states.items()]
 

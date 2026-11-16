@@ -261,6 +261,8 @@ LIST_HELP = [
     ("ctrl-x", "mark the highlighted bot read, without opening it"),
     ("ctrl-c ctrl-d", "quit"),
     ("? f1", "this help (? types when searching)"),
+    ("f2", "mouse on/off: off lets a plain drag select text"),
+    ("shift+drag", "select text while the mouse is on (most terminals)"),
 ]
 
 
@@ -376,7 +378,7 @@ def pick(stdscr, bots, refresh=None):
                     spans = [(grid.clip(problem, max(width - 2, 0)), "red")]
                 else:
                     spans = [(LIST_HINT, "dim")]
-                paint.paint_spans(stdscr, height - 1, 1, spans)
+                paint.paint_spans(stdscr, height - 1, 1, terminal.with_select_hint(spans))
             stdscr.refresh()
             due = theme.theme_due_ms()
             wait = 30 if loader else (150 if running else 400)
@@ -402,6 +404,9 @@ def pick(stdscr, bots, refresh=None):
                 continue
             if key in ("\x03", "\x04"):
                 return None
+            if key == curses.KEY_F2:
+                terminal.toggle_mouse()
+                continue
             if showing_help:
                 # Any other key, Esc included, only closes the help.
                 showing_help = False

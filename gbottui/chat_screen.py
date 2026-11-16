@@ -386,6 +386,9 @@ def composer_key_press(chat, key, stdscr):
         return "quit"
     # The next key clears a notice; ctrl-o sets a new one below.
     chat.expire_notice(any_key=True)
+    if key == curses.KEY_F2:
+        terminal.toggle_mouse()
+        return None
     if getattr(chat, "help", False):
         # Any key closes the overlay. Esc closes it and stays in the chat;
         # a second `?` types one, so a message can still start with it.
