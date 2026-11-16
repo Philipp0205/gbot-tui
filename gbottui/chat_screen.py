@@ -649,6 +649,8 @@ def chat_loop(stdscr, chat):
                     chat.label = label
                     chat.avatar_color = chat.avatar_color or colors.bot_color(bot)
                     dirty = True
+            if chat.loaded:
+                chat.poll_running()
             if chat.expire_working():
                 dirty = True
             if chat.expire_notice():

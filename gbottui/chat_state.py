@@ -1,6 +1,7 @@
 """One chat's state: the transcript, the draft, the phase, and pending decisions."""
 
 import math
+import threading
 
 from . import activity, backend, cards, colors, draft, herdr, icons, mentions, roster, tabs, transcript, widgets
 
@@ -20,6 +21,8 @@ HISTORY_MAX = 800
 RETRY_DELAYS = (2.0, 4.0, 8.0, 15.0, 30.0)
 # A notice (copied, sent elsewhere) stays this long, or until the next key.
 NOTICE_SECONDS = 4.0
+# The open chat asks the server for its running flag at most this often.
+RUNNING_EVERY = 3.0
 
 
 class Chat:
@@ -96,6 +99,9 @@ class Chat:
         self.rows_rev = 0
         self.loaded = False
         self.idle_polls = 0
+        # The server running flag is read in the background: when, and whether one is out.
+        self.running_at = None
+        self.running_busy = False
         self.app_seen = herdr.APP
 
     def show_cached(self, entries):
@@ -393,11 +399,60 @@ class Chat:
             return False
         return now - self.content_at >= activity.quiet_limit(self.messages)
 
+    def running_flag(self):
+        """The server's running flag for this bot: True, False, or None when unknown."""
+        return backend.running_flag(self.list_id())
+
+    def poll_running(self):
+        """Refresh the flag in the background, at most every RUNNING_EVERY seconds.
+
+        Never blocks the caller. True when a refresh was started.
+        """
+        ident = self.list_id()
+        now = activity.clock()
+        if not ident or self.running_busy:
+            return False
+        if self.running_at is not None and 0 <= now - self.running_at < RUNNING_EVERY:
+            return False
+        self.running_at = now
+        self.running_busy = True
+
+        def run():
+            try:
+                backend.refresh_running(ident)
+            finally:
+                self.running_busy = False
+
+        threading.Thread(target=run, daemon=True).start()
+        return True
+
+    def sent_now(self):
+        """A send or an answer starts a turn the last flag knows nothing about.
+
+        The flag is unknown until a read at least RUNNING_EVERY seconds later.
+        """
+        backend.clear_running(self.list_id())
+        self.running_at = activity.clock()
+
     def content_expired(self):
-        return self.phase == "working" and self.quiet_for()
+        if self.phase != "working":
+            return False
+        flag = self.running_flag()
+        if flag is not None:
+            return flag is False
+        return self.quiet_for()
 
     def settle_working(self, phase):
-        """Keep a live reply in `working`, and give up when nothing changes."""
+        """Keep a live reply in `working`, and give up when nothing changes.
+
+        The server's running flag wins when it is known: True keeps `working`
+        with no quiet limit (a card that needs you still blocks), False ends it.
+        """
+        flag = self.running_flag()
+        if flag is True and phase != "blocked" and not transcript.needs_user(self.messages):
+            return "working"
+        if flag is False:
+            return "idle" if phase == "working" else phase
         if phase == "done" and activity.entry_in_progress(self.messages):
             phase = "working"
         # A turn whose last line is the user's gives up after WORKING_TIMEOUT.
@@ -449,6 +504,7 @@ class Chat:
         self.quiet = 0
         self.touch_rows()
         self.note_content()
+        self.sent_now()
         self.note("working")
         self.sync_activity()
         return (self.target, self.choice_agent_id(), entry_id, text)
@@ -765,6 +821,7 @@ class Chat:
         self.follow = True
         self.messages.append({"role": "user", "text": text, "local": True})
         self.note_content()
+        self.sent_now()
         self.note("working")
         self.sync_activity()
         return text

@@ -10,6 +10,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest import mock
 
 from gbottui import (
     activity,
@@ -3782,6 +3783,142 @@ class WorkingLivenessTests(unittest.TestCase):
             self.assertEqual(chat.phase, "idle")
 
 
+class RunningFlagChatTests(unittest.TestCase):
+    """The server's running flag decides `working` when it is known."""
+
+    Clock = WorkingLivenessTests.Clock
+
+    def setUp(self):
+        backend.SERVER.clear()
+        self.addCleanup(backend.SERVER.clear)
+
+    @staticmethod
+    def page(entries):
+        return WorkingLivenessTests.page(entries)
+
+    def set_flag(self, flag):
+        backend.SERVER["a2"] = {"unread": 0, "latest": 1, "running": flag}
+
+    def sent(self):
+        return [
+            {"id": "m1", "role": "assistant", "text": "hi"},
+            {"id": "m2", "role": "user", "text": "go"},
+        ]
+
+    def quiet(self):
+        return transcript.parse_thread({"transcript": {"entries": []}, "cursor": "m2"})
+
+    def test_true_has_no_quiet_timeout(self):
+        with self.Clock(0) as clock:
+            chat = chat_state.Chat("Chef")
+            self.set_flag(True)
+            chat.ingest(self.page(self.sent()), first=True)
+            self.assertEqual(chat.phase, "working")
+            clock.at = activity.WORKING_LIVE_TIMEOUT * 3
+            self.assertFalse(chat.expire_working())
+            chat.ingest(self.quiet())
+            self.assertEqual(chat.phase, "working")
+            self.assertEqual(chat.settle_working("done"), "working")
+            self.assertEqual(chat.settle_working("idle"), "working")
+            self.assertEqual(chat.settle_working("blocked"), "blocked")
+
+    def test_true_does_not_override_a_card_that_needs_you(self):
+        ask = [
+            {"id": "m1", "role": "user", "text": "go"},
+            {
+                "id": "m2",
+                "kind": "send-message",
+                "message": {"type": "auto-review-approval", "approval": {"status": "pending", "requestId": "r1"}},
+            },
+        ]
+        with self.Clock(0):
+            chat = chat_state.Chat("Chef")
+            self.set_flag(True)
+            chat.ingest(self.page(ask), first=True)
+            self.assertEqual(chat.phase, "blocked")
+            self.assertEqual(chat.settle_working("blocked"), "blocked")
+
+    def test_false_ends_working_right_away(self):
+        with self.Clock(0) as clock:
+            chat = chat_state.Chat("Chef")
+            chat.ingest(self.page(self.sent()), first=True)
+            self.assertEqual(chat.phase, "working")
+            self.set_flag(False)
+            clock.at = 1
+            self.assertTrue(chat.expire_working())
+            self.assertEqual(chat.phase, "idle")
+            # A poll with no news does not bring it back.
+            chat.ingest(self.quiet())
+            self.assertEqual(chat.phase, "idle")
+            self.assertEqual(activity.lookup_activity({"name": "Chef", "id": "a2"})["state"], "idle")
+
+    def test_false_settle_maps_working_to_idle_and_keeps_done(self):
+        with self.Clock(0):
+            chat = chat_state.Chat("Chef")
+            chat.ingest(self.page(self.sent()), first=True)
+            self.set_flag(False)
+            self.assertEqual(chat.settle_working("working"), "idle")
+            self.assertEqual(chat.settle_working("done"), "done")
+            streaming = [
+                {"id": "m1", "role": "user", "text": "go"},
+                {"id": "m2", "role": "assistant", "text": "partial", "isStreaming": True},
+            ]
+            chat.messages = list(streaming)
+            self.assertEqual(chat.settle_working("idle"), "idle")
+
+    def test_none_keeps_the_old_timeouts(self):
+        with self.Clock(0) as clock:
+            chat = chat_state.Chat("Chef")
+            self.set_flag(None)
+            chat.ingest(self.page(self.sent()), first=True)
+            self.assertEqual(chat.phase, "working")
+            clock.at = activity.WORKING_TIMEOUT - 1
+            self.assertFalse(chat.expire_working())
+            clock.at = activity.WORKING_TIMEOUT
+            self.assertTrue(chat.expire_working())
+            self.assertEqual(chat.phase, "idle")
+
+    def test_poll_running_is_background_and_rate_limited(self):
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def refresh(ident):
+            calls.append(ident)
+            started.set()
+            release.wait(5)
+
+        with self.Clock(100) as clock, mock.patch.object(backend, "refresh_running", refresh):
+            chat = chat_state.Chat("Chef")
+            chat.session_id = "a2"
+            self.assertTrue(chat.poll_running())
+            self.assertTrue(started.wait(5))
+            # One is out, so no second call, even after the interval.
+            clock.at = 200
+            self.assertFalse(chat.poll_running())
+            release.set()
+            for _ in range(200):
+                if not chat.running_busy:
+                    break
+                time.sleep(0.01)
+            self.assertFalse(chat.running_busy)
+            # The interval counts from the start of the last call (100), so this one is due.
+            self.assertTrue(chat.poll_running())
+            for _ in range(200):
+                if not chat.running_busy:
+                    break
+                time.sleep(0.01)
+            clock.at = 200 + chat_state.RUNNING_EVERY - 0.5
+            self.assertFalse(chat.poll_running())
+            clock.at = 200 + chat_state.RUNNING_EVERY
+            self.assertTrue(chat.poll_running())
+            for _ in range(200):
+                if not chat.running_busy:
+                    break
+                time.sleep(0.01)
+        self.assertEqual(calls, ["a2", "a2", "a2"])
+
+
 class ServerStateTests(unittest.TestCase):
     def test_statuses_give_unread_and_latest(self):
         client = b"\x18\x02" + b"\x20" + backend._varint(1793864041547)
@@ -3789,8 +3926,121 @@ class ServerStateTests(unittest.TestCase):
         data = b"\x0a" + backend._varint(len(status)) + status
         self.assertEqual(
             backend.parse_agent_statuses(data),
-            {"abc": {"unread": 2, "latest": 1793864041547}},
+            {"abc": {"unread": 2, "latest": 1793864041547, "running": False}},
         )
+
+    @staticmethod
+    def status(agent, live=b"", flag=None, client=b""):
+        body = _pb(1, agent.encode())
+        if live is not None and live != b"":
+            body += _pb(2, live)
+        if client:
+            body += _pb(3, client)
+        if flag is not None:
+            body += backend._varint(4 << 3) + bytes([1 if flag else 0])
+        return _pb(1, body)
+
+    @staticmethod
+    def live(**fields):
+        numbers = {"is_running": 2, "composing": 3, "retrying": 4, "subagents": 13}
+        data = b""
+        for name, value in fields.items():
+            if name == "updated":
+                data += backend._varint(7 << 3) + backend._varint(value)
+            elif name == "stale_after":
+                data += backend._varint(8 << 3) + backend._varint(value)
+            else:
+                data += backend._varint(numbers[name] << 3) + bytes([1 if value else 0])
+        return data
+
+    def running(self, data, now_ms=1_000_000):
+        return backend.parse_agent_statuses(data, now_ms)["abc"]["running"]
+
+    def test_running_from_status_field_four(self):
+        self.assertIs(self.running(self.status("abc", flag=True)), True)
+
+    def test_running_from_live_flags(self):
+        for name in ("is_running", "composing", "retrying", "subagents"):
+            with self.subTest(name):
+                self.assertIs(self.running(self.status("abc", live=self.live(**{name: True}))), True)
+
+    def test_running_false_when_nothing_is_set(self):
+        self.assertIs(self.running(self.status("abc", flag=False)), False)
+        self.assertIs(self.running(self.status("abc", live=self.live(is_running=False, composing=False))), False)
+        self.assertIs(self.running(self.status("abc")), False)
+
+    def test_running_unknown_when_live_state_is_stale(self):
+        stale = self.live(is_running=True, updated=1000, stale_after=500)
+        self.assertIsNone(self.running(self.status("abc", live=stale), now_ms=1501))
+        # Inside the window it still counts, and field 4 wins over a stale live state.
+        self.assertIs(self.running(self.status("abc", live=stale), now_ms=1500), True)
+        self.assertIs(self.running(self.status("abc", live=stale, flag=True), now_ms=9999), True)
+        # No stale_after means the state never goes stale.
+        self.assertIs(self.running(self.status("abc", live=self.live(is_running=True, updated=1000)), now_ms=9999), True)
+
+    def test_running_flag_reads_server(self):
+        backend.SERVER.clear()
+        backend.SERVER.update(
+            {
+                "t": {"unread": 0, "latest": 1, "running": True},
+                "f": {"unread": 0, "latest": 1, "running": False},
+                "n": {"unread": 0, "latest": 1, "running": None},
+                "o": {"unread": 0, "latest": 1},
+            }
+        )
+        try:
+            self.assertEqual(
+                [backend.running_flag(i) for i in ("t", "f", "n", "o", "missing")],
+                [True, False, None, None, None],
+            )
+        finally:
+            backend.SERVER.clear()
+
+    def test_refresh_running_updates_one_agent_and_swallows_errors(self):
+        backend.SERVER.clear()
+        backend.SERVER["abc"] = {"unread": 0, "latest": 7, "running": None}
+        calls = []
+
+        def answer(method, body):
+            calls.append((method, body))
+            return self.status("abc", flag=True, client=b"\x18\x05")
+
+        try:
+            with mock.patch.object(backend, "backend_call", answer):
+                backend.refresh_running("abc")
+            self.assertEqual(calls, [("ListGrokBotAgentStatuses", b"\x0a\x03abc")])
+            self.assertIs(backend.running_flag("abc"), True)
+            # Unread stays what the list holds, the flag alone moves.
+            self.assertEqual(backend.SERVER["abc"]["unread"], 0)
+
+            def broken(method, body):
+                raise gbot_cli.GbotError("no Cursor token")
+
+            with mock.patch.object(backend, "backend_call", broken):
+                backend.refresh_running("abc")
+            self.assertIsNone(backend.running_flag("abc"))
+            with mock.patch.object(backend, "backend_call", lambda m, b: b"\x0a\x05"):
+                backend.refresh_running("abc")
+        finally:
+            backend.SERVER.clear()
+
+    def with_flag(self, flag, snap):
+        bot = {"id": "w1", "name": "Wflag"}
+        backend.SERVER.clear()
+        backend.SERVER["w1"] = {"unread": snap.get("server_unread", 0), "latest": 5, "running": flag}
+        self.addCleanup(backend.SERVER.clear)
+        activity.store_activity(bot, {"state": snap["state"], "cursor": "c", "preview": "", "unread": 0})
+        return activity.with_activity([bot])[0]["activity"]["state"]
+
+    def test_with_activity_follows_server_running_flag(self):
+        self.assertEqual(self.with_flag(True, {"state": "idle"}), "working")
+        self.assertEqual(self.with_flag(True, {"state": "idle", "server_unread": 2}), "working")
+        self.assertEqual(self.with_flag(True, {"state": "blocked"}), "blocked")
+        self.assertEqual(self.with_flag(False, {"state": "working"}), "idle")
+        self.assertEqual(self.with_flag(False, {"state": "working", "server_unread": 2}), "unread")
+        self.assertEqual(self.with_flag(False, {"state": "blocked"}), "blocked")
+        self.assertEqual(self.with_flag(None, {"state": "working"}), "working")
+        self.assertEqual(self.with_flag(None, {"state": "idle"}), "idle")
 
     def test_server_state_sorts_and_counts(self):
         backend.SERVER.clear()

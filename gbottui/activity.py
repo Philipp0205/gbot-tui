@@ -487,6 +487,11 @@ def with_activity(bots):
                     snap["state"] = "unread"
                 elif snap.get("state") == "unread":
                     snap["state"] = "idle"
+                running = server.get("running")
+                if running is True:
+                    snap["state"] = "working"
+                elif running is False and snap.get("state") == "working":
+                    snap["state"] = "unread" if server["unread"] else "idle"
         if snap:
             view["activity"] = snap
         views.append(view)

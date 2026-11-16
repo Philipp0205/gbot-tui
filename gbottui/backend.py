@@ -33,7 +33,8 @@ TOKEN_JS = (
     'const a=JSON.parse(s["cursor-accounts"]);const n=a.accounts[a.active];'
     'process.stdout.write(d(n["cursor-access-token"]))'
 )
-# Per-agent read state the desktop app keeps on the server: id -> {"unread", "latest"}.
+# Per-agent state the desktop app keeps on the server: id -> {"unread", "latest", "running"}.
+# "running" is True, False, or None (unknown).
 SERVER = {}
 
 
@@ -118,14 +119,37 @@ def backend_call(method, body, timeout=15):
         raise gbot_cli.GbotError(str(error)) from error
 
 
-def parse_agent_statuses(data):
+def _running_of(status_flag, live, now_ms):
+    """True / False / None (unknown) from a status message and its live state."""
+    if status_flag:
+        return True
+    state = dict(_proto_fields(live))
+    updated = state.get(7)
+    stale_after = state.get(8)
+    if (
+        isinstance(updated, int)
+        and isinstance(stale_after, int)
+        and updated
+        and stale_after > 0
+        and now_ms > updated + stale_after
+    ):
+        return None
+    return any(bool(state.get(number)) for number in (2, 3, 4, 13))
+
+
+def parse_agent_statuses(data, now_ms=None):
+    """id -> {"unread", "latest", "running"}. `running` is True, False, or None when unknown."""
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
     found = {}
     for field, status in _proto_fields(data):
         if field != 1 or not isinstance(status, bytes):
             continue
         parts = _proto_fields(status)
         ids = [v for f, v in parts if f == 1 and isinstance(v, bytes)]
+        live = next((v for f, v in parts if f == 2 and isinstance(v, bytes)), b"")
         client = next((v for f, v in parts if f == 3 and isinstance(v, bytes)), b"")
+        flag = next((v for f, v in parts if f == 4 and isinstance(v, int)), 0)
         if not ids:
             continue
         state = dict(_proto_fields(client))
@@ -134,6 +158,7 @@ def parse_agent_statuses(data):
         found[ids[0].decode("utf-8", "replace")] = {
             "unread": unread if isinstance(unread, int) else 0,
             "latest": latest if isinstance(latest, int) else 0,
+            "running": _running_of(bool(flag), live, now_ms),
         }
     return found
 
@@ -269,6 +294,42 @@ def refresh_server_state(bots):
         return
     with activity.STATE_LOCK:
         SERVER.update(found)
+
+
+def running_flag(agent_id):
+    """The server's running flag for one agent: True, False, or None when unknown."""
+    with activity.STATE_LOCK:
+        known = SERVER.get(agent_id or "")
+        return known.get("running") if known else None
+
+
+def refresh_running(agent_id):
+    """Read-only. Ask for one agent's status and store it. Best effort, like refresh_server_state.
+
+    A failed call makes the flag unknown (None), so an old True or False never sticks.
+    """
+    if not isinstance(agent_id, str) or not agent_id:
+        return
+    body = b"\x0a" + _varint(len(agent_id.encode())) + agent_id.encode()
+    try:
+        found = parse_agent_statuses(backend_call("ListGrokBotAgentStatuses", body))
+    except (gbot_cli.GbotError, ValueError, IndexError):
+        found = {}
+    with activity.STATE_LOCK:
+        if not found and agent_id in SERVER:
+            SERVER[agent_id]["running"] = None
+        for ident, state in found.items():
+            # The chat is open, so a bot not known yet starts read.
+            known = SERVER.setdefault(ident, {"unread": 0, "latest": state["latest"]})
+            known["running"] = state["running"]
+
+
+def clear_running(agent_id):
+    """Make one agent's running flag unknown. A send makes the last answer stale."""
+    with activity.STATE_LOCK:
+        known = SERVER.get(agent_id or "")
+        if known:
+            known["running"] = None
 
 
 def mark_read_later(agent_id):
