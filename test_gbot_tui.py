@@ -4753,21 +4753,83 @@ class EscapeSequenceTests(unittest.TestCase):
         ):
             self.assertEqual(paint.decode_keys(list(seq)), [key], seq)
 
-    def test_modified_arrows_use_the_terminfo_names(self):
+    def test_modified_arrows_are_word_jumps_without_terminfo(self):
+        # Whatever curses knows, a modified Left/Right is a word motion.
         original = curses.keyname
-        names = {601: b"kLFT5", 602: b"kRIT3"}
-        curses.keyname = lambda key: names.get(key, b"KEY_OTHER")
+        curses.keyname = lambda key: b"KEY_OTHER"
         paint._NAMED = None
         try:
-            keys = paint.decode_keys(list("\x1b[1;5D\x1b[1;3C\x1b[1;7Z"))
-            self.assertEqual(keys, [601, 602])
-            self.assertIs(chat_screen.edit_motion(keys[0]), draft.word_left)
-            self.assertIs(chat_screen.edit_motion(keys[1]), draft.word_right)
-            # A modifier terminfo has no name for is the plain arrow.
-            self.assertEqual(paint.decode_keys(list("\x1b[1;2D")), [curses.KEY_LEFT])
+            for left, right in (
+                ("\x1b[1;5D", "\x1b[1;5C"),  # ctrl
+                ("\x1b[1;3D", "\x1b[1;3C"),  # alt
+                ("\x1b[1;7D", "\x1b[1;7C"),  # ctrl+alt
+                ("\x1b[1;6D", "\x1b[1;6C"),  # ctrl+shift
+                ("\x1b[1;9D", "\x1b[1;9C"),  # meta
+                ("\x1b[5D", "\x1b[5C"),
+                ("\x1bO5D", "\x1bO5C"),
+                ("\x1bOd", "\x1bOc"),  # rxvt ctrl
+                ("\x1bb", "\x1bf"),  # readline alt-b / alt-f
+            ):
+                self.assertEqual(paint.decode_keys(list(left)), [paint.WORD_LEFT], left)
+                self.assertEqual(paint.decode_keys(list(right)), [paint.WORD_RIGHT], right)
+            self.assertEqual(paint.decode_keys(list("a\x1b[1;5Db")), ["a", paint.WORD_LEFT, "b"])
+            # Shift alone, unmodified arrows, and the vertical and Home/End keys keep their meaning.
+            self.assertEqual(paint.decode_keys(list("\x1b[1;2D\x1b[1;2C")), [curses.KEY_LEFT, curses.KEY_RIGHT])
+            self.assertEqual(paint.decode_keys(list("\x1b[1D\x1b[1C\x1bOD\x1bOC")), [curses.KEY_LEFT, curses.KEY_RIGHT] * 2)
+            self.assertEqual(paint.decode_keys(list("\x1b[1;5A\x1b[1;5B\x1b[1;5H\x1b[1;5F")), [curses.KEY_UP, curses.KEY_DOWN, curses.KEY_HOME, curses.KEY_END])
+            # Other Alt-letters are still dropped.
+            self.assertEqual(paint.decode_keys(list("\x1bx\x1bB")), [])
         finally:
             curses.keyname = original
             paint._NAMED = None
+
+    def test_alt_b_and_f_split_across_reads(self):
+        screen = _KeyFeed(["b"])
+        self.assertEqual(paint.decode_keys(["\x1b"], paint.follow_up(screen, 0)), [paint.WORD_LEFT])
+
+    def test_edit_motion_maps_the_word_values_and_terminfo_names(self):
+        self.assertIs(chat_screen.edit_motion(paint.WORD_LEFT), draft.word_left)
+        self.assertIs(chat_screen.edit_motion(paint.WORD_RIGHT), draft.word_right)
+        original = curses.keyname
+        names = {601: b"kLFT5", 602: b"kRIT3", 603: b"kLFT7", 604: b"kRIT6", 605: b"kLFT2", 606: b"kUP5"}
+        curses.keyname = lambda key: names.get(key, b"KEY_OTHER")
+        try:
+            self.assertIs(chat_screen.edit_motion(601), draft.word_left)
+            self.assertIs(chat_screen.edit_motion(602), draft.word_right)
+            self.assertIs(chat_screen.edit_motion(603), draft.word_left)
+            self.assertIs(chat_screen.edit_motion(604), draft.word_right)
+            self.assertIsNone(chat_screen.edit_motion(605))
+            self.assertIsNone(chat_screen.edit_motion(606))
+        finally:
+            curses.keyname = original
+
+    def test_word_values_move_the_cursor_and_do_not_confuse_other_readers(self):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, "alpha beta gamma")
+        _typed(chat, [paint.WORD_LEFT, paint.WORD_LEFT, "X"])
+        self.assertEqual(chat.typed, "alpha Xbeta gamma")
+        _typed(chat, [paint.WORD_RIGHT, "Y"])
+        self.assertEqual(chat.typed, "alpha XbetaY gamma")
+        # An empty composer does not turn a card page, and the search box ignores them.
+        empty = chat_state.Chat("Researcher")
+        self.assertIsNone(chat_screen.chat_key(empty, paint.WORD_LEFT, None))
+        self.assertEqual(empty.typed, "")
+        self.assertIsNone(terminal.page_motion(paint.WORD_RIGHT))
+        self.assertIsNone(terminal.wheel_direction(paint.WORD_RIGHT))
+
+    def test_modified_arrows_still_use_the_terminfo_names_from_curses(self):
+        # A key curses decoded itself (kLFT5 code) reaches the draft without the decoder.
+        original = curses.keyname
+        curses.keyname = lambda key: {601: b"kLFT5", 602: b"kRIT7"}.get(key, b"KEY_OTHER")
+        try:
+            chat = chat_state.Chat("Researcher")
+            _typed(chat, "say hello")
+            _typed(chat, [601])
+            self.assertEqual(chat.pos, 4)
+            _typed(chat, [602])
+            self.assertEqual(chat.pos, 9)
+        finally:
+            curses.keyname = original
 
     def test_a_lone_escape_stays_escape(self):
         self.assertEqual(paint.decode_keys(["\x1b"]), ["\x1b"])

@@ -194,15 +194,23 @@ EDIT_KEYS = {
     "\x15": draft.kill_line_start,
     "\x0b": draft.kill_line_end,
 }
-# Curses keys, and the terminfo names of the modified arrows.
+# Curses keys, and the decoder's own word jumps (paint.WORD_LEFT / WORD_RIGHT).
 CURSOR_KEYS = {
     curses.KEY_LEFT: draft.left,
     curses.KEY_RIGHT: draft.right,
     curses.KEY_HOME: draft.line_start,
     curses.KEY_END: draft.line_end,
     curses.KEY_DC: draft.delete,
+    paint.WORD_LEFT: draft.word_left,
+    paint.WORD_RIGHT: draft.word_right,
 }
-WORD_KEYS = {b"kLFT5": draft.word_left, b"kLFT3": draft.word_left, b"kRIT5": draft.word_right, b"kRIT3": draft.word_right}
+# Terminfo names curses may hand over for a modified arrow: kLFT5 (ctrl), kLFT3 (alt),
+# kLFT7 (ctrl+alt) and so on. The decoder turns the raw sequences into WORD_LEFT / WORD_RIGHT
+# first, so these only matter when curses decoded the key itself. Modifier 2 is Shift alone.
+WORD_KEYS = {}
+for _mod in range(paint.WORD_MODIFIER_MIN, 17):
+    WORD_KEYS[f"kLFT{_mod}".encode()] = draft.word_left
+    WORD_KEYS[f"kRIT{_mod}".encode()] = draft.word_right
 
 
 def edit_motion(key):

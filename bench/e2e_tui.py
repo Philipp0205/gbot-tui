@@ -737,6 +737,57 @@ def compose_flow():
     return ok
 
 
+# (name, word left, word right) as terminals send them. The terminfo of screen and linux has none of the
+# modified arrows, so those only work when the app decodes the sequence itself.
+WORD_KEYS = (
+    ("ctrl", "\x1b[1;5D", "\x1b[1;5C"),
+    ("alt", "\x1b[1;3D", "\x1b[1;3C"),
+    ("ctrl_alt", "\x1b[1;7D", "\x1b[1;7C"),
+    ("ctrl_shift", "\x1b[1;6D", "\x1b[1;6C"),
+    ("meta", "\x1b[1;9D", "\x1b[1;9C"),
+    ("csi_5", "\x1b[5D", "\x1b[5C"),
+    ("ss3_5", "\x1bO5D", "\x1bO5C"),
+    ("rxvt_ctrl", "\x1bOd", "\x1bOc"),
+    ("readline_alt", "\x1bb", "\x1bf"),  # alt-b / alt-f, what macOS option-arrow sends
+)
+
+
+def words_flow():
+    """Word jumps in the draft with TERM values whose terminfo has no kLFT5 or kRIT5."""
+    ok = True
+    for term_name in ("xterm-256color", "screen", "linux"):
+        run = Run("Chef", TERM=term_name)
+        try:
+            run.term.wait(has("Chef", "earlier reply"), timeout=10)
+            run.term.settle(0.5)
+            for name, left, right in WORD_KEYS:
+
+                def jump(t, name=name, left=left, right=right):
+                    t.send("\x05\x15alpha beta gamma")
+                    t.wait(has("→  alpha beta gamma"))
+                    # Each key on its own, so a split read cannot hide a stray Esc.
+                    for key in (left, left, "X"):
+                        t.send(key)
+                        t.settle(0.08)
+                    try:
+                        t.wait(has("→  alpha Xbeta gamma"), timeout=3)
+                    except AssertionError:
+                        raise AssertionError(f"{name} left: draft is {composer_rows(t.lines())}, want alpha Xbeta gamma")
+                    for key in (right, "Y"):
+                        t.send(key)
+                        t.settle(0.08)
+                    try:
+                        t.wait(has("→  alpha XbetaY gamma"), timeout=3)
+                    except AssertionError:
+                        raise AssertionError(f"{name} right: draft is {composer_rows(t.lines())}, want alpha XbetaY gamma")
+                    assert any("Chef" in line for line in t.lines()[:2]), "left the chat"
+
+                ok &= scenario(f"50_words_{term_name}_{name}", run.term, jump)
+        finally:
+            run.close()
+    return ok
+
+
 def idle_flow():
     """A gateway that returns the --after entry again: header and footer still go idle."""
     run = Run("Chef", MOCK_INCLUSIVE=1)
@@ -1374,7 +1425,7 @@ def sections_flow():
     return ok
 
 
-FLOWS = {"sections": sections_flow, "media": media_flow, "cards": cards_flow, "paged": paged_flow, "main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow, "unread": unread_flow, "markread": markread_flow, "mouse": mouse_flow}
+FLOWS = {"sections": sections_flow, "media": media_flow, "cards": cards_flow, "paged": paged_flow, "main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "words": words_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow, "unread": unread_flow, "markread": markread_flow, "mouse": mouse_flow}
 
 
 def main():
