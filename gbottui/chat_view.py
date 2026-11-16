@@ -9,7 +9,7 @@ HELP = [
     ("enter", "send"),
     ("ctrl-j / ctrl-enter", "new line"),
     ("left right home end", "move in the draft"),
-    ("ctrl/alt-left right", "jump a word"),
+    ("ctrl/alt-left right", "jump a word (alt-b alt-f too)"),
     ("ctrl-a ctrl-e", "line start / end"),
     ("ctrl-w ctrl-u ctrl-k", "delete word / to start / to end"),
     ("up down", "draft rows, then sent history"),

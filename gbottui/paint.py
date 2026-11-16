@@ -150,6 +150,17 @@ ARROW_FINALS = {
     "F": (curses.KEY_END, "kEND"),
 }
 SS3_FUNCTION = {"P": 1, "Q": 2, "R": 3, "S": 4}
+# A word jump, whatever the terminal sent. Above the unicode range and curses' own
+# codes (terminfo extended keys start at KEY_MAX + 1), so nothing else uses them.
+WORD_LEFT = 0x110001
+WORD_RIGHT = 0x110002
+# Modifier 2 is Shift alone: that stays a plain arrow. Ctrl (5), Alt (3), Ctrl+Alt (7),
+# Ctrl+Shift (6), Meta (9) and the rest jump a word, with or without a terminfo code.
+WORD_MODIFIER_MIN = 3
+WORD_ARROWS = {"D": WORD_LEFT, "C": WORD_RIGHT}
+# rxvt sends Ctrl-Left/Right as ESC O d / ESC O c. Readline Alt-b / Alt-f (macOS Option-arrow).
+RXVT_WORD_FINALS = {"d": WORD_LEFT, "c": WORD_RIGHT}
+ALT_WORD_KEYS = {"b": WORD_LEFT, "f": WORD_RIGHT}
 TILDE_KEYS = {
     1: (curses.KEY_HOME, "kHOM"),
     2: (curses.KEY_IC, "kIC"),
@@ -193,6 +204,13 @@ def _csi_key(params, final, ss3=False):
     except ValueError:
         return None
     mod = numbers[1] if len(numbers) > 1 else (numbers[0] if ss3 and numbers else 1)
+    if final in WORD_ARROWS:
+        # ESC [ 1 ; 5 D, and ESC [ 5 D with the 1 left out.
+        word_mod = numbers[1] if len(numbers) > 1 else (numbers[0] if numbers else 1)
+        if word_mod >= WORD_MODIFIER_MIN:
+            return WORD_ARROWS[final]
+    if ss3 and final in RXVT_WORD_FINALS:
+        return RXVT_WORD_FINALS[final]
     if final in ARROW_FINALS:
         plain, name = ARROW_FINALS[final]
         return named_key(f"{name}{mod}", plain) if mod > 1 else plain
@@ -222,7 +240,8 @@ def decode_keys(keys, more=lambda: None):
 
     `more()` returns the next key within the escape delay, or None. Only an
     Esc with nothing after it stays "\x1b". An unknown sequence, or Esc and a
-    plain character (Alt-letter), is dropped instead of reading as Esc.
+    plain character (Alt-letter), is dropped instead of reading as Esc. The
+    exceptions are Alt-b / Alt-f and modified Left/Right, which are WORD_LEFT / WORD_RIGHT.
     """
     global PASTING
     queue = list(keys)
@@ -250,6 +269,10 @@ def decode_keys(keys, more=lambda: None):
             # Esc then a key curses decoded: the Esc was lone.
             out.append("\x1b")
             queue.insert(0, lead)
+            continue
+        if lead in ALT_WORD_KEYS:
+            # ESC b / ESC f: readline Alt-b / Alt-f. Other Alt-letters are dropped.
+            out.append(ALT_WORD_KEYS[lead])
             continue
         if lead not in ("[", "O"):
             continue
