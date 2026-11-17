@@ -743,7 +743,6 @@ WORD_KEYS = (
     ("ctrl", "\x1b[1;5D", "\x1b[1;5C"),
     ("alt", "\x1b[1;3D", "\x1b[1;3C"),
     ("ctrl_alt", "\x1b[1;7D", "\x1b[1;7C"),
-    ("ctrl_shift", "\x1b[1;6D", "\x1b[1;6C"),
     ("meta", "\x1b[1;9D", "\x1b[1;9C"),
     ("csi_5", "\x1b[5D", "\x1b[5C"),
     ("ss3_5", "\x1bO5D", "\x1bO5C"),
@@ -783,6 +782,119 @@ def words_flow():
                     assert any("Chef" in line for line in t.lines()[:2]), "left the chat"
 
                 ok &= scenario(f"50_words_{term_name}_{name}", run.term, jump)
+        finally:
+            run.close()
+    return ok
+
+
+SHIFT_LEFT, CTRL_SHIFT_LEFT, ALT_A, CTRL_O, CTRL_X = "\x1b[1;2D", "\x1b[1;6D", "\x1ba", "\x0f", "\x18"
+
+
+def draft_reads(t, want, what):
+    try:
+        t.wait(lambda lines: composer_rows(lines) == [want], timeout=3)
+    except AssertionError:
+        raise AssertionError(f"{what}: draft is {composer_rows(t.lines())}, want {want}")
+
+
+def selected_is(t, text):
+    """The reverse-video cells of some row read `text`: that is the selection."""
+    t.wait(lambda lines: text in reversed_text(t), timeout=3)
+
+
+def press_release(t, start, end):
+    """A left press at draft index `start` and a release at `end` (SGR mouse reports, 1-based)."""
+    top = next(i for i, line in enumerate(t.lines()) if line.startswith("┌")) + 2
+    for index, final in ((start, "M"), (end, "m")):
+        t.send(f"\x1b[<0;{6 + index};{top}{final}")
+        t.settle(0.1)
+
+
+def select_flow():
+    """Selecting in the draft, with TERM values whose terminfo has no kLFT2, kLFT6 or alt-a."""
+    ok = True
+    for term_name in ("xterm-256color", "screen"):
+        run = Run("Chef", TERM=term_name)
+        try:
+            run.term.wait(has("Chef", "earlier reply"), timeout=10)
+            run.term.settle(0.5)
+
+            def chars(t):
+                t.send("\x05\x15alpha beta gamma")
+                t.wait(has("→  alpha beta gamma"))
+                # Each key on its own, so a split read cannot hide a stray Esc.
+                for _ in range(5):
+                    t.send(SHIFT_LEFT)
+                    t.settle(0.08)
+                selected_is(t, "gamma")
+                t.send("X")
+                draft_reads(t, "→  alpha beta X", "shift-left x5, X")
+                assert any("Chef" in line for line in t.lines()[:2]), "left the chat"
+
+            ok &= scenario(f"51_select_chars_{term_name}", run.term, chars)
+
+            def words(t):
+                t.send("\x05\x15alpha beta gamma")
+                t.wait(has("→  alpha beta gamma"))
+                for _ in range(2):
+                    t.send(CTRL_SHIFT_LEFT)
+                    t.settle(0.08)
+                selected_is(t, "beta gamma")
+                t.send("\x7f")
+                draft_reads(t, "→  alpha", "ctrl+shift-left x2, backspace")
+                t.send("Z")
+                draft_reads(t, "→  alpha Z", "backspace took more than the selection")
+
+            ok &= scenario(f"51_select_words_{term_name}", run.term, words)
+
+            def everything(t):
+                t.send("\x05\x15alpha beta gamma")
+                t.wait(has("→  alpha beta gamma"))
+                t.send(ALT_A)
+                selected_is(t, "alpha beta gamma")
+                t.send("Q")
+                draft_reads(t, "→  Q", "alt-a, Q")
+                assert any("Chef" in line for line in t.lines()[:2]), "alt-a left the chat"
+
+            ok &= scenario(f"51_select_all_{term_name}", run.term, everything)
+
+            def copy_cut_esc(t):
+                t.send("\x05\x15alpha beta")
+                t.wait(has("→  alpha beta"))
+                for _ in range(4):
+                    t.send(SHIFT_LEFT)
+                    t.settle(0.08)
+                selected_is(t, "beta")
+                t.send(CTRL_O)
+                t.wait(has("Copied the selection (4 chars)."))
+                t.send(ESC)
+                t.wait(lambda lines: "beta" not in reversed_text(t), timeout=3)
+                draft_reads(t, "→  alpha beta", "esc changed the draft")
+                assert any("Chef" in line for line in t.lines()[:2]), "the first esc left the chat"
+                # The cursor stays where the selection ended, so go back to the end first.
+                t.send("\x05")
+                for _ in range(4):
+                    t.send(SHIFT_LEFT)
+                    t.settle(0.08)
+                t.send(CTRL_X)
+                draft_reads(t, "→  alpha", "ctrl-x")
+
+            ok &= scenario(f"51_select_copy_cut_esc_{term_name}", run.term, copy_cut_esc)
+
+            if term_name == "xterm-256color":
+
+                def mouse(t):
+                    t.send("\x05\x15alpha beta gamma")
+                    t.wait(has("→  alpha beta gamma"))
+                    press_release(t, 6, 10)
+                    selected_is(t, "beta")
+                    t.send("X")
+                    draft_reads(t, "→  alpha X gamma", "mouse press and release over beta")
+                    press_release(t, 0, 0)
+                    t.send("<")
+                    draft_reads(t, "→  <alpha X gamma", "a press places the cursor")
+
+                ok &= scenario(f"51_select_mouse_{term_name}", run.term, mouse)
         finally:
             run.close()
     return ok
@@ -1425,7 +1537,7 @@ def sections_flow():
     return ok
 
 
-FLOWS = {"sections": sections_flow, "media": media_flow, "cards": cards_flow, "paged": paged_flow, "main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "words": words_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow, "unread": unread_flow, "markread": markread_flow, "mouse": mouse_flow}
+FLOWS = {"sections": sections_flow, "media": media_flow, "cards": cards_flow, "paged": paged_flow, "main": main_flow, "error": error_flow, "loading": loading_flow, "compose": compose_flow, "words": words_flow, "select": select_flow, "idle": idle_flow, "polish": polish_flow, "offline": offline_flow, "bell": bell_flow, "history": history_flow, "herdr": herdr_flow, "unread": unread_flow, "markread": markread_flow, "mouse": mouse_flow}
 
 
 def main():

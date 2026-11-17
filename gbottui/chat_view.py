@@ -2,7 +2,7 @@
 
 import curses
 
-from . import colors, grid, markdown, paint, roster, styles, terminal, transcript, widgets
+from . import colors, draft, grid, markdown, paint, roster, styles, terminal, transcript, widgets
 
 LOADING = "Loading conversation…"
 HELP = [
@@ -11,21 +11,25 @@ HELP = [
     ("left right home end", "move in the draft"),
     ("ctrl/alt-left right", "jump a word (alt-b alt-f too)"),
     ("ctrl-a ctrl-e", "line start / end"),
-    ("ctrl-w ctrl-u ctrl-k", "delete word / to start / to end"),
+    ("shift-left right", "select by character (shift-home/end, up/down too)"),
+    ("ctrl+shift-left right", "select by word"),
+    ("alt-a", "select the whole draft"),
+    ("mouse press, release", "place the cursor / select in the draft"),
+    ("ctrl-w ctrl-u ctrl-k", "delete word / to start / to end (a selection first)"),
     ("up down", "draft rows, then sent history"),
     ("pgup pgdn", "scroll a screen (alt: half)"),
     ("ctrl-f", "search (enter/ctrl-n older, ctrl-p newer, esc)"),
-    ("ctrl-o", "copy the last reply (OSC 52)"),
+    ("ctrl-o ctrl-x", "copy / cut the selection (no selection: ctrl-o copies the last reply, OSC 52)"),
+    ("esc", "back to the bot list (a selection first)"),
+    ("ctrl-c ctrl-d", "quit"),
+    ("? f1", "this help (?? types a ?)"),
+    ("f2", "mouse on/off: off lets a plain drag select text"),
+    ("shift+drag", "select text while the mouse is on (most terminals)"),
     ("y n", "answer a pending approval"),
     ("1-9", "pick a widget option"),
     ("left right [ ]", "page back and forth through several questions"),
     ("@bot text", "send to another bot"),
     ("@", "tag a bot: up/down, tab or enter inserts, esc closes"),
-    ("esc", "back to the bot list"),
-    ("ctrl-c ctrl-d", "quit"),
-    ("? f1", "this help (?? types a ?)"),
-    ("f2", "mouse on/off: off lets a plain drag select text"),
-    ("shift+drag", "select text while the mouse is on (most terminals)"),
 ]
 
 
@@ -54,7 +58,7 @@ def search_target(rows, chat):
     return hits[at], hits
 
 
-def paint_composer(stdscr, y, width, lines, placeholder=False, first=0, border=None):
+def paint_composer(stdscr, y, width, lines, placeholder=False, first=0, border=None, marks=()):
     span = max(width, 0)
     if span < 2:
         return
@@ -68,6 +72,11 @@ def paint_composer(stdscr, y, width, lines, placeholder=False, first=0, border=N
         if index + first == 0 and inner >= 2:
             paint.put(stdscr, y + index, 2, "→", border)
         paint.put(stdscr, y + index, span - 1, "│", border)
+    # The selection: reverse video over the selected columns of each wrapped row.
+    for row, low, high in marks:
+        if 0 <= row - first < len(lines):
+            text = lines[row - first][low:high][: max(inner - 4 - low, 0)]
+            paint.put(stdscr, y + row - first, 5 + low, text, curses.A_REVERSE | attr)
 
 
 def paint_mentions(stdscr, chat, bottom, top, width):
@@ -208,12 +217,16 @@ def draw(stdscr, chat):
         row, col = grid.draft_cursor(chat.typed, getattr(chat, "pos", None), width)
         first = grid.composer_window(len(lines), row, visible)
         shown = lines[first : first + visible] if lines else ["Add a follow-up"]
-        paint_composer(stdscr, composer_at + 1, width, shown, placeholder=not lines, first=first, border=border)
+        marks = grid.draft_marks(chat.typed, width, draft.span(chat.typed, chat.pos, getattr(chat, "anchor", None)))
+        paint_composer(stdscr, composer_at + 1, width, shown, placeholder=not lines, first=first, border=border, marks=marks)
+        # Where the text sits, for a mouse press: first row on screen, first draft row, rows, width.
+        chat.draft_box = (composer_at + 1, first, len(shown), width) if lines else None
         paint.put(stdscr, composer_at + composer_h - 1, 0, bot, border)
         column = grid.composer_cursor_column("", placeholder=True) if not lines else 5 + col
         cursor = (composer_at + 1 + (row - first if lines else 0), min(column, max(width - 2, 0)))
     elif composer_h == 1:
         shown = chat.typed or "Add a follow-up"
+        chat.draft_box = None
         paint.put(
             stdscr,
             composer_at,
@@ -222,6 +235,10 @@ def draw(stdscr, chat):
             styles.ATTR["default"] if chat.typed else styles.ATTR["dim"],
         )
         paint.put(stdscr, composer_at, 0, "→", styles.dot_attr(color))
+        found = draft.span(chat.typed, chat.pos, getattr(chat, "anchor", None))
+        if found and "\n" not in chat.typed:
+            # One row, no wrapping: the text starts at column 3.
+            paint.put(stdscr, composer_at, 3 + found[0], chat.typed[found[0] : found[1]], curses.A_REVERSE)
         pos = len(chat.typed) if getattr(chat, "pos", None) is None else min(chat.pos, len(chat.typed))
         column = 2 if not chat.typed else 3 + pos
         cursor = (composer_at, min(column, max(width - 2, 0)))

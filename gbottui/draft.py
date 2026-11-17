@@ -91,3 +91,49 @@ def kill_line_end(text, pos):
     if end == pos and pos < len(text):
         end = pos + 1  # at a line end, join with the line below
     return text[:pos] + text[end:], pos
+
+
+# A selection runs between the anchor (where it started) and the cursor. The
+# functions below take and return (text, pos, anchor). An anchor of None, or
+# one equal to the cursor, is no selection.
+
+
+def span(text, pos, anchor):
+    """(start, end) of the selected text, or None when nothing is selected."""
+    if anchor is None:
+        return None
+    pos, anchor = clamp(text, pos), clamp(text, anchor)
+    if pos == anchor:
+        return None
+    return min(pos, anchor), max(pos, anchor)
+
+
+def selected(text, pos, anchor):
+    found = span(text, pos, anchor)
+    return text[found[0] : found[1]] if found else ""
+
+
+def extend(text, pos, anchor, move):
+    """Move the cursor with `move` (a motion above), keeping the selection's far end."""
+    pos = clamp(text, pos)
+    anchor = pos if anchor is None else clamp(text, anchor)
+    _text, new = move(text, pos)
+    return text, new, None if new == anchor else anchor
+
+
+def select_all(text, pos, anchor):
+    return text, len(text), 0 if text else None
+
+
+def replace(text, pos, anchor, value):
+    """Type `value` over the selection, or at the cursor when there is none."""
+    found = span(text, pos, anchor)
+    if found is None:
+        text, pos = insert(text, pos, value)
+        return text, pos, None
+    start, end = found
+    return text[:start] + value + text[end:], start + len(value), None
+
+
+def delete_selection(text, pos, anchor):
+    return replace(text, pos, anchor, "")

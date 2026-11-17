@@ -497,6 +497,11 @@ def pick(stdscr, bots, refresh=None):
                     # ESC [ D from a terminal not in keypad mode is an arrow, not Esc.
                     pending = paint.decode_keys([key], paint.follow_up(stdscr, wait))
                     continue
+            # The list has no draft to select in: shift-up/down still move the highlight.
+            if key == paint.SELECT_UP:
+                key = curses.KEY_UP
+            elif key == paint.SELECT_DOWN:
+                key = curses.KEY_DOWN
             if key == curses.KEY_RESIZE:
                 theme.note_appearance()
                 theme.maybe_retheme(lambda: styles.apply_theme(stdscr))

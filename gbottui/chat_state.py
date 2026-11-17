@@ -23,6 +23,8 @@ RETRY_DELAYS = (2.0, 4.0, 8.0, 15.0, 30.0)
 NOTICE_SECONDS = 4.0
 # The open chat asks the server for its running flag at most this often.
 RUNNING_EVERY = 3.0
+# Draft edits that remove the selection when there is one.
+SELECTION_DELETES = (draft.backspace, draft.delete, draft.kill_word, draft.kill_line_start, draft.kill_line_end)
 
 
 class Chat:
@@ -50,6 +52,12 @@ class Chat:
         # Cursor index into `typed`. None is the end, so a draft set from
         # outside (a test, a widget reset) keeps typing at the end.
         self.pos = None
+        # The other end of a selection in `typed` (the cursor is the first end), or
+        # None. `draft_box` is where the last draw put the composer text, for the
+        # mouse; `press` is the draft index a left press landed on.
+        self.anchor = None
+        self.draft_box = None
+        self.press = None
         # Input history: index into `sent_history()` while Up/Down browse it,
         # and the draft that was there before the first Up.
         self.hist_at = None
@@ -756,11 +764,28 @@ class Chat:
         self.sync_activity()
 
     def edit(self, change, *args):
-        """Apply a `draft` function to the draft and the cursor."""
+        """Apply a `draft` function to the draft and the cursor.
+
+        With a selection, a delete key removes the selection and nothing else.
+        Any other edit or motion drops the selection and acts as it did before.
+        """
+        if change in SELECTION_DELETES and draft.span(self.typed, self.pos, self.anchor):
+            self.typed, self.pos, self.anchor = draft.delete_selection(self.typed, self.pos, self.anchor)
+            return
         self.typed, self.pos = change(self.typed, self.pos, *args)
+        self.anchor = None
+
+    def select(self, move):
+        """Extend the selection with a `draft` motion."""
+        self.typed, self.pos, self.anchor = draft.extend(self.typed, self.pos, self.anchor, move)
+
+    def selection(self):
+        """The selected draft text, or ""."""
+        return draft.selected(self.typed, self.pos, self.anchor)
 
     def type_text(self, value):
-        self.edit(draft.insert, value)
+        """Insert at the cursor, or over the selection."""
+        self.typed, self.pos, self.anchor = draft.replace(self.typed, self.pos, self.anchor, value)
 
     def mention_matches(self):
         """The suggestions for the `@query` at the cursor: [(name, matched indexes)].
@@ -807,9 +832,10 @@ class Chat:
             if at >= len(past):
                 self.hist_at = None
                 self.typed, self.pos = self.hist_draft
+                self.anchor = None
                 return True
         self.hist_at = at
-        self.typed, self.pos = past[at], None
+        self.typed, self.pos, self.anchor = past[at], None, None
         return True
 
     def arm_send(self):
@@ -818,6 +844,7 @@ class Chat:
             return ""
         self.typed = ""
         self.pos = None
+        self.anchor = None
         self.hist_at = None
         self.error = ""
         self.saw_other = False

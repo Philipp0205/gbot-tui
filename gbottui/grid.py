@@ -119,6 +119,27 @@ def draft_cursor(typed, pos, width):
     return at, min(column, composer_text_width(width))
 
 
+def draft_at(typed, width, row, column):
+    """The draft index at a wrapped row and a column in text cells, or None past the last row."""
+    rows = draft_rows(typed, width)
+    if not 0 <= row < len(rows):
+        return None
+    _text, start, end, pad = rows[row]
+    return start + max(0, min(column - len(pad), end - start))
+
+
+def draft_marks(typed, width, found):
+    """[(row, from, to)] columns of the selection `found` (start, end) in each wrapped row."""
+    if not found:
+        return []
+    marks = []
+    for index, (_text, start, end, pad) in enumerate(draft_rows(typed, width)):
+        low, high = max(found[0], start), min(found[1], end)
+        if low < high:
+            marks.append((index, len(pad) + low - start, len(pad) + high - start))
+    return marks
+
+
 def draft_vertical(typed, pos, width, delta):
     """The index one wrapped row up (-1) or down (1), or None at the edge."""
     rows = draft_rows(typed, width)
