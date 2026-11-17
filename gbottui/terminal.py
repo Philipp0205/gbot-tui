@@ -49,6 +49,8 @@ POP_TITLE = b"\033[23;0t"
 
 WHEEL_LINES = 3
 LAST_CLICK = None
+# Where the left button was last let go. The chat uses it to end a draft selection.
+LAST_RELEASE = None
 LINK_HITS = []
 
 
@@ -87,7 +89,9 @@ def apply_mouse():
     """Tell curses (and so the terminal) what MOUSE says."""
     try:
         if MOUSE:
-            curses.mousemask(curses.BUTTON1_PRESSED | curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
+            curses.mousemask(
+                curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED | curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED
+            )
             curses.mouseinterval(0)
         else:
             curses.mousemask(0)
@@ -128,6 +132,9 @@ def wheel_direction(key):
     if state & curses.BUTTON1_PRESSED:
         global LAST_CLICK
         LAST_CLICK = (mx, my)
+    if state & curses.BUTTON1_RELEASED:
+        global LAST_RELEASE
+        LAST_RELEASE = (mx, my)
     if state & curses.BUTTON4_PRESSED:
         return -1
     if state & curses.BUTTON5_PRESSED:

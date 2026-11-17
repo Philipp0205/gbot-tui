@@ -206,11 +206,70 @@ CURSOR_KEYS = {
 }
 # Terminfo names curses may hand over for a modified arrow: kLFT5 (ctrl), kLFT3 (alt),
 # kLFT7 (ctrl+alt) and so on. The decoder turns the raw sequences into WORD_LEFT / WORD_RIGHT
-# first, so these only matter when curses decoded the key itself. Modifier 2 is Shift alone.
+# first, so these only matter when curses decoded the key itself. Modifier 2 (Shift) and 6
+# (Ctrl+Shift) select instead, see SELECT_NAMES.
 WORD_KEYS = {}
 for _mod in range(paint.WORD_MODIFIER_MIN, 17):
-    WORD_KEYS[f"kLFT{_mod}".encode()] = draft.word_left
-    WORD_KEYS[f"kRIT{_mod}".encode()] = draft.word_right
+    if _mod != paint.CTRL_SHIFT_MODIFIER:
+        WORD_KEYS[f"kLFT{_mod}".encode()] = draft.word_left
+        WORD_KEYS[f"kRIT{_mod}".encode()] = draft.word_right
+# Keys that extend the selection: the decoder's own SELECT_* values (no terminfo needed), the
+# curses codes for shifted keys, and the terminfo names for the same keys.
+SELECT_KEYS = {
+    paint.SELECT_LEFT: draft.left,
+    paint.SELECT_RIGHT: draft.right,
+    paint.SELECT_HOME: draft.line_start,
+    paint.SELECT_END: draft.line_end,
+    paint.SELECT_WORD_LEFT: draft.word_left,
+    paint.SELECT_WORD_RIGHT: draft.word_right,
+    curses.KEY_SLEFT: draft.left,
+    curses.KEY_SRIGHT: draft.right,
+    curses.KEY_SHOME: draft.line_start,
+    curses.KEY_SEND: draft.line_end,
+}
+SELECT_NAMES = {
+    b"kLFT2": draft.left,
+    b"kRIT2": draft.right,
+    b"kHOM2": draft.line_start,
+    b"kEND2": draft.line_end,
+    b"kLFT6": draft.word_left,
+    b"kRIT6": draft.word_right,
+}
+# Shift-up / shift-down: one draft row (SR and SF are terminfo's kri and kind).
+SELECT_ROWS = {paint.SELECT_UP: -1, curses.KEY_SR: -1, paint.SELECT_DOWN: 1, curses.KEY_SF: 1}
+SELECT_ROW_NAMES = {b"kUP2": -1, b"kDN2": 1}
+
+
+def key_name(key):
+    try:
+        name = curses.keyname(key)
+    except (curses.error, ValueError, OverflowError):
+        return b""
+    return name.encode() if isinstance(name, str) else name
+
+
+def select_key(chat, key, stdscr):
+    """Shift or Ctrl+Shift motion: extend the selection. False when `key` is not one."""
+    if not isinstance(key, int) or isinstance(key, bool):
+        return False
+    move = SELECT_KEYS.get(key)
+    rows = SELECT_ROWS.get(key)
+    if move is None and rows is None:
+        name = key_name(key)
+        move, rows = SELECT_NAMES.get(name), SELECT_ROW_NAMES.get(name)
+    if move is not None:
+        chat.select(move)
+        return True
+    if rows is not None:
+        width = screen_width(stdscr)
+
+        def row_move(text, pos):
+            found = grid.draft_vertical(text, pos, width, rows)
+            return text, pos if found is None else found
+
+        chat.select(row_move)
+        return True
+    return False
 
 
 def edit_motion(key):
@@ -240,6 +299,7 @@ def screen_width(stdscr):
 def vertical_key(chat, key, stdscr):
     """Up or Down: the row above or below inside the draft, else the input history."""
     delta = -1 if key == curses.KEY_UP else 1
+    chat.anchor = None
     pos = grid.draft_vertical(chat.typed, chat.pos, screen_width(stdscr), delta)
     if pos is None:
         # Past the first or last row: earlier or later sent messages.
@@ -287,6 +347,7 @@ def search_key(chat, key, stdscr):
 
 
 COPY_KEY = "\x0f"  # ctrl-o: ctrl-y and ctrl-n already type y and n
+CUT_KEY = "\x18"  # ctrl-x: not bound in the chat (the bot list uses it to mark read)
 
 
 def copy_last_reply(chat):
@@ -300,6 +361,49 @@ def copy_last_reply(chat):
                 return True
     chat.show_notice("No reply to copy.")
     return False
+
+
+def copy_selection(chat, cut=False):
+    """OSC 52 the selected draft text. With `cut` the selection is deleted too."""
+    text = chat.selection()
+    if not text:
+        return False
+    terminal.write_tty(terminal.osc52(text))
+    if cut:
+        chat.typed, chat.pos, chat.anchor = draft.delete_selection(chat.typed, chat.pos, chat.anchor)
+    chat.show_notice(f"{'Cut' if cut else 'Copied'} the selection ({len(text)} chars).")
+    return True
+
+
+def draft_point(chat, x, y):
+    """The draft index under a screen cell, or None outside the composer text."""
+    box = chat.draft_box
+    if not box or not chat.typed:
+        return None
+    top, first, shown, width = box
+    if not top <= y < top + shown or not 1 <= x < width - 1:
+        return None
+    return grid.draft_at(chat.typed, width, first + y - top, max(x - 5, 0))
+
+
+def draft_press(chat, x, y):
+    """A left press in the draft puts the cursor there. False when it is elsewhere."""
+    at = draft_point(chat, x, y)
+    chat.press = at
+    if at is None:
+        return False
+    chat.pos, chat.anchor = at, None
+    return True
+
+
+def draft_release(chat, x, y):
+    """A release after a press in the draft selects between the two points."""
+    start, chat.press = chat.press, None
+    at = draft_point(chat, x, y)
+    if start is None or at is None or at == start:
+        return False
+    chat.pos, chat.anchor = at, start
+    return True
 
 
 def older_job(chat):
@@ -336,6 +440,7 @@ def mention_key(chat, key):
     if key in ("\t", "\r", curses.KEY_ENTER):
         name = matches[min(chat.mention_sel, len(matches) - 1)][0]
         chat.typed, chat.pos = mentions.insert(chat.typed, chat.pos, name)
+        chat.anchor = None
         chat.close_mention()
         return True
     if key in ("\x1b", 27):
@@ -407,13 +512,22 @@ def composer_key_press(chat, key, stdscr):
     if chat.search is not None and search_key(chat, key, stdscr) is None:
         return None
     if key == COPY_KEY:
-        copy_last_reply(chat)
+        if not copy_selection(chat):
+            copy_last_reply(chat)
+        return None
+    if key == CUT_KEY:
+        copy_selection(chat, cut=True)
         return None
     if key == SEARCH_KEY:
         chat.search = ""
         chat.search_at = None
         return None
     if key in ("\x1b", 27):
+        if draft.span(chat.typed, chat.pos, chat.anchor):
+            # The first Esc only drops the selection; a second one goes back.
+            chat.anchor = None
+            return None
+        chat.anchor = None
         return "back"
     if key == curses.KEY_F1 or (key == "?" and not chat.typed):
         chat.help = True
@@ -422,11 +536,16 @@ def composer_key_press(chat, key, stdscr):
     motion = terminal.page_motion(key)
     if motion is None:
         terminal.LAST_CLICK = None
+        terminal.LAST_RELEASE = None
         wheel = terminal.wheel_direction(key)
         if wheel is not None:
             motion = (wheel, None)
+        elif terminal.LAST_RELEASE:
+            draft_release(chat, *terminal.LAST_RELEASE)
+            return None
         elif terminal.LAST_CLICK:
-            terminal.open_link_at(*terminal.LAST_CLICK)
+            if not draft_press(chat, *terminal.LAST_CLICK):
+                terminal.open_link_at(*terminal.LAST_CLICK)
             return None
     if motion is not None:
         direction, half = motion
@@ -449,6 +568,11 @@ def composer_key_press(chat, key, stdscr):
         return None
     if page_key(chat, key):
         return None
+    if key == paint.SELECT_ALL:
+        chat.typed, chat.pos, chat.anchor = draft.select_all(chat.typed, chat.pos, chat.anchor)
+        return None
+    if select_key(chat, key, stdscr):
+        return None
     change = edit_motion(key)
     if change is not None:
         chat.edit(change)
@@ -457,6 +581,7 @@ def composer_key_press(chat, key, stdscr):
         vertical_key(chat, key, stdscr)
         return None
     if key in ("\r", curses.KEY_ENTER):
+        chat.anchor = None
         page = chat.page() if not chat.widget_busy else None
         if page is not None and chat.typed.strip() and page["custom"]:
             text = chat.typed.strip()

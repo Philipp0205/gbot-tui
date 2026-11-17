@@ -4763,7 +4763,6 @@ class EscapeSequenceTests(unittest.TestCase):
                 ("\x1b[1;5D", "\x1b[1;5C"),  # ctrl
                 ("\x1b[1;3D", "\x1b[1;3C"),  # alt
                 ("\x1b[1;7D", "\x1b[1;7C"),  # ctrl+alt
-                ("\x1b[1;6D", "\x1b[1;6C"),  # ctrl+shift
                 ("\x1b[1;9D", "\x1b[1;9C"),  # meta
                 ("\x1b[5D", "\x1b[5C"),
                 ("\x1bO5D", "\x1bO5C"),
@@ -4773,8 +4772,9 @@ class EscapeSequenceTests(unittest.TestCase):
                 self.assertEqual(paint.decode_keys(list(left)), [paint.WORD_LEFT], left)
                 self.assertEqual(paint.decode_keys(list(right)), [paint.WORD_RIGHT], right)
             self.assertEqual(paint.decode_keys(list("a\x1b[1;5Db")), ["a", paint.WORD_LEFT, "b"])
-            # Shift alone, unmodified arrows, and the vertical and Home/End keys keep their meaning.
-            self.assertEqual(paint.decode_keys(list("\x1b[1;2D\x1b[1;2C")), [curses.KEY_LEFT, curses.KEY_RIGHT])
+            # Shift and Ctrl+Shift select (SELECT_*), unmodified arrows and the vertical and Home/End keys keep their meaning.
+            self.assertEqual(paint.decode_keys(list("\x1b[1;2D\x1b[1;2C")), [paint.SELECT_LEFT, paint.SELECT_RIGHT])
+            self.assertEqual(paint.decode_keys(list("\x1b[1;6D\x1b[1;6C")), [paint.SELECT_WORD_LEFT, paint.SELECT_WORD_RIGHT])
             self.assertEqual(paint.decode_keys(list("\x1b[1D\x1b[1C\x1bOD\x1bOC")), [curses.KEY_LEFT, curses.KEY_RIGHT] * 2)
             self.assertEqual(paint.decode_keys(list("\x1b[1;5A\x1b[1;5B\x1b[1;5H\x1b[1;5F")), [curses.KEY_UP, curses.KEY_DOWN, curses.KEY_HOME, curses.KEY_END])
             # Other Alt-letters are still dropped.
@@ -4797,7 +4797,8 @@ class EscapeSequenceTests(unittest.TestCase):
             self.assertIs(chat_screen.edit_motion(601), draft.word_left)
             self.assertIs(chat_screen.edit_motion(602), draft.word_right)
             self.assertIs(chat_screen.edit_motion(603), draft.word_left)
-            self.assertIs(chat_screen.edit_motion(604), draft.word_right)
+            # Shift (2) and Ctrl+Shift (6) select; they are not plain motions.
+            self.assertIsNone(chat_screen.edit_motion(604))
             self.assertIsNone(chat_screen.edit_motion(605))
             self.assertIsNone(chat_screen.edit_motion(606))
         finally:
@@ -4978,6 +4979,393 @@ class CopyTests(unittest.TestCase):
         self.assertTrue(any("ctrl-o" in keys for keys, _what in chat_view.HELP))
 
 
+class DraftSelectionTests(unittest.TestCase):
+    def test_span_and_selected(self):
+        self.assertIsNone(draft.span("hello", 3, None))
+        self.assertIsNone(draft.span("hello", 3, 3))
+        self.assertEqual(draft.span("hello", 1, 4), (1, 4))
+        self.assertEqual(draft.span("hello", 4, 1), (1, 4))
+        self.assertEqual(draft.selected("hello", 4, 1), "ell")
+        self.assertEqual(draft.selected("hello", 4, None), "")
+        # An anchor past the end is clamped.
+        self.assertEqual(draft.span("hi", 0, 99), (0, 2))
+
+    def test_extend_by_character_keeps_the_far_end(self):
+        text, pos, anchor = draft.extend("alpha", 5, None, draft.left)
+        self.assertEqual((pos, anchor), (4, 5))
+        text, pos, anchor = draft.extend(text, pos, anchor, draft.left)
+        self.assertEqual((pos, anchor), (3, 5))
+        # Shrinking back to the anchor leaves no selection.
+        text, pos, anchor = draft.extend(text, pos, anchor, draft.right)
+        text, pos, anchor = draft.extend(text, pos, anchor, draft.right)
+        self.assertEqual((pos, anchor), (5, None))
+        # Past the edge nothing moves and nothing is selected.
+        self.assertEqual(draft.extend("alpha", 5, None, draft.right), ("alpha", 5, None))
+        self.assertEqual(draft.extend("alpha", 0, None, draft.left), ("alpha", 0, None))
+
+    def test_extend_by_word_and_line_edge(self):
+        text = "alpha beta gamma"
+        self.assertEqual(draft.extend(text, 16, None, draft.word_left)[1:], (11, 16))
+        self.assertEqual(draft.extend(text, 11, 16, draft.word_left)[1:], (6, 16))
+        self.assertEqual(draft.extend(text, 0, None, draft.word_right)[1:], (5, 0))
+        self.assertEqual(draft.extend("ab\ncd", 4, None, draft.line_start)[1:], (3, 4))
+        self.assertEqual(draft.extend("ab\ncd", 0, None, draft.line_end)[1:], (2, 0))
+
+    def test_select_all(self):
+        self.assertEqual(draft.select_all("abc", 1, None), ("abc", 3, 0))
+        self.assertEqual(draft.selected(*draft.select_all("abc", 1, None)), "abc")
+        self.assertEqual(draft.select_all("", 0, None), ("", 0, None))
+
+    def test_replace_and_delete_the_selection(self):
+        self.assertEqual(draft.replace("alpha beta", 10, 6, "X"), ("alpha X", 7, None))
+        self.assertEqual(draft.replace("alpha beta", 6, 10, "X"), ("alpha X", 7, None))
+        # With no selection it is a plain insert at the cursor.
+        self.assertEqual(draft.replace("ac", 1, None, "b"), ("abc", 2, None))
+        self.assertEqual(draft.replace("ac", 1, 1, "b"), ("abc", 2, None))
+        self.assertEqual(draft.delete_selection("alpha beta", 5, 0), (" beta", 0, None))
+        self.assertEqual(draft.delete_selection("abc", 1, None), ("abc", 1, None))
+
+    def test_marks_follow_the_wrapped_rows(self):
+        text = "abcdefghij klmnopqrst uvwxyz"
+        rows = grid.draft_rows(text, 20)
+        self.assertGreater(len(rows), 1)
+        marks = grid.draft_marks(text, 20, (0, len(text)))
+        self.assertEqual([row for row, _low, _high in marks], list(range(len(rows))))
+        shown = ["".join(rows[row][0][low:high] for row, low, high in [mark]) for mark in marks]
+        self.assertEqual(" ".join(shown), text)
+        self.assertEqual(grid.draft_marks(text, 20, None), [])
+        # A hanging indent shifts the columns of a wrapped bullet line.
+        bullet = "- " + "word " * 8
+        for row, low, _high in grid.draft_marks(bullet, 20, (0, len(bullet))):
+            if row:
+                self.assertGreaterEqual(low, 2)
+
+    def test_draft_at_maps_a_cell_to_an_index(self):
+        self.assertEqual(grid.draft_at("alpha beta", 80, 0, 6), 6)
+        self.assertEqual(grid.draft_at("alpha", 80, 0, 50), 5)
+        self.assertIsNone(grid.draft_at("alpha", 80, 3, 0))
+        self.assertIsNone(grid.draft_at("", 80, 0, 0))
+
+
+class SelectionKeyTests(unittest.TestCase):
+    def setUp(self):
+        self.sent = []
+        self.original = terminal.write_tty
+        terminal.write_tty = self.sent.append
+        self.addCleanup(setattr, terminal, "write_tty", self.original)
+
+    def chat(self, text="alpha beta gamma"):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, text)
+        return chat
+
+    def test_the_decoder_constants_need_no_terminfo(self):
+        original = curses.keyname
+        curses.keyname = lambda key: b"KEY_OTHER"
+        paint._NAMED = None
+        try:
+            for seq, key in (
+                ("\x1b[1;2D", paint.SELECT_LEFT),
+                ("\x1b[1;2C", paint.SELECT_RIGHT),
+                ("\x1b[1;2H", paint.SELECT_HOME),
+                ("\x1b[1;2F", paint.SELECT_END),
+                ("\x1b[1;2A", paint.SELECT_UP),
+                ("\x1b[1;2B", paint.SELECT_DOWN),
+                ("\x1b[1;6D", paint.SELECT_WORD_LEFT),
+                ("\x1b[1;6C", paint.SELECT_WORD_RIGHT),
+                ("\x1b[2D", paint.SELECT_LEFT),
+                ("\x1bO2C", paint.SELECT_RIGHT),
+                ("\x1ba", paint.SELECT_ALL),
+            ):
+                self.assertEqual(paint.decode_keys(list(seq)), [key], seq)
+            # Ctrl and Alt still jump, and the plain arrows are plain.
+            self.assertEqual(paint.decode_keys(list("\x1b[1;5D\x1b[1;3C\x1b[D")), [paint.WORD_LEFT, paint.WORD_RIGHT, curses.KEY_LEFT])
+            codes = {paint.SELECT_LEFT, paint.SELECT_RIGHT, paint.SELECT_UP, paint.SELECT_DOWN, paint.SELECT_HOME, paint.SELECT_END, paint.SELECT_WORD_LEFT, paint.SELECT_WORD_RIGHT, paint.SELECT_ALL, paint.WORD_LEFT, paint.WORD_RIGHT}
+            self.assertEqual(len(codes), 11)
+            self.assertGreater(min(codes), 0x110000)
+        finally:
+            curses.keyname = original
+            paint._NAMED = None
+
+    def test_curses_and_terminfo_names_extend_too(self):
+        original = curses.keyname
+        names = {601: b"kLFT2", 602: b"kRIT2", 603: b"kLFT6", 604: b"kRIT6", 605: b"kUP2", 606: b"kHOM2", 607: b"kEND2"}
+        curses.keyname = lambda key: names.get(key, b"KEY_OTHER")
+        try:
+            chat = self.chat()
+            _typed(chat, [curses.KEY_SLEFT, curses.KEY_SLEFT])
+            self.assertEqual(chat.selection(), "ma")
+            _typed(chat, [curses.KEY_SRIGHT])
+            self.assertEqual(chat.selection(), "a")
+            _typed(chat, [curses.KEY_SHOME])
+            self.assertEqual(chat.selection(), "alpha beta gamma")
+            _typed(chat, [curses.KEY_SEND])
+            self.assertEqual(chat.selection(), "")
+            chat = self.chat()
+            _typed(chat, [601, 601, 603])
+            self.assertEqual(chat.selection(), "gamma")  # 16 -> 14 by kLFT2, then to the word start at 11
+            _typed(chat, [604])
+            self.assertEqual(chat.selection(), "")
+            chat = self.chat()
+            _typed(chat, [curses.KEY_HOME, 607])
+            self.assertEqual((chat.pos, chat.anchor), (16, 0))
+            chat = self.chat()
+            _typed(chat, [606])
+            self.assertEqual((chat.pos, chat.anchor), (0, 16))
+        finally:
+            curses.keyname = original
+
+    def test_shift_left_x5_then_type_replaces(self):
+        chat = self.chat()
+        _typed(chat, [paint.SELECT_LEFT] * 5)
+        self.assertEqual(chat.selection(), "gamma")
+        _typed(chat, "X")
+        self.assertEqual((chat.typed, chat.pos, chat.anchor), ("alpha beta X", 12, None))
+
+    def test_a_paste_replaces_the_selection(self):
+        chat = self.chat()
+        _typed(chat, [paint.SELECT_WORD_LEFT])
+        _typed(chat, [paint.Pasted("a"), paint.Pasted("\n"), paint.Pasted("b")])
+        self.assertEqual(chat.typed, "alpha beta a\nb")
+
+    def test_word_select_then_every_delete_key_removes_only_the_selection(self):
+        for key, left in (("\x7f", "alpha beta "), (curses.KEY_BACKSPACE, "alpha beta "), (curses.KEY_DC, "alpha beta "), ("\x17", "alpha beta "), ("\x0b", "alpha beta "), ("\x15", "alpha beta ")):
+            chat = self.chat()
+            _typed(chat, [paint.SELECT_WORD_LEFT])
+            self.assertEqual(chat.selection(), "gamma")
+            _typed(chat, [key])
+            self.assertEqual((chat.typed, chat.pos, chat.anchor), (left, 11, None), key)
+
+    def test_selecting_from_the_middle_and_deleting(self):
+        chat = self.chat()
+        _typed(chat, [curses.KEY_LEFT] * 10 + [paint.SELECT_RIGHT] * 3)
+        self.assertEqual(chat.selection(), "bet")
+        _typed(chat, ["\x7f"])
+        self.assertEqual(chat.typed, "alpha a gamma")
+
+    def test_alt_a_selects_everything_and_typing_replaces_it(self):
+        chat = self.chat()
+        _typed(chat, [paint.SELECT_ALL])
+        self.assertEqual(chat.selection(), "alpha beta gamma")
+        _typed(chat, "Q")
+        self.assertEqual((chat.typed, chat.pos, chat.anchor), ("Q", 1, None))
+        empty = chat_state.Chat("Researcher")
+        _typed(empty, [paint.SELECT_ALL])
+        self.assertEqual((empty.typed, empty.selection()), ("", ""))
+
+    def test_plain_motion_clears_the_selection_and_moves_as_before(self):
+        # The cursor sits at 11 after the word select; a plain motion moves from there, as before.
+        for key, pos in (
+            (curses.KEY_LEFT, 10),
+            (curses.KEY_RIGHT, 12),
+            (paint.WORD_LEFT, 6),
+            (paint.WORD_RIGHT, 16),
+            (curses.KEY_HOME, 0),
+            (curses.KEY_END, 16),
+            ("\x01", 0),
+            ("\x05", 16),
+        ):
+            chat = self.chat()
+            _typed(chat, [paint.SELECT_WORD_LEFT])
+            _typed(chat, [key])
+            self.assertEqual((chat.anchor, chat.pos), (None, pos), key)
+            self.assertEqual(chat.typed, "alpha beta gamma")
+        chat = self.chat()
+        _typed(chat, [paint.SELECT_WORD_LEFT])
+        _typed(chat, [curses.KEY_UP], FakeScreen(24, 80))
+        self.assertIsNone(chat.anchor)
+
+    def test_shift_up_and_down_extend_by_a_row(self):
+        text = "abcdefghij klmnopqrst uvwxyz"
+        screen = FakeScreen(24, 20)
+        chat = self.chat(text)
+        _typed(chat, [paint.SELECT_UP], screen)
+        self.assertEqual(chat.anchor, len(text))
+        self.assertLess(chat.pos, len(text))
+        self.assertEqual(chat.selection(), text[chat.pos :])
+        _typed(chat, [paint.SELECT_DOWN], screen)
+        # Back on the last row at the same column: nothing selected, or just the end.
+        self.assertGreaterEqual(chat.pos, len(text) - 1)
+        # On the first row Shift-Up stays put.
+        first = self.chat("one")
+        _typed(first, [paint.SELECT_UP], FakeScreen(24, 80))
+        self.assertEqual((first.pos, first.anchor), (3, None))
+
+    def test_ctrl_o_copies_the_selection_not_the_last_reply(self):
+        chat = self.chat()
+        chat.messages.append({"id": "a", "role": "assistant", "text": "a reply"})
+        _typed(chat, [paint.SELECT_WORD_LEFT])
+        self.assertIsNone(chat_screen.chat_key(chat, "\x0f", None))
+        self.assertEqual(self.sent, [terminal.osc52("gamma")])
+        self.assertIn("Copied the selection (5 chars)", chat.notice)
+        # Copy keeps the draft and the selection.
+        self.assertEqual((chat.typed, chat.selection()), ("alpha beta gamma", "gamma"))
+        # With no selection it copies the last reply as before.
+        _typed(chat, [curses.KEY_LEFT])
+        _typed(chat, ["\x0f"])
+        self.assertEqual(self.sent[-1], terminal.osc52("a reply"))
+        self.assertIn("Copied the last reply", chat.notice)
+
+    def test_ctrl_x_cuts(self):
+        chat = self.chat()
+        _typed(chat, [paint.SELECT_WORD_LEFT])
+        self.assertIsNone(chat_screen.chat_key(chat, "\x18", None))
+        self.assertEqual(self.sent, [terminal.osc52("gamma")])
+        self.assertEqual((chat.typed, chat.pos, chat.anchor), ("alpha beta ", 11, None))
+        self.assertIn("Cut the selection (5 chars)", chat.notice)
+        # With nothing selected it does nothing, and types nothing.
+        _typed(chat, ["\x18"])
+        self.assertEqual((chat.typed, len(self.sent)), ("alpha beta ", 1))
+        self.assertTrue(any("ctrl-x" in keys for keys, _what in chat_view.HELP))
+
+    def test_esc_clears_the_selection_first_then_goes_back(self):
+        chat = self.chat()
+        _typed(chat, [paint.SELECT_WORD_LEFT])
+        self.assertIsNone(chat_screen.chat_key(chat, "\x1b", None))
+        self.assertEqual((chat.typed, chat.anchor, chat.selection()), ("alpha beta gamma", None, ""))
+        self.assertEqual(chat_screen.chat_key(chat, "\x1b", None), "back")
+        # An empty selection (shrunk back to the anchor) does not eat the Esc.
+        chat = self.chat()
+        _typed(chat, [paint.SELECT_LEFT, paint.SELECT_RIGHT])
+        self.assertEqual(chat_screen.chat_key(chat, "\x1b", None), "back")
+
+    def test_enter_sends_the_whole_draft_and_clears_the_selection(self):
+        chat = self.chat()
+        _typed(chat, [paint.SELECT_WORD_LEFT])
+        result = chat_screen.chat_key(chat, "\r", None)
+        self.assertEqual(result, ("send", ("Researcher", "alpha beta gamma")))
+        self.assertEqual((chat.typed, chat.anchor), ("", None))
+
+    def test_recall_and_a_new_line_drop_the_selection(self):
+        chat = self.chat()
+        chat.messages = [{"role": "user", "text": "old"}]
+        _typed(chat, [paint.SELECT_ALL, "\n"])
+        self.assertEqual((chat.typed, chat.anchor), ("\n", None))
+        chat.typed, chat.pos, chat.anchor = "", None, None
+        chat.anchor = 0
+        _typed(chat, [curses.KEY_UP], FakeScreen(24, 80))
+        self.assertEqual((chat.typed, chat.anchor), ("old", None))
+
+    def test_the_selection_is_drawn_in_reverse_video_across_wrapped_rows(self):
+        class Recorder(FakeScreen):
+            def __init__(self, *size):
+                super().__init__(*size)
+                self.marked = []
+
+            def addnstr(self, y, x, text, n, attr=0):
+                super().addnstr(y, x, text, n, attr)
+                if attr & curses.A_REVERSE:
+                    self.marked.append((y, text[:n]))
+
+        text = "abcdefghij klmnopqrst uvwxyz"
+        chat = self.chat(text)
+        screen = Recorder(24, 20)
+        chat_view.draw(screen, chat)
+        self.assertEqual(screen.marked, [])
+        _typed(chat, [paint.SELECT_ALL])
+        screen = Recorder(24, 20)
+        chat_view.draw(screen, chat)
+        rows = grid.draft_lines(text, 20)
+        self.assertEqual([part for _y, part in screen.marked], rows)
+        self.assertEqual(len({y for y, _part in screen.marked}), len(rows))
+        # A partial selection marks just those letters.
+        chat.anchor, chat.pos = 2, 5
+        screen = Recorder(24, 20)
+        chat_view.draw(screen, chat)
+        self.assertEqual([part for _y, part in screen.marked], ["cde"])
+
+    def test_the_help_lists_the_selection_keys(self):
+        keys = dict(chat_view.HELP)
+        for name in ("shift-left right", "ctrl+shift-left right", "alt-a", "ctrl-o ctrl-x", "mouse press, release"):
+            self.assertIn(name, keys)
+        self.assertTrue(all(len(name) < 22 for name in keys), [name for name in keys if len(name) >= 22])
+
+
+class DraftMouseTests(unittest.TestCase):
+    def setUp(self):
+        self.saved = (terminal.LAST_CLICK, terminal.LAST_RELEASE)
+        self.mouse = curses.getmouse
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        curses.getmouse = self.mouse
+        terminal.LAST_CLICK, terminal.LAST_RELEASE = self.saved
+
+    def event(self, chat, x, y, state):
+        curses.getmouse = lambda: (0, x, y, 0, state)
+        return chat_screen.chat_key(chat, curses.KEY_MOUSE, FakeScreen(24, 80))
+
+    def drawn(self, text="alpha beta gamma"):
+        chat = chat_state.Chat("Researcher")
+        _typed(chat, text)
+        chat_view.draw(FakeScreen(24, 80), chat)
+        return chat
+
+    def test_the_mask_asks_for_releases_and_keeps_the_wheel(self):
+        masks = []
+        original = curses.mousemask
+        curses.mousemask = masks.append
+        try:
+            terminal.set_mouse(True)
+        finally:
+            curses.mousemask = original
+            terminal.set_mouse(terminal.mouse_default({}))
+        mask = masks[0]
+        for button in (curses.BUTTON1_PRESSED, curses.BUTTON1_RELEASED, curses.BUTTON4_PRESSED, curses.BUTTON5_PRESSED):
+            self.assertTrue(mask & button)
+
+    def test_press_places_the_cursor_and_press_release_selects(self):
+        chat = self.drawn()
+        top, _first, _rows, _width = chat.draft_box
+        self.assertIsNone(self.event(chat, 5 + 6, top, curses.BUTTON1_PRESSED))
+        self.assertEqual((chat.pos, chat.anchor), (6, None))
+        self.assertIsNone(self.event(chat, 5 + 10, top, curses.BUTTON1_RELEASED))
+        self.assertEqual((chat.pos, chat.anchor, chat.selection()), (10, 6, "beta"))
+        # Release at the pressed spot selects nothing.
+        self.event(chat, 5 + 2, top, curses.BUTTON1_PRESSED)
+        self.event(chat, 5 + 2, top, curses.BUTTON1_RELEASED)
+        self.assertEqual((chat.pos, chat.anchor), (2, None))
+        # A drag to the left selects too.
+        self.event(chat, 5 + 8, top, curses.BUTTON1_PRESSED)
+        self.event(chat, 5 + 3, top, curses.BUTTON1_RELEASED)
+        self.assertEqual((chat.pos, chat.anchor, chat.selection()), (3, 8, "ha be"))
+
+    def test_a_release_without_a_draft_press_does_nothing(self):
+        chat = self.drawn()
+        top = chat.draft_box[0]
+        self.event(chat, 3, 2, curses.BUTTON1_PRESSED)
+        self.assertIsNone(chat.press)
+        self.event(chat, 5 + 4, top, curses.BUTTON1_RELEASED)
+        # Nothing changes: no selection, the cursor where typing left it.
+        self.assertEqual((chat.anchor, chat.pos), (None, 16))
+
+    def test_a_press_outside_the_draft_still_opens_a_link(self):
+        chat = self.drawn()
+        opened = []
+        original = terminal.open_link_at
+        terminal.open_link_at = lambda x, y: opened.append((x, y))
+        try:
+            self.event(chat, 3, 2, curses.BUTTON1_PRESSED)
+        finally:
+            terminal.open_link_at = original
+        self.assertEqual(opened, [(3, 2)])
+        # A press in the draft is not a link click.
+        opened.clear()
+        terminal.open_link_at = lambda x, y: opened.append((x, y))
+        try:
+            self.event(chat, 6, chat.draft_box[0], curses.BUTTON1_PRESSED)
+        finally:
+            terminal.open_link_at = original
+        self.assertEqual(opened, [])
+
+    def test_the_wheel_still_scrolls(self):
+        chat = self.drawn()
+        chat.follow = True
+        self.event(chat, 3, 2, curses.BUTTON4_PRESSED)
+        self.assertFalse(chat.follow)
+        self.assertEqual(chat.typed, "alpha beta gamma")
+
+
 class NoticeFooterTests(unittest.TestCase):
     def test_a_notice_is_green_and_an_error_wins_over_it(self):
         self.assertEqual(grid.footer_spans("idle", "", notice="Copied")[0], ("Copied", "green"))
@@ -5073,6 +5461,47 @@ class ListHelpTests(unittest.TestCase):
         # "x" closed it and did not start a search.
         self.assertIn("what to cook", drawn[2])
         self.assertNotIn("/x", drawn[2])
+
+    def test_shift_up_and_down_still_move_the_highlight(self):
+        class Screen(FakeScreen):
+            def __init__(self, keys):
+                super().__init__(24, 80)
+                self.keys = list(keys)
+
+            def timeout(self, _ms):
+                pass
+
+            def keypad(self, _on):
+                pass
+
+            def bkgd(self, *_args):
+                pass
+
+            def get_wch(self):
+                return self.keys.pop(0)
+
+        class Quiet:
+            def __init__(self, _bots):
+                pass
+
+            def status(self):
+                return False, 0, 0, 0
+
+            def problem(self):
+                return ""
+
+            def close(self):
+                pass
+
+        bots = [{"name": "Chef"}, {"name": "Coach"}, {"name": "Scout"}]
+        originals = (activity.Survey, picker.paint.fast_escape, picker.paint.place_cursor, picker.terminal.enable_wheel)
+        activity.Survey = Quiet
+        picker.paint.fast_escape = picker.paint.place_cursor = picker.terminal.enable_wheel = lambda *a: None
+        try:
+            down = picker.pick(Screen([paint.SELECT_DOWN, paint.SELECT_DOWN, paint.SELECT_UP, "\r"]), bots)
+        finally:
+            activity.Survey, picker.paint.fast_escape, picker.paint.place_cursor, picker.terminal.enable_wheel = originals
+        self.assertEqual(down, "Coach")
 
 
 class MouseToggleTests(unittest.TestCase):

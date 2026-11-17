@@ -154,13 +154,36 @@ SS3_FUNCTION = {"P": 1, "Q": 2, "R": 3, "S": 4}
 # codes (terminfo extended keys start at KEY_MAX + 1), so nothing else uses them.
 WORD_LEFT = 0x110001
 WORD_RIGHT = 0x110002
-# Modifier 2 is Shift alone: that stays a plain arrow. Ctrl (5), Alt (3), Ctrl+Alt (7),
-# Ctrl+Shift (6), Meta (9) and the rest jump a word, with or without a terminfo code.
+# Modifier 2 is Shift alone: that selects (SELECT_* below). Ctrl (5), Alt (3), Ctrl+Alt (7),
+# Meta (9) and the rest jump a word, with or without a terminfo code. Ctrl+Shift (6)
+# selects by word.
 WORD_MODIFIER_MIN = 3
 WORD_ARROWS = {"D": WORD_LEFT, "C": WORD_RIGHT}
+# Extending a selection in the draft: Shift (2) by character, row or line end, Ctrl+Shift (6)
+# by word. The same range as WORD_LEFT, so no terminfo code is needed either. SELECT_ALL is Alt-a.
+SELECT_LEFT = 0x110011
+SELECT_RIGHT = 0x110012
+SELECT_UP = 0x110013
+SELECT_DOWN = 0x110014
+SELECT_HOME = 0x110015
+SELECT_END = 0x110016
+SELECT_WORD_LEFT = 0x110017
+SELECT_WORD_RIGHT = 0x110018
+SELECT_ALL = 0x110019
+SHIFT_MODIFIER = 2
+CTRL_SHIFT_MODIFIER = 6
+SHIFT_FINALS = {
+    "D": SELECT_LEFT,
+    "C": SELECT_RIGHT,
+    "A": SELECT_UP,
+    "B": SELECT_DOWN,
+    "H": SELECT_HOME,
+    "F": SELECT_END,
+}
+CTRL_SHIFT_FINALS = {"D": SELECT_WORD_LEFT, "C": SELECT_WORD_RIGHT}
 # rxvt sends Ctrl-Left/Right as ESC O d / ESC O c. Readline Alt-b / Alt-f (macOS Option-arrow).
 RXVT_WORD_FINALS = {"d": WORD_LEFT, "c": WORD_RIGHT}
-ALT_WORD_KEYS = {"b": WORD_LEFT, "f": WORD_RIGHT}
+ALT_WORD_KEYS = {"b": WORD_LEFT, "f": WORD_RIGHT, "a": SELECT_ALL}
 TILDE_KEYS = {
     1: (curses.KEY_HOME, "kHOM"),
     2: (curses.KEY_IC, "kIC"),
@@ -204,9 +227,14 @@ def _csi_key(params, final, ss3=False):
     except ValueError:
         return None
     mod = numbers[1] if len(numbers) > 1 else (numbers[0] if ss3 and numbers else 1)
+    # ESC [ 1 ; 2 D, and ESC [ 2 D with the 1 left out.
+    word_mod = numbers[1] if len(numbers) > 1 else (numbers[0] if numbers else 1)
+    if word_mod == SHIFT_MODIFIER and final in SHIFT_FINALS:
+        return SHIFT_FINALS[final]
+    if word_mod == CTRL_SHIFT_MODIFIER and final in CTRL_SHIFT_FINALS:
+        return CTRL_SHIFT_FINALS[final]
     if final in WORD_ARROWS:
         # ESC [ 1 ; 5 D, and ESC [ 5 D with the 1 left out.
-        word_mod = numbers[1] if len(numbers) > 1 else (numbers[0] if numbers else 1)
         if word_mod >= WORD_MODIFIER_MIN:
             return WORD_ARROWS[final]
     if ss3 and final in RXVT_WORD_FINALS:
@@ -241,7 +269,8 @@ def decode_keys(keys, more=lambda: None):
     `more()` returns the next key within the escape delay, or None. Only an
     Esc with nothing after it stays "\x1b". An unknown sequence, or Esc and a
     plain character (Alt-letter), is dropped instead of reading as Esc. The
-    exceptions are Alt-b / Alt-f and modified Left/Right, which are WORD_LEFT / WORD_RIGHT.
+    exceptions are Alt-b / Alt-f and modified Left/Right, which are WORD_LEFT / WORD_RIGHT,
+    Shift and Ctrl+Shift arrows (SELECT_*), and Alt-a (SELECT_ALL).
     """
     global PASTING
     queue = list(keys)
@@ -271,7 +300,7 @@ def decode_keys(keys, more=lambda: None):
             queue.insert(0, lead)
             continue
         if lead in ALT_WORD_KEYS:
-            # ESC b / ESC f: readline Alt-b / Alt-f. Other Alt-letters are dropped.
+            # ESC b / ESC f: readline Alt-b / Alt-f. ESC a selects all. Other Alt-letters are dropped.
             out.append(ALT_WORD_KEYS[lead])
             continue
         if lead not in ("[", "O"):
